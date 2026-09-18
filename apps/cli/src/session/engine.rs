@@ -661,10 +661,35 @@ fn i18n(pump: &PumpState) -> I18n {
     I18n::new(*pump.locale.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
+/// What a sub-agent's event means to this session: nothing but the questions it asks, which the
+/// user watching this session is the one who can answer. Its logs, tools and replies belong to the
+/// child's own transcript, shown through the `create_agent` row that started it.
+fn child_events(event: &StreamEvent, pump: &PumpState) -> Vec<CoreEvent> {
+    match &event.payload {
+        StreamPayload::InteractionRequired {
+            interaction_id,
+            body,
+        } => vec![interaction_to_event(
+            interaction_id,
+            body,
+            *pump.locale.lock().unwrap_or_else(PoisonError::into_inner),
+        )],
+        _ => Vec::new(),
+    }
+}
+
 /// One `StreamEvent` may expand to several `CoreEvent`s (e.g. `TurnEnd` →
 /// `TurnDone` + synthesized `TurnSummaryLoaded`).
 fn translate(event: &StreamEvent, pump: &PumpState) -> Vec<CoreEvent> {
     use zlogic_protocol::stream::SteeringContent;
+    // A sub-agent runs as its own session with a turn id of its own, and the hub fans its events
+    // out to the ancestor sessions — including this one, even though the events keep the child's
+    // session id. They are not this session's turn: taking them for one restarts the live view on
+    // every child turn (an "assistant" header per child), hands the child's summary to the
+    // transcript as the reply, and points `active_turn_id` at a turn the user cannot cancel.
+    if !event.agent.is_root() {
+        return child_events(event, pump);
+    }
     let mut out = Vec::new();
     let turn_id = event.turn_id.to_string();
     match &event.payload {
@@ -2273,6 +2298,106 @@ fn relative_when(at: chrono::DateTime<chrono::Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pump() -> PumpState {
+        let (events_tx, _events_rx) = mpsc::channel();
+        let (bus_tx, _bus_rx) = mpsc::channel();
+        PumpState {
+            events_tx,
+            bus_tx,
+            open_blocks: Mutex::new(HashMap::new()),
+            round_summaries: Mutex::new(Vec::new()),
+            thinking_chars: Mutex::new(0),
+            turn_tokens: Mutex::new(TokenUsage::default()),
+            current_context: Mutex::new(None),
+            mailbox: Mutex::new(Vec::new()),
+            active_turn_id: Arc::new(Mutex::new(None)),
+            locale: Mutex::new(Locale::detect()),
+        }
+    }
+
+    fn model() -> zlogic_protocol::stream::ModelRef {
+        zlogic_protocol::stream::ModelRef {
+            provider_id: "p".into(),
+            model_id: "m".into(),
+            display_name: "M".into(),
+        }
+    }
+
+    /// A sub-agent event as the hub forwards it: the child's own session and turn id, arriving on
+    /// the parent's channel.
+    fn child_event(payload: StreamPayload) -> StreamEvent {
+        StreamEvent {
+            seq: 1,
+            session_id: "child-session".into(),
+            turn_id: "child-turn".into(),
+            agent: zlogic_protocol::stream::AgentRef {
+                agent_id: Some("child-session".into()),
+                parent_agent_id: Some("parent-session".into()),
+                name: "researcher".into(),
+            },
+            payload,
+        }
+    }
+
+    #[test]
+    fn a_sub_agents_turn_is_not_this_sessions_turn() {
+        use zlogic_protocol::stream::{TurnStats, TurnStatus};
+        let pump = pump();
+        let payloads = [
+            StreamPayload::TurnStart {
+                model: model(),
+                resumed: false,
+                proactive: false,
+            },
+            StreamPayload::RoundStart {
+                round_id: "child-round".into(),
+                round_seq: 0,
+                model: model(),
+            },
+            StreamPayload::BlockDelta {
+                block_id: "child-round:0".into(),
+                delta: "the child's own words".into(),
+            },
+            StreamPayload::TurnEnd {
+                status: TurnStatus::Completed,
+                reason: None,
+                stats: TurnStats::default(),
+            },
+        ];
+        for payload in payloads {
+            assert!(
+                translate(&child_event(payload), &pump).is_empty(),
+                "a child's payload must not drive this session's turn"
+            );
+        }
+        assert!(
+            pump.active_turn_id.lock().unwrap().is_none(),
+            "Esc must keep cancelling this session's turn, not a sub-agent's"
+        );
+        assert!(pump.round_summaries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_sub_agents_question_still_reaches_the_user() {
+        let pump = pump();
+        let event = child_event(StreamPayload::InteractionRequired {
+            interaction_id: "i-1".into(),
+            body: InteractionBody::Permission {
+                tool: "write_file".into(),
+                args_preview: "{\"path\":\"a.txt\"}".into(),
+                reason: "write".into(),
+                caveats: Vec::new(),
+                offered_scopes: vec![zlogic_protocol::interaction::GrantScope::Once],
+                grant_preview: None,
+            },
+        });
+        let events = translate(&event, &pump);
+        assert!(
+            matches!(events.as_slice(), [CoreEvent::PermissionRequest { id, .. }] if id == "i-1"),
+            "the user watching this session is the one who answers the child: {events:?}"
+        );
+    }
 
     #[test]
     fn provider_model_ref_splits_on_last_colon() {
