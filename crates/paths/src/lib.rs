@@ -115,10 +115,18 @@ mod tests {
         assert_eq!(strip_verbatim(r"\\server\share"), r"\\server\share");
     }
 
+    /// The answer is the *physical* path, so an existing directory can come back spelled another
+    /// way — Windows reaches `%TEMP%` through an 8.3 short name, macOS reaches `/var/folders`
+    /// through the `/var` symlink. What has to hold is that it names the same directory.
     #[test]
     fn normalise_roundtrips_an_existing_directory() {
         let dir = tempfile_dir();
-        assert_eq!(normalise(&dir), dir.to_string_lossy());
+        let normalized = normalise(&dir);
+        assert!(Path::new(&normalized).is_dir(), "{normalized}");
+        assert_eq!(
+            fs::canonicalize(&normalized).unwrap(),
+            fs::canonicalize(&dir).unwrap()
+        );
     }
 
     #[test]
