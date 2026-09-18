@@ -1417,10 +1417,15 @@ mod tests {
     #[tokio::test]
     async fn the_full_transcript_reaches_the_object_store() {
         let (_d, ctx) = setup();
-        let out = Shell::default()
-            .execute(&ctx, &args("zlogic one; zlogic two 1>&2"))
-            .await
-            .unwrap();
+        let shell = Shell::default();
+        // One word to each stream, spelled for the shell that was resolved. A command named after
+        // this product only produced a transcript where a `zlogic` happened to be installed, and a
+        // runner has none: the object held two "command not found" lines and nothing else.
+        let command = match shell.dialect() {
+            ShellDialect::Cmd => "echo one & echo two 1>&2",
+            ShellDialect::Posix | ShellDialect::PowerShell => "echo one; echo two 1>&2",
+        };
+        let out = shell.execute(&ctx, &args(command)).await.unwrap();
 
         let id = out
             .object_with_role(ObjectRole::Output)

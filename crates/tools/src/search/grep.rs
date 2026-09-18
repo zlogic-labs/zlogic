@@ -457,13 +457,17 @@ mod tests {
             1,
             "the path appears once, as the group heading: {text}"
         );
-        let after_heading = text.split("src/total.ts:\n").nth(1).unwrap();
-        assert!(
-            after_heading
-                .lines()
-                .all(|l| l.is_empty() || l.starts_with(|c: char| c.is_ascii_digit())),
-            "under a heading every row starts with its line number: {text}"
-        );
+        // Which file's group comes first is the filesystem's business, so the rows are checked as a
+        // whole: the summary, the two headings, and the blank lines between groups are not rows.
+        for line in text.lines().skip(1) {
+            if line.is_empty() || line == "src/total.ts:" || line == "src/discount.ts:" {
+                continue;
+            }
+            assert!(
+                line.starts_with(|c: char| c.is_ascii_digit()),
+                "under a heading every row starts with its line number: {line:?} in\n{text}"
+            );
+        }
     }
 
     /// The reason this backend exists: the definition and the call are distinguishable.
