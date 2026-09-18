@@ -295,20 +295,25 @@ mod tests {
         assert!(Dirs::discover_with(env_of(&[])).is_err());
     }
 
+    /// The Windows fallbacks are consulted on every host — what is under test is which variable
+    /// wins — so the expectation is built with `join` instead of being written as a Windows
+    /// literal, which only matches where the host joins paths the Windows way.
     #[test]
     fn windows_userprofile_is_home_when_home_is_missing() {
+        let home = PathBuf::from(r"C:\Users\u");
         let d =
             Dirs::discover_with(env_of(&[("HOME", ""), ("USERPROFILE", r"C:\Users\u")])).unwrap();
-        assert_eq!(d.config, PathBuf::from(r"C:\Users\u\.config\zlogic"));
-        assert_eq!(d.state, PathBuf::from(r"C:\Users\u\.local\state\zlogic"));
-        assert_eq!(d.data, PathBuf::from(r"C:\Users\u\.local\share\zlogic"));
+        assert_eq!(d.config, home.join(".config").join("zlogic"));
+        assert_eq!(d.state, home.join(".local/state").join("zlogic"));
+        assert_eq!(d.data, home.join(".local/share").join("zlogic"));
     }
 
     #[test]
     fn windows_homedrive_homepath_is_home_as_a_last_resort() {
+        let home = PathBuf::from("C:").join(r"\Users\u");
         let d =
             Dirs::discover_with(env_of(&[("HOMEDRIVE", "C:"), ("HOMEPATH", r"\Users\u")])).unwrap();
-        assert_eq!(d.config, PathBuf::from(r"C:\Users\u\.config\zlogic"));
+        assert_eq!(d.config, home.join(".config").join("zlogic"));
 
         assert!(Dirs::discover_with(env_of(&[("HOMEDRIVE", "C:")])).is_err());
         assert!(Dirs::discover_with(env_of(&[("HOMEPATH", r"\Users\u")])).is_err());
