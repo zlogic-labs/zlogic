@@ -1,0 +1,27 @@
+[package]
+name = "zlogic-policy"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Shell-command decomposition and path zoning for permission policy review. Std-only so it builds offline."
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zlogic-paths = { path = "../paths" }
+serde.workspace = true
+serde_yaml_ng.workspace = true
+
+[lib]
+name = "zlogic_policy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "policy-explain"
+path = "src/main.rs"
+
+[[bin]]
+name = "policy-default"
+path = "src/default_policy.rs"

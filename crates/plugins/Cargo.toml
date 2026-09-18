@@ -1,0 +1,21 @@
+[package]
+name = "zlogic-plugins"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Plugins: a manifest in a directory that contributes MCP servers"
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zlogic-config = { path = "../config" }
+zlogic-mcp = { path = "../mcp" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

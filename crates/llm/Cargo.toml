@@ -1,0 +1,46 @@
+[package]
+name = "zlogic-llm"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "One client per vendor: protocol parsing, part lifecycle, usage normalization, request serialization"
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["http"]
+http = ["dep:reqwest"]
+test-support = []
+
+[dependencies]
+zlogic-protocol = { path = "../protocol" }
+serde.workspace = true
+serde_json.workspace = true
+async-stream = "0.3.6"
+async-trait = "0.1.89"
+futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
+futures-core = "0.3.32"
+eventsource-stream = { version = "0.2.3", default-features = false, features = ["std"] }
+bytes = "1.11"
+tokio-util = { version = "0.7.18", default-features = false }
+# Automatic retry (`retry.rs`) sleeps for fixed backoff durations, so it needs tokio's time driver.
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
+base64 = "0.22.1"
+sha2 = "0.10.9"
+reqwest = { version = "0.12.28", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+    "system-proxy",
+    "socks",
+], optional = true }
+
+[dev-dependencies]
+zlogic-llm = { path = ".", features = ["test-support"] }
+tokio = { version = "1.52", features = ["rt", "macros", "time", "test-util"] }
+futures = "0.3.32"
+# sse.rs's tests need to drive a Stream from inside a synchronous test.
+futures-executor = "0.3.32"

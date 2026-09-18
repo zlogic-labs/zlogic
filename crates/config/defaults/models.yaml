@@ -1,0 +1,409 @@
+# Generated from https://models.dev/api.json; do not edit by hand.
+#
+#   source:     https://models.dev/api.json
+#   fetched:    2026-07-30
+#   published:  https://zlogic.run/catalog/models.yaml for clients that check for updates
+
+version: 2026-07-30.baa54300
+generated_at: 2026-07-30
+source: https://models.dev/api.json
+
+providers:
+  anthropic:
+    sdk: anthropic
+    base_url: https://api.anthropic.com
+    guide_url: https://platform.claude.com/settings/keys
+    models:
+      "claude-opus-5":
+        display_name: "Claude Opus 5"
+        tier: thinking
+        context_window: 1000000
+        max_output_tokens: 128000
+        vision: true
+        thinking:
+          supported: true
+          can_disable: true
+          efforts: [low, medium, high, xhigh, max]
+        pricing:
+          input_per_m: 5
+          output_per_m: 25
+          cached_input_per_m: 0.5
+          cache_write_per_m: 6.25
+        # models.dev: released 2026-07-24, knowledge 2026-05
+      "claude-sonnet-5":
+        display_name: "Claude Sonnet 5"
+        tier: main
+        context_window: 1000000
+        max_output_tokens: 128000
+        vision: true
+        thinking:
+          supported: true
+          can_disable: true
+          efforts: [low, medium, high, xhigh, max]
+        pricing:
+          input_per_m: 2
+          output_per_m: 10
+          cached_input_per_m: 0.2
+          cache_write_per_m: 2.5
+        # models.dev: released 2026-06-29, knowledge 2026-01-31
+      "claude-opus-4-8":
+        display_name: "Claude Opus 4.8"
+        tier: thinking
+        context_window: 1000000
+        max_output_tokens: 128000
+        vision: true
+        thinking:
+          supported: true
+          can_disable: true
+          efforts: [low, medium, high, xhigh, max]
+        pricing:
+          input_per_m: 5
+          output_per_m: 25
+          cached_input_per_m: 0.5
+          cache_write_per_m: 6.25
+        # models.dev: released 2026-05-28, knowledge 2026-01
+      "claude-haiku-4-5":
+        display_name: "Claude Haiku 4.5 (latest)"
+        tier: light
+        context_window: 200000
+        max_output_tokens: 64000
+        vision: true
+        thinking:
+          supported: true
+          can_disable: true
+          budget: true
+        pricing:
+          input_per_m: 1
+          output_per_m: 5
+          cached_input_per_m: 0.1
+          cache_write_per_m: 1.25
+        # models.dev: released 2025-10-15, knowledge 2025-02-28
+  openai:
+    sdk: openai_responses
+    base_url: https://api.openai.com
+    guide_url: https://platform.openai.com/api-keys
+    models:
+      "gpt-5.6":
+        display_name: "GPT-5.6"
+        tier: thinking
+        context_window: 1050000
+        max_output_tokens: 128000
+        vision: true
+        thinking:
+          supported: true
+          can_disable: true
+          efforts: [low, medium, high, xhigh, max]
+        pricing:
+          input_per_m: 5
+          output_per_m: 30
+          cached_input_per_m: 0.5
+          cache_write_per_m: 6.25
+        # models.dev: released 2026-07-09, knowledge 2026-02-16
+      "gpt-5.6-terra":
+        display_name: "GPT-5.6 Terra"
+        tier: main
+        context_window: 1050000
+        max_output_tokens: 128000
+        vision: true
+        thinking:
+          supported: true
+          can_disable: true
+          efforts: [low, medium, high, xhigh, max]
+        pricing:
+          input_per_m: 2.5
+          output_per_m: 15
+          cached_input_per_m: 0.25
+          cache_write_per_m: 3.125
+        # models.dev: released 2026-07-09, knowledge 2026-02-16
+      "gpt-5.6-luna":
+        display_name: "GPT-5.6 Luna"
+        tier: light
+        context_window: 1050000
+        max_output_tokens: 128000
+        vision: true
+        thinking:
+          supported: true
+          can_disable: true
+          efforts: [low, medium, high, xhigh, max]
+        pricing:
+          input_per_m: 1
+          output_per_m: 6
+          cached_input_per_m: 0.1
+          cache_write_per_m: 1.25
+        # models.dev: released 2026-07-09, knowledge 2026-02-16
+  gemini:
+    sdk: gemini
+    base_url: https://generativelanguage.googleapis.com
+    guide_url: https://aistudio.google.com/apikey
+    models:
+      "gemini-3.6-flash":
+        display_name: "Gemini 3.6 Flash"
+        tier: main
+        context_window: 1048576
+        max_output_tokens: 65536
+        vision: true
+        thinking:
+          supported: true
+          can_disable: false
+          efforts: [minimal, low, medium, high]
+        pricing:
+          input_per_m: 1.5
+          output_per_m: 7.5
+          cached_input_per_m: 0.15
+        # models.dev: released 2026-07-21, knowledge 2026-03
+      "gemini-3.5-flash-lite":
+        display_name: "Gemini 3.5 Flash Lite"
+        tier: light
+        context_window: 1048576
+        max_output_tokens: 65536
+        vision: true
+        thinking:
+          supported: true
+          can_disable: false
+          efforts: [minimal, low, medium, high]
+        pricing:
+          input_per_m: 0.3
+          output_per_m: 2.5
+          cached_input_per_m: 0.03
+        # models.dev: released 2026-07-21, knowledge 2026-03
+  deepseek:
+    sdk: deepseek
+    base_url: https://api.deepseek.com
+    guide_url: https://platform.deepseek.com/api_keys
+    models:
+      "deepseek-v4-pro":
+        display_name: "DeepSeek V4 Pro"
+        tier: main
+        context_window: 1000000
+        max_output_tokens: 384000
+        vision: false
+        thinking:
+          supported: true
+          can_disable: true
+          efforts: [high, max]
+        pricing:
+          input_per_m: 0.435
+          output_per_m: 0.87
+          cached_input_per_m: 0.003625
+        # models.dev: released 2026-04-24, knowledge 2025-05
+      "deepseek-v4-flash":
+        display_name: "DeepSeek V4 Flash"
+        tier: light
+        context_window: 1000000
+        max_output_tokens: 384000
+        vision: false
+        thinking:
+          supported: true
+          can_disable: true
+          efforts: [high, max]
+        pricing:
+          input_per_m: 0.14
+          output_per_m: 0.28
+          cached_input_per_m: 0.0028
+        # models.dev: released 2026-04-24, knowledge 2025-05
+  glm:
+    sdk: glm
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    guide_url: https://bigmodel.cn/usercenter/proj-mgmt/apikeys
+    models:
+      "glm-5.2":
+        display_name: "GLM-5.2"
+        tier: main
+        context_window: 1000000
+        max_output_tokens: 131072
+        vision: false
+        thinking:
+          supported: true
+          can_disable: false
+          efforts: [high, max]
+        pricing:
+          input_per_m: 1.4
+          output_per_m: 4.4
+          cached_input_per_m: 0.26
+          cache_write_per_m: 0
+        # models.dev: released 2026-06-13, knowledge ?
+      "glm-4.7-flashx":
+        display_name: "GLM-4.7-FlashX"
+        tier: light
+        context_window: 200000
+        max_output_tokens: 131072
+        vision: false
+        thinking:
+          supported: true
+          can_disable: true
+        pricing:
+          input_per_m: 0.07
+          output_per_m: 0.4
+          cached_input_per_m: 0.01
+          cache_write_per_m: 0
+        # models.dev: released 2026-01-19, knowledge 2025-04
+  dashscope:
+    sdk: dashscope
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    guide_url: https://help.aliyun.com/en/model-studio/get-api-key
+    models:
+      "qwen3.7-max":
+        display_name: "Qwen3.7 Max"
+        tier: main
+        context_window: 1000000
+        max_output_tokens: 65536
+        vision: false
+        thinking:
+          supported: true
+          can_disable: true
+          budget: true
+        pricing:
+          input_per_m: 2.5
+          output_per_m: 7.5
+          cached_input_per_m: 0.5
+          cache_write_per_m: 3.125
+        # models.dev: released 2026-05-21, knowledge ?
+      "qwen3.7-plus":
+        display_name: "Qwen3.7 Plus"
+        tier: main
+        context_window: 1000000
+        max_output_tokens: 65536
+        vision: true
+        thinking:
+          supported: true
+          can_disable: true
+          budget: true
+        pricing:
+          input_per_m: 0.5
+          output_per_m: 3
+          cached_input_per_m: 0.05
+          cache_write_per_m: 0.625
+        # models.dev: released 2026-06-02, knowledge 2025-04
+  openrouter:
+    sdk: openrouter
+    base_url: https://openrouter.ai/api/v1
+    guide_url: https://openrouter.ai/settings/keys
+    models:
+      "anthropic/claude-opus-5":
+        display_name: "Claude Opus 5"
+        tier: thinking
+        context_window: 1000000
+        max_output_tokens: 128000
+        vision: true
+        thinking:
+          supported: true
+          can_disable: false
+          efforts: [low, medium, high, xhigh, max]
+        pricing:
+          input_per_m: 5
+          output_per_m: 25
+          cached_input_per_m: 0.5
+          cache_write_per_m: 6.25
+        # models.dev: released 2026-07-24, knowledge 2026-05
+      "google/gemini-3.6-flash":
+        display_name: "Gemini 3.6 Flash"
+        tier: main
+        context_window: 1048576
+        max_output_tokens: 65536
+        vision: true
+        thinking:
+          supported: true
+          can_disable: false
+          efforts: [minimal, low, medium, high]
+        pricing:
+          input_per_m: 1.5
+          output_per_m: 7.5
+          cached_input_per_m: 0.15
+          cache_write_per_m: 0.083333
+        # models.dev: released 2026-07-21, knowledge 2026-03
+      "qwen/qwen3.7-flash":
+        display_name: "Qwen3.7 Flash"
+        tier: light
+        context_window: 1000000
+        max_output_tokens: 65536
+        vision: true
+        thinking:
+          supported: true
+          can_disable: false
+          budget: true
+        pricing:
+          input_per_m: 0.03
+          output_per_m: 0.13
+          cached_input_per_m: 0.006
+          cache_write_per_m: 0.038
+        # models.dev: released 2026-07-27, knowledge ?
+  xai:
+    sdk: openai_generic
+    base_url: https://api.x.ai/v1
+    guide_url: https://console.x.ai/team/default/api-keys
+    generic:
+      reasoning_carrier: reasoning_content
+      effort_field: reasoning_effort
+      thinking_off: { reasoning_effort: none }
+    models:
+      "grok-4.5":
+        display_name: "Grok 4.5"
+        tier: thinking
+        context_window: 500000
+        max_output_tokens: 500000
+        vision: true
+        thinking:
+          supported: true
+          can_disable: false
+          efforts: [low, medium, high]
+        pricing:
+          input_per_m: 2
+          output_per_m: 6
+          cached_input_per_m: 0.3
+        # models.dev: released 2026-07-08, knowledge ?
+      "grok-4.3":
+        display_name: "Grok 4.3"
+        tier: main
+        context_window: 1000000
+        max_output_tokens: 30000
+        vision: true
+        thinking:
+          supported: true
+          can_disable: true
+          efforts: [low, medium, high]
+        pricing:
+          input_per_m: 1.25
+          output_per_m: 2.5
+          cached_input_per_m: 0.2
+        no_think_params:
+          reasoning_effort: "none"
+        # models.dev: released 2026-04-17, knowledge ?
+  groq:
+    sdk: openai_generic
+    base_url: https://api.groq.com/openai/v1
+    guide_url: https://console.groq.com/keys
+    generic:
+      reasoning_carrier: reasoning_content
+      effort_field: reasoning_effort
+      thinking_off: { reasoning_effort: none }
+    models:
+      "openai/gpt-oss-120b":
+        display_name: "GPT OSS 120B"
+        tier: main
+        context_window: 131072
+        max_output_tokens: 65536
+        vision: false
+        thinking:
+          supported: true
+          can_disable: false
+          efforts: [low, medium, high]
+        pricing:
+          input_per_m: 0.15
+          output_per_m: 0.6
+          cached_input_per_m: 0.075
+        # models.dev: released 2025-08-05, knowledge ?
+      "openai/gpt-oss-20b":
+        display_name: "GPT OSS 20B"
+        tier: light
+        context_window: 131072
+        max_output_tokens: 65536
+        vision: false
+        thinking:
+          supported: true
+          can_disable: false
+          efforts: [low, medium, high]
+        pricing:
+          input_per_m: 0.075
+          output_per_m: 0.3
+          cached_input_per_m: 0.0375
+        # models.dev: released 2025-08-05, knowledge ?

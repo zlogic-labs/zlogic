@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 900" role="img" aria-label="ZLOGIC desktop 全局问答 预览">
+  <defs>
+    <linearGradient id="logo" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#83c7b4"/>
+      <stop offset="1" stop-color="#7b9fe7"/>
+    </linearGradient>
+    <filter id="logoShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#7b9fe7" flood-opacity="0.22"/>
+    </filter>
+    
+    <symbol id="i-home" viewBox="0 0 24 24"><path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/><path d="M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+    <symbol id="i-clipboard-list" viewBox="0 0 24 24"><rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M12 11h4"/><path d="M12 16h4"/><path d="M8 11h.01"/><path d="M8 16h.01"/></symbol>
+    <symbol id="i-chart-column" viewBox="0 0 24 24"><path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></symbol>
+    <symbol id="i-store" viewBox="0 0 24 24"><path d="M15 21v-5a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v5"/><path d="M17.774 10.31a1.12 1.12 0 0 0-1.549 0 2.5 2.5 0 0 1-3.451 0 1.12 1.12 0 0 0-1.548 0 2.5 2.5 0 0 1-3.452 0 1.12 1.12 0 0 0-1.549 0 2.5 2.5 0 0 1-3.77-3.248l2.889-4.184A2 2 0 0 1 7 2h10a2 2 0 0 1 1.653.873l2.895 4.192a2.5 2.5 0 0 1-3.774 3.244"/><path d="M4 10.95V19a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8.05"/></symbol>
+    <symbol id="i-cable" viewBox="0 0 24 24"><path d="M17 19a1 1 0 0 1-1-1v-2a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2a1 1 0 0 1-1 1z"/><path d="M17 21v-2"/><path d="M19 14V6.5a1 1 0 0 0-7 0v11a1 1 0 0 1-7 0V10"/><path d="M21 21v-2"/><path d="M3 5V3"/><path d="M4 10a2 2 0 0 1-2-2V6a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2a2 2 0 0 1-2 2z"/><path d="M7 5V3"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></symbol>
+    <symbol id="i-files" viewBox="0 0 24 24"><path d="M15 2h-4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V8"/><path d="M16.706 2.706A2.4 2.4 0 0 0 15 2v5a1 1 0 0 0 1 1h5a2.4 2.4 0 0 0-.706-1.706z"/><path d="M5 7a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h8a2 2 0 0 0 1.732-1"/></symbol>
+    <symbol id="i-message" viewBox="0 0 24 24"><path d="M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2z"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+    <symbol id="i-panel-left-close" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m16 15-3-3 3-3"/></symbol>
+    <symbol id="i-panel-right-close" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/><path d="m8 9 3 3-3 3"/></symbol>
+    <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></symbol>
+    <symbol id="i-activity" viewBox="0 0 24 24"><path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/></symbol>
+    <symbol id="i-rotate-ccw-clock" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></symbol>
+    <symbol id="i-refresh-cw" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></symbol>
+    <symbol id="i-gauge" viewBox="0 0 24 24"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
+    <symbol id="i-git-branch" viewBox="0 0 24 24"><path d="M15 6a9 9 0 0 0-9 9V3"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><circle cx="12" cy="16" r="1"/><rect x="3" y="10" width="18" height="12" rx="2"/><path d="M7 10V7a5 5 0 0 1 10 0v3"/></symbol>
+    <symbol id="i-paperclip" viewBox="0 0 24 24"><path d="m16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z"/><path d="m21.854 2.147-10.94 10.939"/></symbol>
+    <symbol id="i-shield-check" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></symbol>
+    <symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M9 13a4.5 4.5 0 0 0 3-4"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M12 13h4"/><path d="M12 18h6a2 2 0 0 1 2 2v1"/><path d="M12 8h8"/><path d="M16 8V5a2 2 0 0 1 2-2"/><circle cx="16" cy="13" r=".5"/><circle cx="18" cy="3" r=".5"/><circle cx="20" cy="21" r=".5"/><circle cx="20" cy="8" r=".5"/></symbol>
+    
+    <style>
+      .sans{font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+      .mono{font-family:"JetBrains Mono","SFMono-Regular",Consolas,monospace}
+      .ink{fill:#e5e7eb}
+      .muted{fill:#8b919a}
+      .line{stroke:#2e3035;stroke-width:1.2}
+      .green{fill:#7bb8a4}
+      .icon{stroke:#a0a4ac;stroke-width:2.2;fill:none;stroke-linecap:round;stroke-linejoin:round}
+      .iconSoft{stroke:#7c8189}
+      .iconGreen{stroke:#7bb8a4}
+    </style>
+  </defs>
+  <rect x="0" y="0" width="1440" height="900" fill="#1e1f24"/>
+  <rect x="0" y="0" width="301.5" height="900" fill="#17181c"/>
+  <rect x="301.5" y="0" width="1.5" height="900" fill="#2e3035"/>
+  <circle cx="36" cy="24" r="9" fill="#f15d5d"/><circle cx="64" cy="24" r="9" fill="#f5c13a"/><circle cx="92" cy="24" r="9" fill="#58bf63"/>
+
+  <!-- 侧边栏 -->
+  <g transform="translate(0 0)">
+    <text x="26" y="100" class="sans ink" font-size="18" font-weight="740">ZLOGIC</text>
+    <svg x="252" y="83" width="18" height="18" class="icon"><use href="#i-panel-left-close"/></svg>
+
+    <g class="sans" font-size="16" font-weight="650">
+      <svg x="32" y="133" width="18" height="18" class="icon"><use href="#i-home"/></svg><text x="64" y="152" fill="#c0c4cc">Dashboard</text>
+      <svg x="32" y="167" width="18" height="18" class="icon"><use href="#i-clipboard-list"/></svg><text x="64" y="186" fill="#c0c4cc">任务</text>
+      <svg x="32" y="201" width="18" height="18" class="icon"><use href="#i-chart-column"/></svg><text x="64" y="220" fill="#c0c4cc">用量</text>
+      <svg x="32" y="235" width="18" height="18" class="icon"><use href="#i-store"/></svg><text x="64" y="254" fill="#c0c4cc">插件</text>
+      <svg x="32" y="269" width="18" height="18" class="icon"><use href="#i-cable"/></svg><text x="64" y="288" fill="#c0c4cc">连接管理</text>
+      <svg x="32" y="303" width="18" height="18" class="icon"><use href="#i-search"/></svg><text x="64" y="322" fill="#c0c4cc">全局搜索</text>
+    </g>
+
+    <text x="26" y="360" class="sans muted" font-size="15" font-weight="800" letter-spacing="1.5">工作区 / Sessions</text>
+    <rect x="18" y="382" width="266" height="32" rx="6" fill="#27302c"/>
+    <svg x="31" y="391" width="18" height="18" class="icon" transform="rotate(90 40 400)"><use href="#i-chevron-right"/></svg>
+    <text x="55" y="404" class="sans ink" font-size="17" font-weight="760">Global</text>
+    <rect x="40" y="420" width="244" height="30" rx="6" fill="#222a27"/>
+    <svg x="50" y="428" width="17" height="17" class="icon"><use href="#i-message"/></svg>
+    <text x="76" y="442" class="sans ink" font-size="16" font-weight="760">全局问答</text>
+
+    <line x1="0" y1="835" x2="302" y2="835" class="line"/>
+    <svg x="30" y="852" width="19" height="19" class="icon"><use href="#i-settings"/></svg>
+    <text x="64" y="871" class="sans ink" font-size="16" font-weight="700">设置</text>
+  </g>
+
+  <!-- 主内容 -->
+  <g transform="translate(302 0)">
+    <rect x="0" y="0" width="1138" height="900" fill="#1e1f24"/>
+    <line x1="0" y1="68" x2="1138" y2="68" class="line"/>
+    <text x="40" y="42" class="sans ink" font-size="18" font-weight="800">全局问答</text>
+
+    <g transform="translate(60 140)">
+      <g transform="translate(60 0)" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18" fill="url(#logo)" filter="url(#logoShadow)">
+        <text x="0" y="16" xml:space="preserve">  _____  _        ___     ____   ___    ____ </text>
+        <text x="0" y="38" xml:space="preserve"> |__  / | |      / _ \   / ___| |_ _|  / ___|</text>
+        <text x="0" y="60" xml:space="preserve">   / /  | |     | | | | | |  _   | |  | |    </text>
+        <text x="0" y="82" xml:space="preserve">  / /_  | |___  | |_| | | |_| |  | |  | |___ </text>
+        <text x="0" y="104" xml:space="preserve"> /____| |_____|  \___/   \____| |___|  \____|</text>
+      </g>
+      <text x="60" y="180" class="sans ink" font-size="18" font-weight="800">欢迎使用 ZLOGIC</text>
+      <text x="250" y="180" class="sans muted" font-size="17" font-weight="600">一个桌面端 agent 工作台</text>
+      <g class="sans" font-size="16">
+        <text x="106" y="226" class="green" font-weight="800">Send</text><text x="164" y="226" class="mono green">Enter</text><text x="262" y="226" class="ink">发送消息 · Shift+Enter 换行</text>
+        <text x="90" y="256" class="green" font-weight="800">History</text><text x="176" y="256" class="mono green">Esc</text><text x="262" y="256" class="ink">空输入时打开历史 · 生成中停止当前轮</text>
+        <text x="110" y="286" class="green" font-weight="800">Files</text><text x="182" y="286" class="mono green">@</text><text x="262" y="286" class="ink">引用项目文件或目录</text>
+        <text x="106" y="316" class="green" font-weight="800">Paste</text><text x="164" y="316" class="mono green">Cmd+V</text><text x="262" y="316" class="ink">粘贴文本、Finder 文件或图片</text>
+        <text x="197" y="354" class="muted">更多命令 · 输入 /help</text>
+      </g>
+    </g>
+
+    <!-- 右侧卡片 -->
+    <g transform="translate(790 84)">
+      <!-- 用量卡片 -->
+      <g>
+        <rect width="304" height="180" rx="10" fill="#25272c" stroke="#36383d"/>
+        <text x="22" y="34" class="sans ink" font-size="17" font-weight="800">用量</text>
+        <svg x="260" y="20" width="16" height="16" class="icon"><use href="#i-panel-right-close"/></svg>
+
+        <!-- 用量标题下方的细分隔线 -->
+        <line x1="22" y1="44" x2="282" y2="44" class="line"/>
+
+        <svg x="24" y="66" width="18" height="18" class="icon iconSoft"><use href="#i-activity"/></svg>
+        <text x="56" y="82" class="sans ink" font-size="16" font-weight="800">累计用量</text><text x="284" y="82" class="sans muted" text-anchor="end" font-size="15">暂无</text>
+
+        <svg x="24" y="100" width="18" height="18" class="icon iconSoft"><use href="#i-rotate-ccw-clock"/></svg>
+        <text x="56" y="116" class="sans ink" font-size="16" font-weight="800">本轮用量</text><text x="284" y="116" class="sans muted" text-anchor="end" font-size="15">暂无</text>
+
+        <svg x="24" y="134" width="18" height="18" class="icon iconSoft"><use href="#i-database"/></svg>
+        <text x="56" y="150" class="sans ink" font-size="16" font-weight="800">Context</text><text x="284" y="150" class="sans muted" text-anchor="end" font-size="15">暂无</text>
+      </g>
+    </g>
+
+    <!-- 底部输入框 -->
+    <g transform="translate(60 760)">
+      <rect width="724" height="94" rx="17" fill="#25272c" stroke="#5f9a8c" stroke-width="2.5"/>
+      <text x="18" y="32" class="sans muted" font-size="17">输入消息...</text>
+      <text x="28" y="74" class="mono ink" font-size="16">deepseek-v4-pro</text>
+      <!-- 调整语言切换间距：竖线从170，文字从180 -->
+      <line x1="170" y1="50" x2="170" y2="88" class="line"/>
+      <text x="180" y="74" class="sans ink" font-size="16">中⌄</text>
+      <line x1="374" y1="50" x2="374" y2="88" class="line"/>
+      <svg x="407" y="58" width="18" height="18" class="icon"><use href="#i-brain"/></svg><text x="432" y="74" class="sans ink" font-size="16" font-weight="760">Plan</text>
+      <svg x="510" y="58" width="18" height="18" class="icon iconGreen"><use href="#i-shield-check"/></svg><text x="536" y="74" class="sans green" font-size="16" font-weight="760">替我审批⌄</text>
+      <svg x="650" y="56" width="20" height="20" class="icon iconSoft"><use href="#i-paperclip"/></svg>
+      <svg x="690" y="56" width="20" height="20" class="icon iconSoft"><use href="#i-send"/></svg>
+    </g>
+  </g>
+</svg>

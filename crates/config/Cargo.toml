@@ -1,0 +1,23 @@
+[package]
+name = "zlogic-config"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Directory layout, YAML config loading, provider environment detection"
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zlogic-protocol = { path = "../protocol" }
+zlogic-credential = { path = "../credential" }
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,48 @@
+[package]
+name = "zlogic-cli"
+edition = "2021"
+description = "Ratatui TUI frontend for zlogic, wired to the in-process engine (desktop/cli flow)."
+license.workspace = true
+version = "0.9.9"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
+crossterm.workspace = true
+ratatui = "0.29"
+unicode-width = "0.2"
+anyhow = "1"
+fluent-bundle = "0.15"
+unic-langid = "0.9"
+chrono.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "io-std", "io-util", "net"] }
+# For logging from the exit hook (EngineSession::drop stops all turns); shares the same tracing pipeline as the engine.
+tracing.workspace = true
+
+# engine host dependencies (the same crate graph every host links).
+zlogic-engine = { path = "../../crates/engine" }
+zlogic-protocol = { path = "../../crates/protocol" }
+zlogic-config = { path = "../../crates/config" }
+zlogic-logging = { path = "../../crates/logging" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+signal-hook = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# The command name is zlogic (the package name is still zlogic-cli: `-p zlogic-cli` refers to the package, the artifact is zlogic[.exe]).
+[[bin]]
+name = "zlogic"
+path = "src/main.rs"

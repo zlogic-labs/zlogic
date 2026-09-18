@@ -1,0 +1,37 @@
+[package]
+name = "zlogic-code-sitter"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Code-aware grep: ripgrep-style search, each hit annotated with its enclosing symbol via tree-sitter. Stateless, no index."
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+grep-regex = "0.1"
+grep-searcher = "0.1"
+grep-matcher = "0.1"   # the Matcher trait — used to recover each match's column within its line
+ignore = "0.4"
+tree-sitter = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-php = "0.23"
+tree-sitter-c-sharp = "=0.23.0"
+tree-sitter-zig = "1"
+tree-sitter-lua = "0.2"
+
+[lib]
+name = "code_sitter"
+path = "src/lib.rs"
+
+[[bin]]
+name = "code-sitter"
+path = "src/main.rs"
