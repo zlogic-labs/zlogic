@@ -1,0 +1,41 @@
+[package]
+name = "zlogic-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "One agent run: build context, drive rounds, execute tools, persist"
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zlogic-protocol = { path = "../protocol" }
+zlogic-objects = { path = "../objects" }
+zlogic-store = { path = "../store" }
+zlogic-tools = { path = "../tools" }
+zlogic-task = { path = "../task" }
+zlogic-llm = { path = "../llm", default-features = false }
+zlogic-config = { path = "../config" }
+zlogic-hooks = { path = "../hooks" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+base64 = "0.22.1"
+image.workspace = true
+jsonschema = { version = "0.49.9", default-features = false }
+futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
+tokio = { version = "1.52", features = ["sync", "time", "rt", "macros"] }
+tokio-util.workspace = true
+
+[dev-dependencies]
+# Enables zlogic-llm's scripted fake client (`mock`); test use only.
+zlogic-llm = { path = "../llm", default-features = false , features = ["test-support"] }
+tempfile.workspace = true
+chrono.workspace = true
+tokio = { version = "1.52", features = ["rt", "macros", "time", "sync"] }
+# Opens the real state.db read-only (buildctx_bench example).
+rusqlite.workspace = true
