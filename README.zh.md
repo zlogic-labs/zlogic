@@ -13,11 +13,11 @@
 
 ---
 
-## 桌面端预览
+## CLI 预览
 
-![zlogic 桌面端（浅色主题）](screenshots/desktop.light.svg)
+![zlogic CLI（TUI）](screenshots/cli.gif)
 
-![zlogic 桌面端（深色主题）](screenshots/desktop.dark.svg)
+桌面端见 [zlogic.run](https://zlogic.run)。
 
 ---
 

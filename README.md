@@ -15,11 +15,11 @@
 
 ---
 
-## Desktop preview
+## CLI preview
 
-![zlogic desktop (light theme)](screenshots/desktop.light.svg)
+![zlogic CLI (TUI)](screenshots/cli.gif)
 
-![zlogic desktop (dark theme)](screenshots/desktop.dark.svg)
+Meet the desktop app at [zlogic.run](https://zlogic.run).
 
 ---
 
