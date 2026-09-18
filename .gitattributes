@@ -1,0 +1,29 @@
+# Line endings: stored as LF and checked out as LF, on every platform.
+#
+# The tree is edited on Windows as well as Unix. `text=auto` alone would leave the
+# checkout to `core.autocrlf`, which is per-machine state — a repository cannot
+# rely on it, and the same file would then arrive with CRLF on one machine and LF
+# on another. `eol=lf` makes the working tree the repository's business instead.
+* text=auto eol=lf
+
+# Scripts cmd.exe has to run, which need CRLF. Nothing here is one today; this is
+# here so the first one added does not silently arrive with LF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never converted, never diffed as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.icns binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.xz binary
+*.tar binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
