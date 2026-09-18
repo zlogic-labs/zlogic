@@ -1,0 +1,91 @@
+policy:
+  version: 1
+
+  default: ask
+
+  protected_delete:
+    - "/home/user/project/.git"
+    - "/home/user/.zlogic"
+    - "/home/user/.local/share/zlogic"
+    - "/home/user/.config/zlogic"
+    - "/home/user/.cache/zlogic"
+    - "/home/user/.local/state/zlogic"
+
+  protected_write:
+    - "/home/user/.config/zlogic/policy.yaml"
+    - "/home/user/project/.zlogic/policy.yaml"
+
+  commands:
+    - id: allow-sudo-anything
+      pattern: "sudo **"
+      effect: allow
+
+    - id: allow-bash-dynamic
+      pattern: "bash -c $CMD"
+      effect: allow
+
+    - id: deny-any-force-push
+      pattern: "git push --force **"
+      effect: deny
+
+  exec:
+    - id: allow-git-status
+      head: git
+      args_prefix:
+        - status
+      effect: allow
+      require_static_args: true
+
+    - id: deny-force-push
+      head: git
+      args:
+        - push
+        - --force
+        - "*"
+      effect: deny
+      require_static_args: true
+
+    - id: allow-cat
+      head: cat
+      effect: allow
+      require_static_args: true
+
+  paths:
+    - id: allow-workspace-reads
+      zone: workspace
+      access:
+        - read
+      effect: allow
+
+    - id: allow-workspace-writes
+      zone: workspace
+      access:
+        - write
+      effect: allow
+
+    - id: ask-workspace-delete
+      zone: workspace
+      access:
+        - delete
+      effect: ask
+
+    - id: deny-system-write
+      zone: system
+      access:
+        - write
+        - delete
+      effect: deny
+
+    - id: allow-project-docs
+      zone: workspace
+      glob: "/home/user/project/docs/**"
+      access:
+        - read
+        - write
+      effect: allow
+
+  scripts:
+    - id: ask-workspace-scripts
+      zone: workspace
+      glob: "/home/user/project/**"
+      effect: ask

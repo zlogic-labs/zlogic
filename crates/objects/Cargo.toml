@@ -1,0 +1,27 @@
+[package]
+name = "zlogic-objects"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "content-addressed object storage: large payloads go to disk, only the ObjectId into the DB"
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# rusqlite ToSql/FromSql for ObjectId. Same orphan-rule reason as zlogic-protocol's `sql`.
+sql = ["dep:rusqlite"]
+
+[dependencies]
+serde.workspace = true
+rusqlite = { workspace = true, optional = true }
+thiserror.workspace = true
+tracing.workspace = true
+git2.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,59 @@
+[package]
+name = "zlogic-engine"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "zlogic's process-singleton dispatch layer: UI protocol host, service assembly, turn event fan-out"
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zlogic-protocol = { path = "../protocol" }
+zlogic-credential = { path = "../credential" }
+zlogic-config = { path = "../config" }
+zlogic-core = { path = "../core" }
+zlogic-hooks = { path = "../hooks" }
+zlogic-llm = { path = "../llm" }
+zlogic-mcp = { path = "../mcp" }
+zlogic-plugins = { path = "../plugins" }
+zlogic-objects = { path = "../objects" }
+zlogic-store = { path = "../store" }
+zlogic-tools = { path = "../tools" }
+zlogic-task = { path = "../task" }
+zlogic-policy = { path = "../policy" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "process"] }
+tokio-util.workspace = true
+uuid.workspace = true
+futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
+git2.workspace = true
+ignore = "0.4"
+reqwest.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tar.workspace = true
+xz2.workspace = true
+flate2.workspace = true
+sha2.workspace = true
+zip.workspace = true
+tempfile.workspace = true
+fs2 = "0.4.3"
+
+[dev-dependencies]
+# Enables zlogic-llm's scripted fake client (`mock`); tests only.
+zlogic-llm = { path = "../llm" , features = ["test-support"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tempfile.workspace = true
+serde_yaml_ng.workspace = true
+futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
+bytes = "1.11"
+# lifecycle unit tests edit heartbeat timestamps directly to simulate a dead host.
+rusqlite.workspace = true

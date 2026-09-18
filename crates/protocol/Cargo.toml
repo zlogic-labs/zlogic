@@ -1,0 +1,28 @@
+[package]
+name = "zlogic-protocol"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Source of truth for zlogic's protocol types: the three boundaries core↔llm, UI→engine, engine→UI"
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+sql = ["dep:rusqlite"]
+ts = ["dep:ts-rs"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+rusqlite = { workspace = true, optional = true }
+ts-rs = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_yaml_ng.workspace = true

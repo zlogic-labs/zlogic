@@ -1,0 +1,106 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/protocol",
+    "crates/credential",
+    "crates/llm",
+    "crates/config",
+    "crates/objects",
+    "crates/paths",
+    "crates/store",
+    "crates/task",
+    "crates/policy",
+    "crates/code-sitter",
+    "crates/tools",
+    "crates/hooks",
+    "crates/mcp",
+    "crates/plugins",
+    "crates/logging",
+    "crates/core",
+    "crates/engine",
+    # apps/cli: the Ratatui TUI host, wired to the engine in-process.
+    "apps/cli",
+]
+
+default-members = [
+    "crates/protocol",
+    "crates/credential",
+    "crates/llm",
+    "crates/config",
+    "crates/objects",
+    "crates/paths",
+    "crates/store",
+    "crates/task",
+    "crates/policy",
+    "crates/code-sitter",
+    "crates/tools",
+    "crates/hooks",
+    "crates/mcp",
+    "crates/plugins",
+    "crates/logging",
+    "crates/core",
+    "crates/engine",
+    "apps/cli",
+]
+
+[workspace.package]
+version = "0.9.9"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149", features = ["preserve_order"] }
+serde_yaml_ng = "0.10"          # serde_yaml is deprecated and archived; this is the maintained fork
+dirs = "6"
+thiserror = "2.0"
+tracing = "0.1"
+async-trait = "0.1.89"
+sha1 = "0.10"                   # git object ids (not sha2: git really is SHA-1)
+git2 = { version = "0.20", default-features = false }
+sha2 = "0.10.9"
+flate2 = "1.0"                  # git loose objects are zlib-compressed
+rusqlite = { version = "0.32", features = ["bundled", "chrono", "hooks", "uuid"] }
+uuid = { version = "1", features = ["v7"] }   # v7 = time-ordered, well suited to a primary key
+tempfile = "3"
+tar = "0.4"
+xz2 = "0.1.7"                    # node's Linux distribution is a .tar.xz
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json", "stream", "system-proxy", "socks"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+crossterm = "0.28.1"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+ring = { version = "0.17.14", features = ["std"] }
+security-framework = "3.7"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2"
+tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
+tokio-util = { version = "0.7", default-features = false }
+ts-rs = { version = "11.1", default-features = false, features = [
+    "serde-compat",
+    "serde-json-impl",
+    "chrono-impl",
+    "uuid-impl",
+    "no-serde-warnings",
+] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.dev]
+incremental = false
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.dev.package."zlogic-engine"]
+incremental = true
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 16
+strip = "symbols"

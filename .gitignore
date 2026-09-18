@@ -1,0 +1,46 @@
+# ---------- Rust ----------
+target/
+*.rs.bk
+
+# ---------- Node / Bun ----------
+node_modules
+dist/
+build/
+.next/
+*.tsbuildinfo
+coverage/
+
+# ---------- environment / secrets ----------
+.env
+.env.*
+!.env.example
+
+# ---------- logs ----------
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------- IDE / editors ----------
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ---------- operating systems ----------
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ---------- scratch files ----------
+*.tmp
+*.bak
+
+# ---------- model-generated scratch (cache directory) ----------
+.zlogic/

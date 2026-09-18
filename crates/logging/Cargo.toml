@@ -1,0 +1,22 @@
+[package]
+name = "zlogic-logging"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "One place that wires tracing consistently for CLI / desktop / tests"
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zlogic-config = { path = "../config" }
+# Bucketing by day needs "today" — chrono is already available in the workspace, and a date format is not worth a new dependency.
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
