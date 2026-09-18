@@ -1646,7 +1646,16 @@ mod tests {
 
         let tail = tail_text(&s, 20);
         assert!(tail.iter().any(|line| line.contains("_____")));
-        assert!(tail.iter().any(|line| line.contains("/help")));
+        // The tip block is drawn from a random subset of `splash::TIPS`, so the
+        // test follows the picks this launch made instead of naming one of them.
+        assert!(!s.help.is_empty());
+        for tip in &s.help {
+            let (cmd, _) = splash::TIPS[*tip % splash::TIPS.len()];
+            assert!(
+                tail.iter().any(|line| line.contains(cmd)),
+                "the visible tail is missing the {cmd} tip"
+            );
+        }
         assert!(s.history_outbox.is_empty());
     }
 
