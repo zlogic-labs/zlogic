@@ -128,6 +128,11 @@ impl Dirs {
         self.config.join("models.yaml")
     }
 
+    /// What a subscription backend said this account may call; a fetched snapshot, not config.
+    pub fn provider_models_file(&self) -> PathBuf {
+        self.data.join("provider-models.json")
+    }
+
     pub fn state_db(&self) -> PathBuf {
         self.state.join("state.db")
     }
@@ -142,6 +147,14 @@ impl Dirs {
 
     pub fn secrets_blob(&self) -> PathBuf {
         self.security_dir().join(".key.enc")
+    }
+
+    /// The secret table used when the keychain is turned off — plaintext, and deliberately a
+    /// different file from [`Dirs::secrets_blob`]. Two stores, two files: turning the keychain on
+    /// and off again must not have one backend read or overwrite the other's data, and a file that
+    /// only ever holds one format needs no format detection.
+    pub fn secrets_plain_file(&self) -> PathBuf {
+        self.security_dir().join(".key.json")
     }
 
     pub fn objects(&self) -> PathBuf {
@@ -339,6 +352,18 @@ mod tests {
             Some(d.security_dir().as_path())
         );
         assert_eq!(d.secrets_blob().parent(), Some(d.security_dir().as_path()));
+    }
+
+    #[test]
+    fn the_two_secret_stores_never_share_a_file() {
+        let d = Dirs::under("/tmp/x");
+        assert!(d.secrets_plain_file().starts_with(&d.security_dir()));
+        assert_ne!(
+            d.secrets_plain_file(),
+            d.secrets_blob(),
+            "turning the keychain on and off must not have one store read the other's file"
+        );
+        assert_ne!(d.secrets_plain_file(), d.master_key_file());
     }
 
     #[test]

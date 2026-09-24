@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/protocol",
     "crates/credential",
+    "crates/codex",
     "crates/llm",
     "crates/config",
     "crates/objects",
@@ -25,6 +26,7 @@ members = [
 default-members = [
     "crates/protocol",
     "crates/credential",
+    "crates/codex",
     "crates/llm",
     "crates/config",
     "crates/objects",

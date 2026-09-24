@@ -13,6 +13,7 @@
 /// Every migration, in order. The index is the schema version.
 pub const MIGRATIONS: &[&str] = &[
     V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19, V20, V21,
+    V22,
 ];
 
 /// The current version — what a freshly created database reports.
@@ -426,6 +427,28 @@ CREATE INDEX IF NOT EXISTS idx_entry_object_kind ON entry_object(kind, entry_id)
 const V21: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_entry_interaction
 ON session_entry(session_id, seq) WHERE kind IN ('interaction_request', 'interaction_response');
+"#;
+
+/// Quick translate's history, which doubles as its cache: the same text into the same language is
+/// answered from here instead of from the model.
+///
+/// No foreign key to `workspaces`: a translation is a record of something the user did, and it has
+/// to survive the workspace being deleted — deleting a workspace must not need this table touched.
+/// `(target_code, source_text)` is indexed for the cache lookup, `created_at` for the list.
+const V22: &str = r#"
+CREATE TABLE IF NOT EXISTS translation (
+  id             INTEGER PRIMARY KEY,
+  translation_id TEXT NOT NULL UNIQUE,
+  workspace_id   TEXT NOT NULL,
+  target         TEXT NOT NULL,
+  target_code    TEXT NOT NULL,
+  source_text    TEXT NOT NULL,
+  result_text    TEXT NOT NULL,
+  model_ref      TEXT,
+  created_at     TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_translation_recent ON translation(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_translation_cache ON translation(target_code, source_text);
 "#;
 
 #[cfg(test)]

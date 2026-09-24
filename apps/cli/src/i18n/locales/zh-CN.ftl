@@ -368,3 +368,26 @@ notice-tasks-still-running = 本 turn 启动的后台任务仍在运行，完成
 error-submit-internal-part = 任务更新、技能加载和技能调用只能由运行时产生
 error-submit-empty = 提交内容为空
 error-submit-unknown-model = 未知模型：{ $model }
+
+# ── auth 子命令（zlogic auth …）──
+auth-unknown-command = 不认识的 auth 子命令：{ $command }
+auth-usage-list = 用法：zlogic auth（不接参数）
+auth-usage-login = 用法：zlogic auth login <provider> [--device]
+auth-usage-logout = 用法：zlogic auth logout <provider>
+auth-usage-refresh = 用法：zlogic auth refresh <provider>
+auth-list-title = Provider 一览：
+auth-list-empty = 尚未配置任何 provider
+auth-marker-in = 已配置
+auth-marker-out = 未配置
+auth-open-url = 打开下面的链接继续：{ $url }
+auth-open-failed = 无法打开浏览器（{ $reason }），请手动打开上面的链接。
+auth-device-code = 打开 { $url } 并输入验证码 { $code }
+auth-waiting = 等待登录结果…
+auth-signed-in-as = 已登录：{ $account } { $plan }
+auth-signed-out = 已退出 { $provider }
+auth-sign-in-failed = 登录失败：{ $message }
+auth-sign-in-expired = 登录超时，未完成授权
+auth-sign-in-cancelled = 登录已取消
+auth-sign-in-pending = 登录没有返回结果
+auth-models-title = { $provider } 可用的模型：
+auth-models-count = { $provider } 共 { $count } 个模型

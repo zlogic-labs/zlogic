@@ -388,3 +388,26 @@ notice-tasks-still-running = Background tasks started by this turn are still run
 error-submit-internal-part = Task updates, skill loads and skill invocations can only be produced by the runtime
 error-submit-empty = The submission is empty
 error-submit-unknown-model = Unknown model: { $model }
+
+# ── auth subcommand (zlogic auth …) ──
+auth-unknown-command = Unknown auth subcommand: { $command }
+auth-usage-list = Usage: zlogic auth (no arguments)
+auth-usage-login = Usage: zlogic auth login <provider> [--device]
+auth-usage-logout = Usage: zlogic auth logout <provider>
+auth-usage-refresh = Usage: zlogic auth refresh <provider>
+auth-list-title = Providers:
+auth-list-empty = No providers configured yet
+auth-marker-in = configured
+auth-marker-out = not configured
+auth-open-url = Open this URL to continue: { $url }
+auth-open-failed = Could not open a browser ({ $reason }); open the URL above yourself.
+auth-device-code = Open { $url } and enter the code { $code }
+auth-waiting = Waiting for the sign-in to come back…
+auth-signed-in-as = Signed in as { $account } { $plan }
+auth-signed-out = Signed { $provider } out
+auth-sign-in-failed = Sign-in failed: { $message }
+auth-sign-in-expired = The sign-in expired before it was completed
+auth-sign-in-cancelled = Sign-in cancelled
+auth-sign-in-pending = The sign-in never came back
+auth-models-title = Models { $provider } offers:
+auth-models-count = { $count } models available for { $provider }

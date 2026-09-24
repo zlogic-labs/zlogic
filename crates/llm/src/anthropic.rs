@@ -64,14 +64,15 @@ impl LlmClient for AnthropicClient {
 
         let mut http = self
             .endpoint
-            .request("v1/messages", payload)
+            .request(self.endpoint.path_or("v1/messages"), payload)
             .header("anthropic-version", API_VERSION);
         if let Some(betas) = beta_header(&self.endpoint.capabilities, &req.cache) {
             http = http.header("anthropic-beta", betas);
         }
         http = self
             .endpoint
-            .authorize(http, crate::AuthHeader::Raw("x-api-key"));
+            .authorize(http, crate::AuthHeader::Raw("x-api-key"), &req.meta)
+            .await?;
         for (k, v) in &self.endpoint.extra_headers {
             http = http.header(k.clone(), v.clone());
         }

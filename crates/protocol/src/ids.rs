@@ -226,6 +226,10 @@ define_id! {
     UsageId
 }
 define_id! {
+    /// One remembered quick translation.
+    TranslationId
+}
+define_id! {
     /// One durable user memory.
     MemoryId
 }

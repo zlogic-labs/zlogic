@@ -48,9 +48,23 @@ pub fn run() -> ExitCode {
     // start and the /model panel is unreachable, so this is the documented way to
     // add a key headlessly.
     if std::env::args().nth(1).as_deref() == Some("key") {
-        let words: Vec<String> = std::env::args().skip(2).collect();
-        let locale = key_locale(&words);
-        return match cli::keys::run(words, locale) {
+        let raw: Vec<String> = std::env::args().skip(2).collect();
+        let locale = key_locale(&raw);
+        return match cli::keys::run(without_locale(raw), locale) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("zlogic: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // `auth` is intercepted the same way: signing a provider in must work before any model is
+    // configured, which is exactly when the TUI refuses to start.
+    if std::env::args().nth(1).as_deref() == Some("auth") {
+        let raw: Vec<String> = std::env::args().skip(2).collect();
+        let locale = key_locale(&raw);
+        return match cli::auth::run(without_locale(raw), locale) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("zlogic: {e}");
@@ -199,5 +213,50 @@ fn key_locale(words: &[String]) -> i18n::Locale {
             Err(_) => i18n::Locale::detect(),
         },
         None => i18n::Locale::detect(),
+    }
+}
+
+/// Drop `--locale <tag>` from an intercepted command line.
+///
+/// It is how the handler was told which language to answer in; the subcommand itself has no use
+/// for it and would otherwise read it as an argument (`zlogic auth list --locale zh-CN` would be a
+/// usage error).
+fn without_locale(words: Vec<String>) -> Vec<String> {
+    let mut kept = Vec::with_capacity(words.len());
+    let mut skip_next = false;
+    for word in words {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if word == "--locale" {
+            skip_next = true;
+            continue;
+        }
+        kept.push(word);
+    }
+    kept
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(list: &[&str]) -> Vec<String> {
+        list.iter().map(|word| word.to_string()).collect()
+    }
+
+    #[test]
+    fn the_locale_flag_reaches_the_handler_and_not_the_subcommand() {
+        let raw = words(&["list", "--locale", "zh-CN"]);
+        assert_eq!(key_locale(&raw), i18n::Locale::ZhCn);
+        assert_eq!(without_locale(raw), ["list"]);
+
+        assert_eq!(without_locale(words(&["--locale"])), Vec::<String>::new());
+        assert_eq!(
+            without_locale(words(&["login", "codex", "--device"])),
+            ["login", "codex", "--device"],
+            "everything else is left alone"
+        );
     }
 }

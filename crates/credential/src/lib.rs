@@ -9,11 +9,27 @@ use std::sync::{OnceLock, RwLock};
 use serde::{Deserialize, Serialize};
 
 pub use vault::{
-    MASTER_ACCOUNT, MASTER_ENV_VAR, MASTER_KEY_LEN, SecretVault, init_secret_vault,
+    EncryptedPaths, MASTER_ACCOUNT, MASTER_ENV_VAR, MASTER_KEY_LEN, SecretVault, init_secret_vault,
     secret_vault_initialized,
 };
 
 pub const KEYRING_SERVICE: &str = "zlogic";
+
+/// Whether the OS credential store may be touched at all.
+///
+/// Off, every `keyring:` reference is answered by the vault file instead — no Keychain prompt on a
+/// macOS build without a signature, and nothing to be refused in a headless session.
+pub fn keychain_enabled() -> bool {
+    KEYCHAIN_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_keychain_enabled(on: bool) {
+    KEYCHAIN_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+    vault::set_keychain_enabled(on);
+}
+
+static KEYCHAIN_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(vault::DEFAULT_KEYCHAIN_ENABLED);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(into = "String", try_from = "String")]
@@ -146,6 +162,13 @@ pub struct AwsCredentials {
 pub trait CredentialStore: Send + Sync {
     fn resolve(&self, credential_ref: &str) -> Option<String>;
 
+    /// Where a store answers `keyring:` references from. Only the engine's UI needs this — it
+    /// labels a stored key so the user can tell "in the OS keychain" from "in a plaintext file" —
+    /// and it is false for a custom store, which is not the local secret file.
+    fn keyring_is_local_file(&self) -> bool {
+        false
+    }
+
     fn is_available(&self, credential_ref: &CredentialRef) -> bool {
         self.resolve(&credential_ref.to_string()).is_some()
     }
@@ -202,6 +225,11 @@ impl SystemCredentialStore {
                         .and_then(|vault| vault.get(name))
                         .ok_or_else(|| CredentialError::Missing(reference.clone()));
                 }
+                // Only reachable before a vault is registered. A process with no store at all must
+                // not touch the OS keychain once it has been turned off.
+                if !keychain_enabled() {
+                    return Err(CredentialError::Missing(reference.clone()));
+                }
                 keyring::Entry::new(KEYRING_SERVICE, name)
                     .and_then(|entry| entry.get_password())
                     .map_err(|error| match error {
@@ -222,6 +250,10 @@ impl CredentialStore for SystemCredentialStore {
             .parse::<CredentialRef>()
             .ok()
             .and_then(|reference| Self::resolve_ref(&reference).ok())
+    }
+
+    fn keyring_is_local_file(&self) -> bool {
+        !keychain_enabled()
     }
 
     fn set_keyring(&self, entry: &str, secret: &str) -> Result<(), CredentialError> {
@@ -303,6 +335,14 @@ pub fn keyring_entry(id: &str) -> String {
     }
 }
 
+/// The keychain entry holding one provider's subscription sign-in (an OAuth token document).
+///
+/// It is deliberately not the provider's plain key entry: a ChatGPT plan is not an API key, and
+/// the two must not overwrite each other.
+pub fn provider_oauth_entry(provider_id: &str) -> String {
+    format!("{provider_id}_oauth")
+}
+
 pub fn credential_candidates(provider_id: &str, auto_detect_env: bool) -> Vec<CredentialRef> {
     let mut candidates = Vec::new();
     if auto_detect_env {
@@ -353,6 +393,7 @@ fn known_env_keys(provider_id: &str) -> &'static [&'static str] {
         "glm" => &["ZHIPUAI_API_KEY", "GLM_API_KEY"],
         "fireworks" => &["FIREWORKS_API_KEY"],
         "bedrock" => &["AWS_SECRET_ACCESS_KEY"],
+        "opencode-go" => &["OPENCODE_API_KEY"],
         _ => &[],
     }
 }

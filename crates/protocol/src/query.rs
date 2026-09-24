@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ProviderConfig;
 pub use crate::error::{ApiError, ApiResult};
-use crate::ids::{RoundId, SessionId, TurnId, WorkspaceId};
+use crate::ids::{RoundId, SessionId, TranslationId, TurnId, WorkspaceId};
 use crate::interaction::{InteractionBody, InteractionDecision};
 use crate::llm::Effort;
 use crate::stream::{ToolDisplay, ToolStatus, TurnStats, TurnStatus};
@@ -639,6 +639,81 @@ pub struct TaskJobDraft {
     pub executor: TaskJobExecutor,
     pub schedule: TaskJobSchedule,
     pub concurrency_policy: TaskJobConcurrencyPolicy,
+}
+
+/// Translate one piece of text outside the conversation.
+///
+/// Same no-turn auxiliary path as [`WorkspaceGitGenerateCommitMessageReq`]: no transcript, no
+/// global system prompt, no tools, no visible turn. `to` is the target language **as the model
+/// should name it** ("English", "简体中文") — naming it is the entire instruction. The source
+/// language is deliberately not a field: it is detected, so a saved "quick translate" is one
+/// choice (the target) rather than two.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TextTranslateReq {
+    /// Usage is accounted against a hidden task session in this workspace, as the task draft does.
+    pub workspace_id: WorkspaceId,
+    pub text: String,
+    pub to: String,
+    /// The target's language tag, when the caller knows it. Nothing in the prompt uses it: it is
+    /// what history and its cache match on, so "English" the name can change wording without
+    /// splitting the history of the same language in two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_code: Option<String>,
+    /// Model to translate with; absent means the utility route (the session model, then the light
+    /// tier), which is what a short call like this should get by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ref: Option<String>,
+}
+
+/// One translation, as answered.
+///
+/// `cached` is the honest half: the same text into the same language was translated before, so the
+/// stored answer came back and no model was called. The UI says so rather than presenting a
+/// remembered result as a fresh one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TextTranslateResp {
+    pub translation_id: TranslationId,
+    pub text: String,
+    pub cached: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A remembered translation, for the history list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TranslationEntry {
+    pub translation_id: TranslationId,
+    pub workspace_id: WorkspaceId,
+    /// The target as the prompt named it, and the tag the cache matches on.
+    pub target: String,
+    pub target_code: String,
+    pub source_text: String,
+    pub result_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ref: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TranslationListReq {
+    /// How many of the most recent to return. Absent means [`DEFAULT_TRANSLATION_PAGE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// How much history a list call returns when the caller does not say.
+pub const DEFAULT_TRANSLATION_PAGE: u32 = 50;
+
+/// The most a list call may return, so a hand-written request cannot ask for everything.
+pub const MAX_TRANSLATION_PAGE: u32 = 500;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TranslationDeleteReq {
+    pub translation_id: TranslationId,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1334,6 +1409,7 @@ pub struct SettingsView {
     pub limits: crate::settings::LimitsConfig,
     pub network: crate::settings::NetworkSettings,
     pub auto_detect_env: bool,
+    pub keychain: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1370,6 +1446,11 @@ pub struct ConfigUpdateReq {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub auto_detect_env: Option<bool>,
+    /// `None` leaves the switch alone. Setting it also re-points the vault at the other backend for
+    /// the rest of this process, so a change takes effect without a restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub keychain: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub llm_roles: Option<std::collections::BTreeMap<String, crate::roles::RoleSettings>>,
@@ -1437,6 +1518,9 @@ pub struct OpenAiCompatibleProviderReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub tier: Option<crate::config::Tier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub rate_limit: Option<crate::config::ModelRateLimit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub create_scope: Option<ConfigCreateScope>,
@@ -1547,9 +1631,104 @@ pub struct CredentialVerifyResult {
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum CredentialSource {
+    /// The OS credential store, or the encrypted vault that stands in front of it.
     Keyring,
+    /// The local secret file, used when the keychain is turned off. A different label on purpose:
+    /// the value there is stored unencrypted, and calling that "Keychain" would misdescribe it.
+    File,
     Env,
     Missing,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum ProviderSignInMethod {
+    /// The browser callback on the loopback port.
+    Browser,
+    /// A code the user types at the issuer: the flow that works without a browser.
+    Device,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ProviderSignInBeginReq {
+    pub provider_id: String,
+    #[serde(default = "browser_sign_in")]
+    pub method: ProviderSignInMethod,
+}
+
+fn browser_sign_in() -> ProviderSignInMethod {
+    ProviderSignInMethod::Browser
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ProviderSignInBegin {
+    pub flow_id: String,
+    pub provider_id: String,
+    pub method: ProviderSignInMethod,
+    pub authorization_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ProviderSignInStatusReq {
+    pub flow_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ProviderSignInCancelReq {
+    pub flow_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum ProviderSignInState {
+    Pending,
+    Succeeded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<String>,
+    },
+    Failed {
+        message: String,
+    },
+    Expired,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ProviderSignInStatus {
+    pub flow_id: String,
+    pub provider_id: String,
+    pub state: ProviderSignInState,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ProviderModelsReq {
+    pub provider_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ProviderModels {
+    pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<DateTime<Utc>>,
+    pub models: Vec<crate::config::ModelConfig>,
 }
 
 fn is_false(b: &bool) -> bool {

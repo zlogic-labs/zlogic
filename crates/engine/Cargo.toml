@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 zlogic-protocol = { path = "../protocol" }
 zlogic-credential = { path = "../credential" }
+zlogic-codex = { path = "../codex" }
 zlogic-config = { path = "../config" }
 zlogic-core = { path = "../core" }
 zlogic-hooks = { path = "../hooks" }

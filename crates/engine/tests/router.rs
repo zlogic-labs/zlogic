@@ -3,7 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use zlogic_config::{AppConfig, ConfigFile};
 use zlogic_engine::{AwsCredentials, CredentialStore, EngineError, ModelRouter};
-use zlogic_llm::transport::{HttpTransport, ReplayTransport};
+use zlogic_llm::transport::{HttpTransport, RecordingTransport, ReplayTransport};
+use zlogic_protocol::llm::{CacheSpec, LlmRequest, RequestMeta, ThinkingIntent, ThinkingMode};
+use zlogic_protocol::message::{ContentPart, Message, TextPart};
 use zlogic_protocol::usage::Purpose;
 
 #[derive(Default)]
@@ -548,4 +550,120 @@ fn credentials_are_read_at_resolve_time_and_never_stored() {
         !dumped.contains("k1"),
         "the key's value must not appear in ResolvedModel"
     );
+}
+
+/// The subscription provider as `defaults/codex.yaml` declares it: the backend is not
+/// `api.openai.com`, and there is no path `/v1` under it.
+const SUBSCRIPTION: &str = r#"
+default_model: codex:gpt-test
+providers:
+  codex:
+    sdk: openai_responses
+    auth: chatgpt
+    base_url: https://chatgpt.com/backend-api/codex
+    wiring:
+      path: responses
+    models:
+      gpt-test:
+        context_window: 400000
+        display_name: GPT Test
+"#;
+
+/// A stored sign-in, as `zlogic auth login codex` would have written it.
+fn subscription_tokens() -> String {
+    serde_json::json!({
+        "access_token": "access-1",
+        "refresh_token": "refresh-1",
+        "expires_at": 9_999_999_999_999i64,
+        "account_id": "acct-1",
+    })
+    .to_string()
+}
+
+fn request(model: &str) -> LlmRequest {
+    LlmRequest {
+        model: model.to_string(),
+        system: Vec::new(),
+        messages: vec![Message::user(vec![ContentPart::Text(TextPart {
+            text: "hello".into(),
+            raw: None,
+            truncated: false,
+        })])],
+        tools: Vec::new(),
+        thinking: ThinkingIntent {
+            mode: ThinkingMode::Off,
+            ..Default::default()
+        },
+        params: Default::default(),
+        response_format: None,
+        cache: CacheSpec::off(),
+        meta: RequestMeta {
+            session_id: "session-1".into(),
+            turn_id: "turn-1".into(),
+            round_id: "round-1".into(),
+            purpose: Purpose::Main,
+        },
+    }
+}
+
+#[tokio::test]
+async fn a_subscription_model_sends_its_token_and_the_codex_headers() {
+    let recorder = RecordingTransport::new();
+    let keys = FakeKeys::with(&[("keyring:codex_oauth", &subscription_tokens())]);
+    let router = ModelRouter::new(
+        config(SUBSCRIPTION),
+        Arc::new(recorder.clone()),
+        keys.clone(),
+    );
+
+    let routed = router
+        .resolve(&Purpose::Main, Some("codex:gpt-test"))
+        .unwrap();
+    assert_eq!(routed.model_ref(), "codex:gpt-test");
+
+    let mut stream = routed.client.stream(request("gpt-test")).await.unwrap();
+    while futures_util::StreamExt::next(&mut stream).await.is_some() {}
+
+    let sent = recorder.last().expect("the request has to reach the wire");
+    let header = |name: &str| {
+        sent.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(
+        sent.url, "https://chatgpt.com/backend-api/codex/responses",
+        "a subscription has no /v1 and no api.openai.com"
+    );
+    assert_eq!(
+        header("authorization").as_deref(),
+        Some("Bearer access-1"),
+        "the token is read per request, not baked into the client"
+    );
+    assert_eq!(header("chatgpt-account-id").as_deref(), Some("acct-1"));
+    assert_eq!(header("session_id").as_deref(), Some("session-1"));
+    assert!(header("originator").is_some());
+    assert!(
+        keys.asked
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|reference| reference == "keyring:codex_oauth"),
+        "a subscription looks in exactly one place: {:?}",
+        keys.asked.lock().unwrap()
+    );
+}
+
+#[test]
+fn a_subscription_with_no_sign_in_is_not_routed_anywhere_else() {
+    let router = router(SUBSCRIPTION, &[]);
+    // Routing reports the chain it walked, not the reason each candidate was dropped; the reason
+    // (`provider codex is not signed in`) is logged by the client builder that refused it.
+    match router.resolve(&Purpose::Main, Some("codex:gpt-test")) {
+        Err(EngineError::NoModel { role, tried }) => {
+            assert_eq!(role, "main");
+            assert!(tried.contains(&"codex:gpt-test".to_string()), "{tried:?}");
+        }
+        other => panic!("{:?}", other.map(|routed| routed.model_ref())),
+    }
 }

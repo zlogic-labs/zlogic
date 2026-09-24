@@ -229,6 +229,23 @@ providers:
       gpt-4o: {}
 ```
 
+### Sign in with a ChatGPT plan
+
+A plan is not an API key, so it is signed in rather than pasted:
+
+```sh
+zlogic auth                    # which providers are signed in
+zlogic auth login codex        # opens the browser; --device prints a code for a headless machine
+zlogic auth refresh codex      # ask the backend which models the plan may call
+zlogic auth logout codex
+```
+
+The sign-in stores an OAuth token in the keyring under `codex_oauth`; the access token is refreshed
+per request, so a session that outlives one token keeps working. `login` and `refresh` also record
+the model list the account is allowed to use — the server's answer wins over the built-in floor.
+Models of this provider go to the Codex backend (`chatgpt.com/backend-api/codex`), never to
+`api.openai.com`.
+
 ### Run it
 
 ```sh

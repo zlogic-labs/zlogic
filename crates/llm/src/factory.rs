@@ -21,6 +21,26 @@ pub struct BedrockAuth {
     pub credentials: Credentials,
 }
 
+/// What a client authenticates with.
+///
+/// A provider picks one of these; a subscription token is not interchangeable with an API key,
+/// which is why they are separate fields rather than one "secret".
+#[derive(Default)]
+pub struct Auth {
+    pub api_key: Option<String>,
+    pub token: Option<Arc<dyn crate::TokenProvider>>,
+    pub bedrock: Option<BedrockAuth>,
+}
+
+impl Auth {
+    pub fn key(key: impl Into<String>) -> Self {
+        Self {
+            api_key: Some(key.into()),
+            ..Default::default()
+        }
+    }
+}
+
 pub struct ClientConfig {
     pub endpoint: Endpoint,
     pub max_output_tokens: Option<u64>,
@@ -118,10 +138,14 @@ fn detail(client: RetryingClient) -> Arc<dyn LlmClient> {
 
 pub fn from_resolved(
     model: &ResolvedModel,
-    api_key: Option<String>,
-    bedrock: Option<BedrockAuth>,
+    auth: Auth,
     transport: Arc<dyn HttpTransport>,
 ) -> Result<Arc<dyn LlmClient>, ConfigError> {
+    let Auth {
+        api_key,
+        token,
+        bedrock,
+    } = auth;
     let sdk = match &model.client {
         ClientSpec::Builtin { sdk } => *sdk,
         ClientSpec::OpenAiGeneric(_) => Sdk::OpenAiGeneric,
@@ -140,6 +164,8 @@ pub fn from_resolved(
         .with_key(api_key)
         .with_capabilities(model.capabilities.clone());
     endpoint.network = model.network.clone();
+    endpoint.path = model.wiring.path.clone();
+    endpoint.token = token;
     let w = &model.wiring;
     if let Some(h) = &w.auth_header {
         endpoint.auth = crate::AuthStyle::Header(h.clone());
@@ -153,7 +179,7 @@ pub fn from_resolved(
         .extra_headers
         .extend(w.headers.iter().map(|(k, v)| (k.clone(), v.clone())));
 
-    create_client(
+    let client = create_client(
         &model.client,
         ClientConfig {
             endpoint,
@@ -161,7 +187,15 @@ pub fn from_resolved(
             bedrock,
         },
         transport,
-    )
+    )?;
+
+    /* Outermost, so a retry inside `RetryingClient` counts as the one request it belongs to. The
+     * window is keyed by model rather than held by the client: clients are rebuilt every turn. */
+    Ok(crate::ratelimit::RateLimitedClient::wrap(
+        client,
+        &format!("{}:{}", model.source.provider_id, model.source.model_id),
+        model.rate_limit.and_then(|limit| limit.rpm),
+    ))
 }
 
 #[cfg(test)]
@@ -185,12 +219,14 @@ mod tests {
             wiring: Default::default(),
             network: Default::default(),
             credential_refs: Vec::new(),
+            auth: Default::default(),
             context_window: 128_000,
             max_output_tokens: Some(4096),
             compaction_threshold: None,
             capabilities: ModelCapabilities::default(),
             pricing: None::<Pricing>,
             default_params: Default::default(),
+            rate_limit: None,
             config_revision: 1,
         }
     }
@@ -210,7 +246,7 @@ mod tests {
         ] {
             let m = resolved(sdk, Some("https://x.test"));
             assert!(
-                from_resolved(&m, Some("k".into()), None, transport()).is_ok(),
+                from_resolved(&m, Auth::key("k"), transport()).is_ok(),
                 "{sdk:?} has no matching client"
             );
         }
@@ -221,7 +257,7 @@ mod tests {
         for sdk in [Sdk::OpenAiGeneric, Sdk::QwenLocal] {
             let m = resolved(sdk, None);
             assert!(
-                from_resolved(&m, None, None, transport()).is_err(),
+                from_resolved(&m, Auth::default(), transport()).is_err(),
                 "{sdk:?} has no default endpoint: this should error rather than build an empty URL"
             );
         }
@@ -230,7 +266,7 @@ mod tests {
     #[test]
     fn bedrock_without_credentials_is_a_config_error_not_a_401() {
         let m = resolved(Sdk::Bedrock, Some("https://bedrock.test"));
-        let Err(err) = from_resolved(&m, Some("bearer-token".into()), None, transport()) else {
+        let Err(err) = from_resolved(&m, Auth::key("bearer-token"), transport()) else {
             panic!(
                 "bedrock does not take a Bearer token: this should be a config error at construction"
             );
@@ -249,7 +285,11 @@ mod tests {
                 session_token: None,
             },
         };
-        assert!(from_resolved(&m, None, Some(auth), transport()).is_ok());
+        let auth = Auth {
+            bedrock: Some(auth),
+            ..Default::default()
+        };
+        assert!(from_resolved(&m, auth, transport()).is_ok());
     }
 
     #[test]
@@ -259,6 +299,6 @@ mod tests {
             reasoning_carrier: Some("reasoning_content".into()),
             ..Default::default()
         }));
-        assert!(from_resolved(&m, None, None, transport()).is_ok());
+        assert!(from_resolved(&m, Auth::default(), transport()).is_ok());
     }
 }

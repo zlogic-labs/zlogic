@@ -19,7 +19,7 @@ zlogic key
 Usage:
   zlogic key set                     interactive: pick a provider with ↑/↓, then type the key
   zlogic key set <provider>          interactive: type the key for that provider
-  zlogic key set <provider> <value>  write straight to the keychain (entry name = provider id)
+  zlogic key set <provider> <value>  write straight to the credential store (entry name = provider id)
   zlogic key delete <provider>       delete that provider's key
   zlogic key list                    list which providers have / do not have a key
 

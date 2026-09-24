@@ -54,11 +54,13 @@ impl LlmClient for GeminiClient {
             )
         })?;
 
-        let path = format!("v1beta/models/{}:streamGenerateContent?alt=sse", req.model);
+        let default_path = format!("v1beta/models/{}:streamGenerateContent?alt=sse", req.model);
+        let path = self.endpoint.path_or(&default_path).to_string();
         let mut http = self.endpoint.request(&path, payload);
         http = self
             .endpoint
-            .authorize(http, crate::AuthHeader::Raw("x-goog-api-key"));
+            .authorize(http, crate::AuthHeader::Raw("x-goog-api-key"), &req.meta)
+            .await?;
         for (k, v) in &self.endpoint.extra_headers {
             http = http.header(k.clone(), v.clone());
         }

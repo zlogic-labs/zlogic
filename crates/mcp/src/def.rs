@@ -1,7 +1,7 @@
 //! Server definitions: what is written down, before anything is resolved or connected.
 //! # The format is the ecosystem's, not ours
-//! A definition file is the standard `{"mcpServers": {…}}` object that Claude Desktop, Claude Code
-//! and VS Code all write, so a server someone already configured can be copied in verbatim. We
+//! A definition file is the standard `{"mcpServers": {…}}` object that the ecosystem's editors and
+//! CLIs write, so a server someone already configured can be copied in verbatim. We
 //! accept the two spellings that exist in the wild (`mcpServers` and VS Code's `servers`), a bare
 //! single-server object, and infer the transport from `command` / `url` when `type` is absent —
 //! because a definition that has to be rewritten to be understood is a definition users will get

@@ -2081,6 +2081,7 @@ fn empty_upsert() -> OpenAiCompatibleProviderReq {
         thinking: None,
         pricing: None,
         tier: None,
+        rate_limit: None,
         create_scope: None,
         expected_revision: None,
     }

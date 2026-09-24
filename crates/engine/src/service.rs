@@ -10,12 +10,15 @@ use zlogic_protocol::query::{
     ApiResult, CatalogCheck, ConfigRemoveProviderReq, ConfigUpdateReq, ConfigView,
     CredentialDeleteReq, CredentialSetReq, CredentialState, CredentialVerifyReq,
     CredentialVerifyResult, EntriesReq, ObjectData, ObjectDataReq, ObjectReadReq, ObjectText,
-    OpenAiCompatibleProviderReq, Page, ProviderCatalog, RuntimeTask, RuntimeTaskDeleteReq,
-    RuntimeTaskListReq, RuntimeTaskLog, RuntimeTaskLogReq, RuntimeTaskPage, RuntimeTaskStopReq,
-    SessionListReq, SessionOpenReq, SessionOpened, SessionRenameReq, SessionSearchHit,
-    SessionSearchReq, SessionSummary, TaskJob, TaskJobCreateReq, TaskJobDeleteReq, TaskJobDraft,
-    TaskJobDraftReq, TaskJobListReq, TaskJobRunReq, TaskJobRunsReq, TaskJobSetEnabledReq, ToolInfo,
-    TranscriptEntry, TranscriptReq, TurnItem, TurnState, TurnsReq, UsageSummary, UsageSummaryReq,
+    OpenAiCompatibleProviderReq, Page, ProviderCatalog, ProviderModels, ProviderModelsReq,
+    ProviderSignInBegin, ProviderSignInBeginReq, ProviderSignInCancelReq, ProviderSignInStatus,
+    ProviderSignInStatusReq, RuntimeTask, RuntimeTaskDeleteReq, RuntimeTaskListReq, RuntimeTaskLog,
+    RuntimeTaskLogReq, RuntimeTaskPage, RuntimeTaskStopReq, SessionListReq, SessionOpenReq,
+    SessionOpened, SessionRenameReq, SessionSearchHit, SessionSearchReq, SessionSummary, TaskJob,
+    TaskJobCreateReq, TaskJobDeleteReq, TaskJobDraft, TaskJobDraftReq, TaskJobListReq,
+    TaskJobRunReq, TaskJobRunsReq, TaskJobSetEnabledReq, TextTranslateReq, TextTranslateResp,
+    ToolInfo, TranscriptEntry, TranscriptReq, TranslationDeleteReq, TranslationEntry,
+    TranslationListReq, TurnItem, TurnState, TurnsReq, UsageSummary, UsageSummaryReq,
     WorkspaceFileBase64, WorkspaceFileCreateReq, WorkspaceFileDeleteReq, WorkspaceFileEntry,
     WorkspaceFileListReq, WorkspaceFileRange, WorkspaceFileRangeReq, WorkspaceFileReadReq,
     WorkspaceFileRenameReq, WorkspaceFileSearchReq, WorkspaceFileText, WorkspaceFileWriteReq,
@@ -29,8 +32,8 @@ use zlogic_protocol::usage::QuotaStatus;
 use zlogic_protocol::{
     AgentProfile, AgentProfileCreateReq, AgentProfileDeleteReq, AgentProfileListReq,
     AgentProfileListRes, AgentProfileUpdateReq, Command, MemoryAddReq, MemoryEditReq,
-    MemoryListReq, MemoryRecord, MemoryRemoveReq, MemoryUndoReq, SessionId, Submission, SubmitAck,
-    TurnId, WorkspaceId,
+    MemoryListReq, MemoryRecord, MemoryRemoveReq, SessionId, Submission, SubmitAck, TurnId,
+    WorkspaceId,
 };
 
 #[async_trait]
@@ -40,6 +43,19 @@ pub trait AuxiliaryService: Send + Sync {
         req: WorkspaceGitGenerateCommitMessageReq,
     ) -> ApiResult<String>;
     async fn draft_task_job(&self, req: TaskJobDraftReq) -> ApiResult<TaskJobDraft>;
+    async fn text_translate(&self, req: TextTranslateReq) -> ApiResult<TextTranslateResp>;
+}
+
+/// Quick translate's history: what was translated before, and the cache that comes with it.
+///
+/// Split from [`AuxiliaryService`], which is the model path. These three never call a model — they
+/// are the store half of the same feature, and the closed half implements both on one object
+/// because one feature owns them.
+#[async_trait]
+pub trait TranslationService: Send + Sync {
+    async fn translation_list(&self, req: TranslationListReq) -> ApiResult<Vec<TranslationEntry>>;
+    async fn translation_delete(&self, req: TranslationDeleteReq) -> ApiResult<()>;
+    async fn translation_clear(&self) -> ApiResult<()>;
 }
 
 #[async_trait]
@@ -48,7 +64,6 @@ pub trait MemoryService: Send + Sync {
     async fn add(&self, req: MemoryAddReq) -> ApiResult<MemoryRecord>;
     async fn update(&self, req: MemoryEditReq) -> ApiResult<MemoryRecord>;
     async fn remove(&self, req: MemoryRemoveReq) -> ApiResult<MemoryRecord>;
-    async fn undo(&self, req: MemoryUndoReq) -> ApiResult<Option<MemoryRecord>>;
 }
 
 #[async_trait]
@@ -205,6 +220,18 @@ pub trait CredentialService: Send + Sync {
     async fn set(&self, req: CredentialSetReq) -> ApiResult<CredentialState>;
     async fn delete(&self, req: CredentialDeleteReq) -> ApiResult<CredentialState>;
     async fn verify(&self, req: CredentialVerifyReq) -> ApiResult<CredentialVerifyResult>;
+
+    /// Begin signing a subscription provider in. The host shows the URL (or the code) and polls
+    /// [`CredentialService::sign_in_status`]; nothing here opens a browser.
+    async fn sign_in_begin(&self, req: ProviderSignInBeginReq) -> ApiResult<ProviderSignInBegin>;
+    async fn sign_in_status(&self, req: ProviderSignInStatusReq)
+    -> ApiResult<ProviderSignInStatus>;
+    async fn sign_in_cancel(&self, req: ProviderSignInCancelReq) -> ApiResult<()>;
+
+    /// Ask the subscription backend which models this account may call, and keep the answer.
+    async fn models(&self, req: ProviderModelsReq) -> ApiResult<ProviderModels>;
+    /// Forget a fetched model list, so the provider's built-in one applies again.
+    async fn forget_models(&self, req: ProviderModelsReq) -> ApiResult<()>;
 }
 
 #[async_trait]

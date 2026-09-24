@@ -1,0 +1,55 @@
+# The ChatGPT subscription backend (a Codex/ChatGPT plan rather than an API key).
+#
+# Hand-maintained on purpose: it is not part of the models.dev catalog, which describes
+# api.openai.com, and it has no API key to be detected from the environment.
+#
+# The provider only appears once a plan is signed in (`zlogic auth login codex`), and the models
+# listed here are a floor rather than the truth: after sign-in zlogic asks the backend which models
+# the account may call and stores that answer as a snapshot, which takes precedence over this list.
+#
+# `max_output_tokens` is deliberately absent, matching what the backend expects from a client that
+# lets the model decide its own output budget.
+codex:
+  sdk: openai_responses
+  auth: chatgpt
+  base_url: https://chatgpt.com/backend-api/codex
+  guide_url: https://chatgpt.com/#settings
+  wiring:
+    path: responses
+  models:
+    "gpt-5.5":
+      display_name: "GPT-5.5 (ChatGPT)"
+      tier: thinking
+      context_window: 400000
+      vision: true
+      thinking:
+        supported: true
+        can_disable: false
+        efforts: [low, medium, high, xhigh]
+    "gpt-5.4":
+      display_name: "GPT-5.4 (ChatGPT)"
+      tier: main
+      context_window: 400000
+      vision: true
+      thinking:
+        supported: true
+        can_disable: false
+        efforts: [low, medium, high, xhigh]
+    "gpt-5.3-codex-spark":
+      display_name: "GPT-5.3 Codex Spark"
+      tier: main
+      context_window: 272000
+      vision: true
+      thinking:
+        supported: true
+        can_disable: false
+        efforts: [low, medium, high, xhigh]
+    "gpt-5.4-mini":
+      display_name: "GPT-5.4 mini"
+      tier: light
+      context_window: 272000
+      vision: true
+      thinking:
+        supported: true
+        can_disable: false
+        efforts: [low, medium, high, xhigh]

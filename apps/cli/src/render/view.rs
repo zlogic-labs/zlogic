@@ -3434,14 +3434,20 @@ fn status_fields(state: &AppState, _width: usize) -> StatusLineFields {
     StatusLineFields {
         cwd: last_path_segment(&snap.cwd),
         mode: match state.mode {
-            Mode::God => Some("god".into()),
-            Mode::Plan => Some("plan".into()),
+            Mode::God => Some(format!("{} god", Glyph::ModeGod.render(state.icons))),
+            Mode::Plan => Some(format!("{} plan", Glyph::ModePlan.render(state.icons))),
             Mode::Normal | Mode::Streaming => None,
         },
         appr: match state.permission_mode {
             crate::session::dto::PermissionMode::Auto => None,
-            crate::session::dto::PermissionMode::Deny => Some("appr deny".into()),
-            crate::session::dto::PermissionMode::ApproveAll => Some("appr all".into()),
+            // "appr" reads as an abbreviation at a glance; the shield is the status bar's word
+            // for the same idea the composer badge and the settings row spell out.
+            crate::session::dto::PermissionMode::Deny => {
+                Some(format!("{} deny", Glyph::ModeGod.render(state.icons)))
+            }
+            crate::session::dto::PermissionMode::ApproveAll => {
+                Some(format!("{} all", Glyph::ModeGod.render(state.icons)))
+            }
         },
         model_full: snap.model_identity(),
         model_abbrev: snap
@@ -3575,9 +3581,9 @@ mod tests {
     use crate::app::SuggestState;
     use crate::glyph::IconTier;
     use crate::session::dto::{CommandKind, CommandSpec};
-    use crate::theme::{themes, ColorTier, ThemeState};
-    use ratatui::backend::TestBackend;
+    use crate::theme::{ColorTier, ThemeState, themes};
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn state() -> AppState {
         AppState::new(
@@ -3751,8 +3757,8 @@ mod tests {
     fn status_fields_fixture() -> StatusLineFields {
         StatusLineFields {
             cwd: "cli-rs".into(),
-            mode: Some("plan".into()),
-            appr: Some("appr deny".into()),
+            mode: Some(format!("{} plan", Glyph::ModePlan.render(IconTier::Ascii))),
+            appr: Some("⚡ deny".into()),
             model_full: Some("deepseek-r1".into()),
             model_abbrev: Some("ds".into()),
             status: Some("Renamed session".into()),
@@ -3780,7 +3786,7 @@ mod tests {
         for part in [
             "cli-rs",
             "plan",
-            "appr deny",
+            "⚡ deny",
             "deepseek-r1",
             "Renamed session",
         ] {
@@ -3789,10 +3795,10 @@ mod tests {
 
         let without_status = compose_status_left(&fields, 55);
         assert!(!without_status.contains("Renamed session"));
-        assert!(without_status.contains("appr deny"));
+        assert!(without_status.contains("⚡ deny"));
 
         let w35 = compose_status_left(&fields, 35);
-        assert!(!w35.contains("appr deny"));
+        assert!(!w35.contains("⚡ deny"));
         assert!(w35.contains("cli-rs"));
         assert!(w35.contains("deepseek-r1"));
 

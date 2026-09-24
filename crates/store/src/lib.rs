@@ -28,6 +28,7 @@ pub mod memory;
 pub mod resource;
 pub mod schema;
 pub mod session;
+pub mod translation;
 pub mod usage;
 pub mod workspace;
 
@@ -50,6 +51,7 @@ pub use resource::{NewResource, ResourceRecord, ResourceStore};
 pub use session::{
     AgentPath, NewSession, SessionKind, SessionQuery, SessionRecord, SessionStore, TitleSource,
 };
+pub use translation::{NewTranslation, TranslationRecord, TranslationStore};
 pub use usage::{
     NewUsage, ToolUsageAggregate, TurnEnvelope, UsageAggregate, UsageAggregatePart, UsageQuery,
     UsageRecord, UsageRow, UsageStore,
@@ -567,6 +569,10 @@ impl Db {
 
     pub fn usage(&self) -> UsageStore<'_> {
         UsageStore::new(&self.conn)
+    }
+
+    pub fn translations(&self) -> TranslationStore<'_> {
+        TranslationStore::new(&self.conn)
     }
 
     pub fn mailbox(&self) -> MailboxStore<'_> {

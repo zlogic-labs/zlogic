@@ -10,12 +10,15 @@ use zlogic_protocol::query::{
     ApiError, ApiResult, CatalogCheck, ConfigRemoveProviderReq, ConfigUpdateReq, ConfigView,
     CredentialDeleteReq, CredentialSetReq, CredentialState, CredentialVerifyReq,
     CredentialVerifyResult, EntriesReq, ObjectData, ObjectDataReq, ObjectReadReq, ObjectText,
-    OpenAiCompatibleProviderReq, Page, ProviderCatalog, RuntimeTask, RuntimeTaskDeleteReq,
-    RuntimeTaskListReq, RuntimeTaskLog, RuntimeTaskLogReq, RuntimeTaskPage, RuntimeTaskStopReq,
-    SessionListReq, SessionOpenReq, SessionOpened, SessionRenameReq, SessionSearchHit,
-    SessionSearchReq, SessionSummary, TaskJob, TaskJobCreateReq, TaskJobDeleteReq, TaskJobDraft,
-    TaskJobDraftReq, TaskJobListReq, TaskJobRunReq, TaskJobRunsReq, TaskJobSetEnabledReq, ToolInfo,
-    TranscriptEntry, TranscriptReq, TurnItem, TurnState, TurnsReq, UsageSummary, UsageSummaryReq,
+    OpenAiCompatibleProviderReq, Page, ProviderCatalog, ProviderModels, ProviderModelsReq,
+    ProviderSignInBegin, ProviderSignInBeginReq, ProviderSignInCancelReq, ProviderSignInStatus,
+    ProviderSignInStatusReq, RuntimeTask, RuntimeTaskDeleteReq, RuntimeTaskListReq, RuntimeTaskLog,
+    RuntimeTaskLogReq, RuntimeTaskPage, RuntimeTaskStopReq, SessionListReq, SessionOpenReq,
+    SessionOpened, SessionRenameReq, SessionSearchHit, SessionSearchReq, SessionSummary, TaskJob,
+    TaskJobCreateReq, TaskJobDeleteReq, TaskJobDraft, TaskJobDraftReq, TaskJobListReq,
+    TaskJobRunReq, TaskJobRunsReq, TaskJobSetEnabledReq, TextTranslateReq, TextTranslateResp,
+    ToolInfo, TranscriptEntry, TranscriptReq, TranslationDeleteReq, TranslationEntry,
+    TranslationListReq, TurnItem, TurnState, TurnsReq, UsageSummary, UsageSummaryReq,
     WorkspaceFileBase64, WorkspaceFileCreateReq, WorkspaceFileDeleteReq, WorkspaceFileEntry,
     WorkspaceFileListReq, WorkspaceFileRange, WorkspaceFileRangeReq, WorkspaceFileReadReq,
     WorkspaceFileRenameReq, WorkspaceFileSearchReq, WorkspaceFileText, WorkspaceFileWriteReq,
@@ -30,13 +33,14 @@ use zlogic_protocol::{
     AgentProfileListRes, AgentProfileUpdateReq, Command, ManagedResource, ManagedResourceDeleteReq,
     ManagedResourceListReq, ManagedResourceTestReq, ManagedResourceTestResult,
     ManagedResourceUpsertReq, MemoryAddReq, MemoryEditReq, MemoryListReq, MemoryRecord,
-    MemoryRemoveReq, MemoryUndoReq, SessionId, Submission, SubmitAck, TurnId, WorkspaceId,
+    MemoryRemoveReq, SessionId, Submission, SubmitAck, TurnId, WorkspaceId,
 };
 
 use crate::service::{
     AgentProfileService, AuxiliaryService, ConfigService, CredentialService, ExtensionService,
     ManagedResourceService, MemoryService, ObjectService, SessionService, TaskService,
-    ToolCatalogService, TurnService, WorkspaceFilesService, WorkspaceGitService, WorkspaceService,
+    ToolCatalogService, TranslationService, TurnService, WorkspaceFilesService,
+    WorkspaceGitService, WorkspaceService,
 };
 
 pub struct NotWired;
@@ -59,6 +63,25 @@ impl AuxiliaryService for NotWired {
     async fn draft_task_job(&self, _req: TaskJobDraftReq) -> ApiResult<TaskJobDraft> {
         nope!("task_job_draft")
     }
+
+    async fn text_translate(&self, _req: TextTranslateReq) -> ApiResult<TextTranslateResp> {
+        nope!("text_translate")
+    }
+}
+
+#[async_trait]
+impl TranslationService for NotWired {
+    async fn translation_list(&self, _req: TranslationListReq) -> ApiResult<Vec<TranslationEntry>> {
+        nope!("translation_list")
+    }
+
+    async fn translation_delete(&self, _req: TranslationDeleteReq) -> ApiResult<()> {
+        nope!("translation_delete")
+    }
+
+    async fn translation_clear(&self) -> ApiResult<()> {
+        nope!("translation_clear")
+    }
 }
 
 #[async_trait]
@@ -74,9 +97,6 @@ impl MemoryService for NotWired {
     }
     async fn remove(&self, _req: MemoryRemoveReq) -> ApiResult<MemoryRecord> {
         nope!("memory_remove")
-    }
-    async fn undo(&self, _req: MemoryUndoReq) -> ApiResult<Option<MemoryRecord>> {
-        nope!("memory_undo")
     }
 }
 
@@ -351,6 +371,24 @@ impl CredentialService for NotWired {
     }
     async fn verify(&self, _req: CredentialVerifyReq) -> ApiResult<CredentialVerifyResult> {
         nope!("credential_verify")
+    }
+    async fn sign_in_begin(&self, _req: ProviderSignInBeginReq) -> ApiResult<ProviderSignInBegin> {
+        nope!("credential_sign_in_begin")
+    }
+    async fn sign_in_status(
+        &self,
+        _req: ProviderSignInStatusReq,
+    ) -> ApiResult<ProviderSignInStatus> {
+        nope!("credential_sign_in_status")
+    }
+    async fn sign_in_cancel(&self, _req: ProviderSignInCancelReq) -> ApiResult<()> {
+        nope!("credential_sign_in_cancel")
+    }
+    async fn models(&self, _req: ProviderModelsReq) -> ApiResult<ProviderModels> {
+        nope!("provider_models")
+    }
+    async fn forget_models(&self, _req: ProviderModelsReq) -> ApiResult<()> {
+        nope!("provider_models_forget")
     }
 }
 

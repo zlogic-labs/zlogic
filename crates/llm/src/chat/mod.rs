@@ -139,8 +139,13 @@ impl<V: ChatVendor> LlmClient for ChatClient<V> {
             )
         })?;
 
-        let mut http = self.endpoint.request(self.vendor.path(), payload);
-        http = self.endpoint.authorize(http, crate::AuthHeader::Bearer);
+        let mut http = self
+            .endpoint
+            .request(self.endpoint.path_or(self.vendor.path()), payload);
+        http = self
+            .endpoint
+            .authorize(http, crate::AuthHeader::Bearer, &req.meta)
+            .await?;
         for (k, v) in &self.endpoint.extra_headers {
             http = http.header(k.clone(), v.clone());
         }

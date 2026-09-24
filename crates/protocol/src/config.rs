@@ -47,10 +47,29 @@ impl Sdk {
 }
 
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuth {
+    /// A key kept under the provider's own keychain entry or an environment variable.
+    #[default]
+    ApiKey,
+    /// A ChatGPT subscription: an OAuth token document, refreshed as it expires.
+    Chatgpt,
+}
+
+impl ProviderAuth {
+    pub fn is_api_key(&self) -> bool {
+        matches!(self, Self::ApiKey)
+    }
+}
+
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub provider_id: String,
     pub sdk: Sdk,
+    #[serde(default)]
+    pub auth: ProviderAuth,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -142,6 +161,8 @@ pub struct ModelConfig {
     pub network: Option<NetworkConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quotas: Vec<QuotaConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<ModelRateLimit>,
 }
 
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -188,6 +209,10 @@ fn usd() -> String {
 pub struct Wiring {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_header: Option<String>,
+    /// Replaces the codec's request path. A provider that lives outside the codec's usual
+    /// `<base>/v1/...` shape — the ChatGPT subscription backend is one — names it here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub query: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -196,7 +221,10 @@ pub struct Wiring {
 
 impl Wiring {
     pub fn is_empty(&self) -> bool {
-        self.auth_header.is_none() && self.query.is_empty() && self.headers.is_empty()
+        self.auth_header.is_none()
+            && self.path.is_none()
+            && self.query.is_empty()
+            && self.headers.is_empty()
     }
 }
 
@@ -220,6 +248,29 @@ impl NetworkConfig {
             connect_timeout_ms: other.connect_timeout_ms.or(self.connect_timeout_ms),
             read_timeout_ms: other.read_timeout_ms.or(self.read_timeout_ms),
         }
+    }
+}
+
+/// A request budget the client keeps to itself, so a configured limit is never discovered by
+/// getting a 429 back.
+///
+/// Requests are counted against one sliding minute shared by every client built for the same
+/// `provider:model` in this process — a limit that each session kept to itself would add up to
+/// several times the configured value.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelRateLimit {
+    /// Requests per minute. Absent, or zero, means no limit.
+    pub rpm: Option<u32>,
+}
+
+impl ModelRateLimit {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.rpm == Some(0) {
+            return Err("rate_limit.rpm must be at least 1; 0 would block every request".into());
+        }
+        Ok(())
     }
 }
 
@@ -307,6 +358,8 @@ pub struct ResolvedModel {
     pub wire_model: String,
     pub display_name: String,
     pub client: ClientSpec,
+    #[serde(default)]
+    pub auth: ProviderAuth,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Wiring::is_empty")]
@@ -325,6 +378,8 @@ pub struct ResolvedModel {
     pub pricing: Option<Pricing>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub default_params: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<ModelRateLimit>,
     pub config_revision: u64,
 }
 

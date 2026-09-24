@@ -4503,6 +4503,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "zlogic-codex"
+version = "0.9.9"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "reqwest 0.12.28",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "zlogic-credential",
+ "zlogic-llm",
+ "zlogic-protocol",
+]
+
+[[package]]
 name = "zlogic-config"
 version = "0.9.9"
 dependencies = [
@@ -4587,6 +4607,7 @@ dependencies = [
  "uuid",
  "xz2",
  "zip",
+ "zlogic-codex",
  "zlogic-config",
  "zlogic-core",
  "zlogic-credential",

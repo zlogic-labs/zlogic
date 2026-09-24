@@ -1,6 +1,7 @@
 //! CLI entry surface: argument parsing + the headless one-shot path.
 
 pub mod args;
+pub mod auth;
 pub mod daemon;
 pub mod keys;
 pub mod oneshot;

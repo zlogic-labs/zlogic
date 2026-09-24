@@ -54,8 +54,12 @@ impl LlmClient for ResponsesClient {
             )
         })?;
 
-        let mut http = self.endpoint.request("v1/responses", payload);
-        http = self.endpoint.authorize(http, crate::AuthHeader::Bearer);
+        let path = self.endpoint.path_or("v1/responses");
+        let mut http = self.endpoint.request(path, payload);
+        http = self
+            .endpoint
+            .authorize(http, crate::AuthHeader::Bearer, &req.meta)
+            .await?;
         for (k, v) in &self.endpoint.extra_headers {
             http = http.header(k.clone(), v.clone());
         }
@@ -64,10 +68,11 @@ impl LlmClient for ResponsesClient {
             .transport
             .post_stream(http)
             .await
-            .map_err(|e| crate::error::attach_endpoint(e, &self.endpoint, "v1/responses"))?;
+            .map_err(|e| crate::error::attach_endpoint(e, &self.endpoint, path))?;
         let endpoint = self.endpoint.clone();
+        let label = path.to_string();
         Ok(Box::pin(drive(bytes, warnings).map(move |item| {
-            item.map_err(|e| crate::error::attach_endpoint(e, &endpoint, "v1/responses"))
+            item.map_err(|e| crate::error::attach_endpoint(e, &endpoint, &label))
         })))
     }
 }

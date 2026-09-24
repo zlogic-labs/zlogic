@@ -7,7 +7,7 @@ use zlogic_config::write::{
 };
 use zlogic_config::{AppConfig, Dirs};
 use zlogic_core::SharedStore;
-use zlogic_credential::{CredentialStore, credential_candidates};
+use zlogic_credential::CredentialStore;
 use zlogic_protocol::config::{ModelConfig, ProviderConfig, ProviderOrigin, Sdk};
 use zlogic_protocol::query::{
     ApiError, ApiResult, CatalogCheck, CatalogSnapshot, ConfigCreateScope, ConfigRemoveProviderReq,
@@ -104,6 +104,7 @@ impl Config {
                 limits: cfg.limits.clone(),
                 network: cfg.network.clone(),
                 auto_detect_env: cfg.auto_detect_env,
+                keychain: cfg.keychain,
             },
             llm_roles: cfg.llm_roles.clone(),
             global_path: self.dirs.config_file().to_string_lossy().into_owned(),
@@ -113,6 +114,43 @@ impl Config {
             warnings: cfg.warnings.clone(),
             revision: cfg.revision,
         }
+    }
+
+    /// Keep the model list a subscription backend answered, so routing and the pickers see it.
+    pub async fn write_provider_models(
+        &self,
+        provider_id: &str,
+        models: std::collections::BTreeMap<String, zlogic_config::ModelSettings>,
+    ) -> Result<()> {
+        zlogic_config::ProviderModelsFile {
+            provider_id: provider_id.to_string(),
+            fetched_at: Some(chrono::Utc::now().to_rfc3339()),
+            models,
+        }
+        .write(&self.dirs)
+        .map_err(EngineError::from)?;
+        self.reload_inner().await.map(|_| ())
+    }
+
+    /// Forget a fetched model list, so the built-in floor applies again.
+    pub async fn remove_provider_models(&self, provider_id: &str) -> Result<()> {
+        let path = zlogic_config::ProviderModelsFile::path(&self.dirs);
+        if let Some(current) = zlogic_config::ProviderModelsFile::read(&self.dirs)
+            && current.provider_id == provider_id
+        {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(EngineError::Config(zlogic_config::ConfigError::Io {
+                        path,
+                        source,
+                    }));
+                }
+            }
+            self.reload_inner().await?;
+        }
+        Ok(())
     }
 
     async fn reload_inner(&self) -> Result<ConfigView> {
@@ -187,6 +225,15 @@ impl Config {
         }
         if let Some(on) = req.auto_detect_env {
             models_patch.insert("auto_detect_env".into(), scalar_or(&on, &true)?);
+        }
+
+        if let Some(on) = req.keychain {
+            // Before the reload: the next config parse is what decides which keys count as present,
+            // and the vault has to already be answering from the store the switch selects. The
+            // vault re-reads on its next access, so no restart is needed either way.
+            zlogic_config::write_keychain_enabled(&self.dirs, Some(on))
+                .map_err(EngineError::from)?;
+            zlogic_credential::set_keychain_enabled(on);
         }
 
         if !config_patch.is_empty() {
@@ -271,7 +318,9 @@ impl Config {
 
         let files = zlogic_config::ConfigFiles::read(&self.dirs).map_err(EngineError::from)?;
         let mut providers = files.models.unwrap_or_default().providers;
-        let builtin = zlogic_config::builtin_catalog().map_err(EngineError::from)?;
+        /* The full built-in set, subscription provider included: `codex` is a name zlogic already
+         * answers for, so a user-declared provider must not take it over silently. */
+        let builtin = zlogic_config::builtin_catalog_with_local().map_err(EngineError::from)?;
         /* A rename can only move something **within the same file**. A provider may also be
          * declared in config.yaml: that layer is an override, and models are merged as a union by
          * id (see `merge_provider`), so "delete the old, create the new in models.yaml" would
@@ -426,6 +475,10 @@ impl Config {
              * otherwise it permanently shadows the correct price refreshed from models.dev. */
             next.pricing = req.pricing;
             next.tier = req.tier;
+            if let Some(limit) = req.rate_limit.as_ref() {
+                limit.validate().map_err(EngineError::Invalid)?;
+            }
+            next.rate_limit = req.rate_limit;
             provider.models.insert(model_id.to_string(), next);
             if let Some(old) = rename_from {
                 renamed = Some((old.to_string(), model_id.to_string()));
@@ -543,7 +596,7 @@ impl Config {
 
     fn catalog_view(&self, cfg: &AppConfig) -> Result<ProviderCatalog> {
         let files = zlogic_config::ConfigFiles::read(&self.dirs).unwrap_or_default();
-        let builtin = zlogic_config::builtin_catalog().map_err(EngineError::from)?;
+        let builtin = zlogic_config::builtin_catalog_with_local().map_err(EngineError::from)?;
         let effective = zlogic_config::catalog::apply_snapshots(
             builtin,
             files.catalog.as_ref(),
@@ -974,12 +1027,15 @@ fn apply_update(cfg: &mut AppConfig, req: &ConfigUpdateReq) {
     if let Some(v) = &req.auto_detect_env {
         cfg.auto_detect_env = *v;
     }
+    if let Some(v) = &req.keychain {
+        cfg.keychain = *v;
+    }
     if let Some(v) = &req.llm_roles {
         cfg.llm_roles = v.clone();
     }
 }
 
-fn providers_of(
+pub(crate) fn providers_of(
     cfg: &AppConfig,
     declared: &std::collections::BTreeSet<String>,
 ) -> Vec<ProviderConfig> {
@@ -994,9 +1050,10 @@ fn providers_of(
                 ProviderOrigin::Builtin
             },
             sdk: p.sdk.unwrap_or(zlogic_protocol::config::Sdk::OpenAiChat),
+            auth: p.auth,
             base_url: p.base_url.clone(),
             guide_url: p.guide_url.clone(),
-            credential_refs: credential_candidates(id, cfg.auto_detect_env)
+            credential_refs: zlogic_config::credential_refs_for(id, p.auth, cfg.auto_detect_env)
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
@@ -1024,6 +1081,7 @@ fn providers_of(
                             no_think_params: p.models[mid].no_think_params.clone(),
                             tier: p.models[mid].tier,
                             quotas: p.models[mid].quotas.clone(),
+                            rate_limit: resolved.rate_limit,
                             network: p.models[mid].network.clone(),
                             sdk: match &resolved.client {
                                 zlogic_protocol::config::ClientSpec::Builtin { sdk } => Some(*sdk),
@@ -1274,6 +1332,38 @@ providers:
     }
 
     #[tokio::test]
+    async fn keychain_is_written_to_the_config_and_reaches_the_view() {
+        let rig = Rig::new(YAML, &[]);
+        let view = rig
+            .config
+            .update(ConfigUpdateReq {
+                keychain: Some(false),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!view.settings.keychain);
+
+        let config = std::fs::read_to_string(rig.config.dirs.config_file()).unwrap();
+        assert!(config.contains("keychain: false"), "{config}");
+        assert!(
+            !zlogic_config::keychain_enabled(&rig.config.dirs),
+            "the engine must not leave the process pointing at the keychain it just disabled"
+        );
+
+        let back = rig
+            .config
+            .update(ConfigUpdateReq {
+                keychain: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(back.settings.keychain);
+        assert!(zlogic_config::keychain_enabled(&rig.config.dirs));
+    }
+
+    #[tokio::test]
     async fn an_invalid_value_is_refused_and_the_file_is_left_alone() {
         let rig = Rig::new(YAML, &[]);
         let before = std::fs::read_to_string(rig.config.dirs.config_file()).unwrap();
@@ -1386,6 +1476,7 @@ providers:
                 ],
                 budget: false,
             }),
+            rate_limit: None,
             create_scope: Some(ConfigCreateScope::Provider),
             expected_revision: Some(before),
         };
@@ -1786,6 +1877,7 @@ providers:
             thinking: None,
             pricing: None,
             tier: None,
+            rate_limit: None,
             create_scope: None,
             expected_revision: None,
         }

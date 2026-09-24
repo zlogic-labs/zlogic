@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod dirs;
 pub mod prices;
 pub mod provider;
+pub mod provider_models;
 pub mod write;
 
 pub use zlogic_protocol::{roles, settings};
@@ -15,13 +16,16 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use zlogic_credential::{CredentialRef, credential_candidates};
-use zlogic_protocol::config::{ResolvedModel, Tier};
+use zlogic_credential::CredentialRef;
+use zlogic_protocol::config::{ProviderAuth, ResolvedModel, Tier};
 
 pub use catalog::CatalogFile;
 pub use dirs::Dirs;
 pub use prices::PriceFile;
-pub use provider::{ModelSettings, ProviderSettings, detect_providers, resolve_model};
+pub use provider::{
+    ModelSettings, ProviderSettings, credential_refs_for, detect_providers, resolve_model,
+};
+pub use provider_models::ProviderModelsFile;
 pub use roles::{RoleSettings, RoleThinking, SESSION};
 pub use settings::{
     ApprovalMode, AutoTitle, ContextConfig, CostConfig, ExchangeRate, LimitsConfig, LogConfig,
@@ -54,6 +58,46 @@ pub enum ConfigError {
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
 
+/// The OS keychain is opt-in on macOS and opt-out everywhere else.
+///
+/// A macOS build without a stable signing identity gets a Keychain authorization dialog for every
+/// entry it touches, and nothing the user can click makes it stop — so on macOS the local secret
+/// store is the default and the keychain is a switch the user turns on themselves.
+pub const DEFAULT_KEYCHAIN_ENABLED: bool = !cfg!(target_os = "macos");
+
+/// The keychain switch on its own, without loading the rest of the configuration.
+///
+/// Credentials are read before the rest of the config is parsed: whether the OS store may be
+/// touched at all decides which backend the vault picks, and a process that has already asked the
+/// keychain for one entry has already shown the dialog it was trying to avoid. A file that cannot
+/// be read falls back to the platform default rather than failing startup.
+pub fn keychain_enabled(dirs: &Dirs) -> bool {
+    std::fs::read_to_string(dirs.config_file())
+        .ok()
+        .and_then(|body| serde_yaml_ng::from_str::<ConfigFile>(&body).ok())
+        .and_then(|file| file.keychain)
+        .unwrap_or(DEFAULT_KEYCHAIN_ENABLED)
+}
+
+/// Write the keychain switch alone, leaving every other line of the file where it is. Returns
+/// whether the file changed.
+///
+/// `None` removes the key, which restores the platform default: a macOS user who turns the
+/// keychain back on gets a file that says nothing rather than one that freezes today's default.
+pub fn write_keychain_enabled(dirs: &Dirs, on: Option<bool>) -> Result<bool> {
+    let current = ConfigFiles::read(dirs)?.config.and_then(|file| file.keychain);
+    if current == on {
+        return Ok(false);
+    }
+    let mut patch = write::YamlPatch::new();
+    patch.insert(
+        "keychain".into(),
+        on.map(|value| serde_yaml_ng::Value::Bool(value)),
+    );
+    write::patch_yaml_file(&dirs.config_file(), &patch)?;
+    Ok(true)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConfigFile {
@@ -61,6 +105,8 @@ pub struct ConfigFile {
     pub providers: BTreeMap<String, ProviderSettings>,
     #[serde(default)]
     pub llm_roles: BTreeMap<String, RoleSettings>,
+    /// Whether the OS credential store may be used. Absent means the platform default.
+    pub keychain: Option<bool>,
     pub session: Option<SessionConfig>,
     pub context: Option<ContextConfig>,
     pub tools: Option<ToolsConfig>,
@@ -82,6 +128,10 @@ pub struct ModelsFile {
 pub struct AppConfig {
     pub default_model: Option<String>,
     pub auto_detect_env: bool,
+    /// Whether the OS credential store may be used. Off — the default on macOS — every `keyring:`
+    /// entry is answered from the vault file instead, which is what keeps an unsigned build from
+    /// raising a Keychain dialog it cannot get out of.
+    pub keychain: bool,
     pub providers: BTreeMap<String, ProviderSettings>,
     pub llm_roles: BTreeMap<String, RoleSettings>,
     pub session: SessionConfig,
@@ -101,6 +151,7 @@ impl Default for AppConfig {
         Self {
             default_model: None,
             auto_detect_env: true,
+            keychain: DEFAULT_KEYCHAIN_ENABLED,
             providers: BTreeMap::new(),
             llm_roles: BTreeMap::new(),
             session: SessionConfig::default(),
@@ -123,6 +174,7 @@ pub struct ConfigFiles {
     pub config: Option<ConfigFile>,
     pub prices: Option<PriceFile>,
     pub catalog: Option<CatalogFile>,
+    pub provider_models: Option<ProviderModelsFile>,
 }
 
 impl ConfigFiles {
@@ -132,6 +184,7 @@ impl ConfigFiles {
             config: read_optional::<ConfigFile>(&dirs.config_file())?,
             prices: PriceFile::read(dirs),
             catalog: CatalogFile::read(dirs),
+            provider_models: ProviderModelsFile::read(dirs),
         })
     }
 }
@@ -180,10 +233,16 @@ impl AppConfig {
             .as_ref()
             .and_then(|m| m.auto_detect_env)
             .unwrap_or(true);
+        let keychain = files
+            .config
+            .as_ref()
+            .and_then(|c| c.keychain)
+            .unwrap_or(DEFAULT_KEYCHAIN_ENABLED);
 
         let mut cfg = AppConfig {
             revision: 1,
             auto_detect_env,
+            keychain,
             ..Default::default()
         };
 
@@ -207,9 +266,30 @@ impl AppConfig {
         }
 
         cfg.materialise_builtin_providers(&probe, files.catalog.as_ref(), files.prices.as_ref());
+        cfg.apply_provider_models(files.provider_models.as_ref(), files.models.as_ref());
 
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Overlay the fetched model list of subscription providers on top of what they ship with.
+    fn apply_provider_models(
+        &mut self,
+        snapshot: Option<&ProviderModelsFile>,
+        declared: Option<&ModelsFile>,
+    ) {
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        let Some(provider) = self.providers.get_mut(&snapshot.provider_id) else {
+            return;
+        };
+        let declared: std::collections::BTreeSet<String> = declared
+            .and_then(|file| file.providers.get(&snapshot.provider_id))
+            .map(|p| p.models.keys().cloned().collect())
+            .unwrap_or_default();
+        snapshot.apply(provider, &declared);
+        self.revision += 1;
     }
 
     fn materialise_builtin_providers(
@@ -218,7 +298,7 @@ impl AppConfig {
         catalog: Option<&CatalogFile>,
         prices: Option<&PriceFile>,
     ) {
-        let builtin: CatalogFile = match serde_yaml_ng::from_str(CATALOG) {
+        let builtin: CatalogFile = match builtin_catalog_with_local() {
             Ok(c) => c,
             Err(e) => {
                 self.warnings.push(format!(
@@ -231,7 +311,8 @@ impl AppConfig {
         self.warnings.extend(effective.warnings);
 
         let auto = self.auto_detect_env;
-        let has_key = |id: &str| credential_candidates(id, auto).iter().any(probe);
+        let has_key =
+            |id: &str, auth: ProviderAuth| credential_refs_for(id, auth, auto).iter().any(probe);
 
         for (pid, cat) in effective.catalog.providers {
             match self.providers.get_mut(&pid) {
@@ -259,7 +340,7 @@ impl AppConfig {
                         }
                     }
                 }
-                None if has_key(&pid) => {
+                None if has_key(&pid, cat.auth) => {
                     self.providers.insert(pid, cat);
                 }
                 None => {}
@@ -267,7 +348,7 @@ impl AppConfig {
         }
 
         for (id, p) in self.providers.iter_mut() {
-            p.credential_ok = Some(credential_candidates(id, auto).iter().any(probe));
+            p.credential_ok = Some(credential_refs_for(id, p.auth, auto).iter().any(probe));
         }
     }
 
@@ -289,6 +370,9 @@ impl AppConfig {
         self.merge_providers(file.providers);
         for (role, incoming) in file.llm_roles {
             self.llm_roles.insert(role, incoming);
+        }
+        if let Some(k) = file.keychain {
+            self.keychain = k;
         }
         if let Some(s) = file.session {
             self.session = s;
@@ -498,10 +582,41 @@ fn usable(p: &ProviderSettings) -> bool {
 
 const CATALOG: &str = include_str!("../defaults/models.yaml");
 
+/// The ChatGPT subscription provider, which is not part of the generated catalog.
+pub const CODEX_PROVIDER_ID: &str = "codex";
+const CODEX_PROVIDER: &str = include_str!("../defaults/codex.yaml");
+
 pub fn builtin_catalog() -> Result<CatalogFile> {
     serde_yaml_ng::from_str(CATALOG).map_err(|e| {
         ConfigError::Invalid(format!("failed to parse the built-in model catalog: {e}"))
     })
+}
+
+/// The built-in catalog plus the hand-written provider definitions that are not part of it.
+pub fn builtin_catalog_with_local() -> Result<CatalogFile> {
+    let mut catalog = builtin_catalog()?;
+    if let Some(codex) = codex_provider() {
+        catalog
+            .providers
+            .entry(CODEX_PROVIDER_ID.to_string())
+            .or_insert(codex);
+    }
+    Ok(catalog)
+}
+
+/// The hand-written provider definition for the ChatGPT subscription backend. A file that fails
+/// to parse loses that one provider and is logged — the rest of the catalog still loads.
+pub fn codex_provider() -> Option<ProviderSettings> {
+    match serde_yaml_ng::from_str::<BTreeMap<String, ProviderSettings>>(CODEX_PROVIDER) {
+        Ok(mut providers) => providers.remove(CODEX_PROVIDER_ID),
+        Err(e) => {
+            tracing::warn!(
+                target: "zlogic::config",
+                "the built-in codex provider failed to parse and will be missing: {e}"
+            );
+            None
+        }
+    }
 }
 
 fn fill_model_gaps(mine: &mut ModelSettings, cat: ModelSettings) {
@@ -791,6 +906,15 @@ auto_detect_env: true
 
 const CONFIG_TEMPLATE: &str = r#"# zlogic's basic settings. The provider / model list is in models.yaml in the same directory.
 # How keys are supplied is described at the top of that file as well.
+
+# ── where a stored secret goes ────────────────────────────────────────────
+# On, a key you enter (or a sign-in) is handed to the operating system's credential store
+# (macOS Keychain / Windows Credential Manager / Linux Secret Service).
+# Off, it is kept unencrypted in this app's own state directory instead, and the OS store is never
+# touched. Turn it off if your macOS build is not signed and macOS keeps asking for Keychain access.
+# Default: off on macOS (an unsigned build gets an authorization prompt per entry, with no way to
+# stop it), on everywhere else. The desktop has the same switch under Settings → Advanced → Credentials.
+# keychain: false
 
 # Left unset, a main model that has a key is picked automatically (tier: main is preferred).
 # default_model: anthropic:claude-sonnet-5
@@ -1493,6 +1617,59 @@ providers:
     }
 
     #[test]
+    fn the_keychain_switch_defaults_to_the_platform_and_round_trips() {
+        use crate::DEFAULT_KEYCHAIN_ENABLED;
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+
+        assert_eq!(
+            keychain_enabled(&dirs),
+            DEFAULT_KEYCHAIN_ENABLED,
+            "no file at all means the platform default"
+        );
+
+        assert!(write_keychain_enabled(&dirs, Some(false)).unwrap());
+        assert!(!keychain_enabled(&dirs));
+        assert!(
+            !write_keychain_enabled(&dirs, Some(false)).unwrap(),
+            "writing the value already there must not touch the file"
+        );
+
+        assert!(write_keychain_enabled(&dirs, Some(true)).unwrap());
+        assert!(keychain_enabled(&dirs));
+
+        assert!(write_keychain_enabled(&dirs, None).unwrap());
+        assert_eq!(
+            keychain_enabled(&dirs),
+            DEFAULT_KEYCHAIN_ENABLED,
+            "removing the key restores the default instead of freezing today's value"
+        );
+        assert!(
+            !write_keychain_enabled(&dirs, None).unwrap(),
+            "removing a key that is not there is not a write"
+        );
+    }
+
+    #[test]
+    fn the_keychain_switch_lands_in_the_file_and_survives_a_full_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        seed_config_dir(&dirs).unwrap();
+
+        write_keychain_enabled(&dirs, Some(false)).unwrap();
+
+        let body = std::fs::read_to_string(dirs.config_file()).unwrap();
+        assert!(body.contains("keychain: false"), "{body}");
+        assert!(
+            body.contains("# zlogic"),
+            "the template's own documentation must survive the write: {body}"
+        );
+
+        let cfg = load(&dirs, &[]).unwrap();
+        assert!(!cfg.keychain, "the file has to reach the loaded config");
+    }
+
+    #[test]
     fn the_seeded_files_load_back_and_contain_no_builtin_data() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Dirs::under(tmp.path());
@@ -1804,6 +1981,12 @@ mod builtin_authority {
     use super::*;
     use crate::dirs::Dirs;
 
+    /// A probe that finds exactly the given keychain entries and no environment variable.
+    fn keyring(entries: &[&str]) -> impl Fn(&CredentialRef) -> bool + use<> {
+        let entries: Vec<String> = entries.iter().map(|entry| entry.to_string()).collect();
+        move |reference: &CredentialRef| matches!(reference, CredentialRef::Keyring(name) if entries.iter().any(|e| e == name))
+    }
+
     #[test]
     fn a_builtin_providers_sdk_comes_from_the_catalog() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1821,5 +2004,50 @@ mod builtin_authority {
             "the catalog says responses, so responses it is; when this one changes, detection is grabbing sdk again"
         );
         assert_eq!(cfg.providers["openai"].models.len(), 3);
+    }
+
+    /// The subscription provider is not in the generated catalog, and it has no API key to detect:
+    /// it exists exactly when a sign-in does.
+    #[test]
+    fn the_subscription_provider_appears_only_once_it_is_signed_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        dirs.ensure().unwrap();
+
+        let signed_out = AppConfig::load(&dirs, keyring(&[])).unwrap();
+        assert!(
+            !signed_out.providers.contains_key(CODEX_PROVIDER_ID),
+            "with no token there is no provider to point a model at"
+        );
+
+        let signed_in = AppConfig::load(&dirs, keyring(&["codex_oauth"])).unwrap();
+        let codex = &signed_in.providers[CODEX_PROVIDER_ID];
+        assert_eq!(codex.auth, ProviderAuth::Chatgpt);
+        assert_eq!(
+            codex.base_url.as_deref(),
+            Some("https://chatgpt.com/backend-api/codex"),
+            "a plan is served by the Codex backend, not by api.openai.com"
+        );
+        assert_eq!(codex.wiring.path.as_deref(), Some("responses"));
+
+        let (model, warnings) = signed_in
+            .resolve("codex:gpt-5.5")
+            .expect("the built-in floor resolves");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(model.auth, ProviderAuth::Chatgpt);
+        assert_eq!(
+            model.credential_refs,
+            ["keyring:codex_oauth"],
+            "a subscription has exactly one home, and it is not an environment variable"
+        );
+        assert_eq!(
+            model.max_output_tokens, None,
+            "the backend decides the output budget; a client-imposed cap is what it rejects"
+        );
+        assert!(
+            model.pricing.is_none(),
+            "a plan is not billed per token, so there is no price to show"
+        );
+        assert!(model.capabilities.thinking.supported);
     }
 }

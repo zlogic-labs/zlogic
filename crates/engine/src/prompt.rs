@@ -15,7 +15,7 @@ use crate::skills::{self, SkillDef};
 const MAX_NOTES_CHARS: usize = 32 * 1024;
 const MAX_MEMORY_CHARS: usize = 16 * 1024;
 
-const NOTES_NAMES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
+const NOTES_NAMES: &[&str] = &["AGENTS.md"];
 
 pub struct SystemPrompts {
     dirs: Dirs,
@@ -1223,25 +1223,6 @@ mod tests {
         assert!(
             stable.contains(&root.join("AGENTS.md").display().to_string()),
             "with a path"
-        );
-    }
-
-    #[test]
-    fn claude_md_is_a_fallback_not_a_second_source() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("repo");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("CLAUDE.md"), "legacy rule\n").unwrap();
-
-        let stable = build(&prompts(tmp.path()), &root, &root, &["read_file"]).remove(0);
-        assert!(stable.contains("legacy rule"));
-
-        std::fs::write(root.join("AGENTS.md"), "current rule\n").unwrap();
-        let stable = build(&prompts(tmp.path()), &root, &root, &["read_file"]).remove(0);
-        assert!(stable.contains("current rule"));
-        assert!(
-            !stable.contains("legacy rule"),
-            "injecting both means saying the same thing twice"
         );
     }
 

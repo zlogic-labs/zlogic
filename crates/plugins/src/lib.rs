@@ -4,7 +4,7 @@
 //! ```text
 //! <data>/extensions/plugins/<name>/     ← the user installed it
 //! <root>/.zlogic/extensions/plugins/<name>/   ← it came with the repository
-//!     plugin.json | plugin.yaml | .claude-plugin/plugin.json   ← the manifest
+//!     plugin.json | plugin.yaml                                ← the manifest
 //!     .mcp.json                                                ← or servers in their own file
 //! ```
 //! # What a plugin contributes
@@ -13,11 +13,11 @@
 //! Contributed servers are namespaced `<plugin>.<server>`, so two plugins can each ship a server
 //! called `search` and a plugin can never shadow a server the user configured themselves.
 //! # Why the plugin root is expanded *after* parsing
-//! A manifest refers to its own directory as `${pluginRoot}` (or `${CLAUDE_PLUGIN_ROOT}`, which is
-//! what plugins written for Claude Code use). The obvious implementation — substitute in the file's
-//! text before parsing it — is wrong on Windows: a path containing `\` is not a valid JSON string
-//! escape, so a textual substitution produces a file that no longer parses, or worse, one that parses
-//! differently. So the substitution happens on the parsed definition, where a path is just a value.
+//! A manifest refers to its own directory as `${pluginRoot}` (or `${ZLOGIC_PLUGIN_ROOT}`). The
+//! obvious implementation — substitute in the file's text before parsing it — is wrong on Windows:
+//! a path containing `\` is not a valid JSON string escape, so a textual substitution produces a
+//! file that no longer parses, or worse, one that parses differently. So the substitution happens on
+//! the parsed definition, where a path is just a value.
 //! # A plugin is data on disk, and it is not trusted by being present
 //! A plugin inside a repository arrived with a `git clone`, and its manifest can name any command on
 //! the machine. This crate therefore only ever *reports* what it found, carrying
@@ -30,10 +30,7 @@ use zlogic_mcp::Origin;
 use zlogic_mcp::def::{self, Problem, ServerDef, TransportDef};
 
 /// Manifest file names, in the order they are looked for.
-/// `.claude-plugin/plugin.json` is first because a plugin written for Claude Code should work as-is;
-/// finding it before our own names means a plugin that ships both is read as its author intended.
 const MANIFEST_NAMES: &[&str] = &[
-    ".claude-plugin/plugin.json",
     "plugin.json",
     "plugin.yaml",
     "plugin.yml",
@@ -287,11 +284,7 @@ fn string_of(value: &serde_json::Value, key: &str) -> Option<String> {
 fn expand_plugin_root(server: &mut ServerDef, root: &Path) {
     let root = root.to_string_lossy().to_string();
     let sub = |s: &mut String| {
-        for name in [
-            "${pluginRoot}",
-            "${CLAUDE_PLUGIN_ROOT}",
-            "${ZLOGIC_PLUGIN_ROOT}",
-        ] {
+        for name in ["${pluginRoot}", "${ZLOGIC_PLUGIN_ROOT}"] {
             if s.contains(name) {
                 *s = s.replace(name, &root);
             }
@@ -390,19 +383,6 @@ mod tests {
         );
     }
 
-    /// A plugin written for Claude Code should work as it is.
-    #[test]
-    fn a_claude_plugin_manifest_is_read() {
-        let f = fixture();
-        write_json(
-            &f.dirs.global.join("compat/.claude-plugin/plugin.json"),
-            json!({ "name": "Compat", "mcpServers": { "s": { "command": "x" } } }),
-        );
-        let loaded = load(&f.dirs, None);
-        assert_eq!(loaded.plugins.len(), 1);
-        assert_eq!(loaded.mcp_servers()[0].id, "compat.s");
-    }
-
     #[test]
     fn a_yaml_manifest_is_read_by_the_same_parser() {
         let f = fixture();
@@ -447,7 +427,7 @@ mod tests {
                 "name": "Local",
                 "mcpServers": { "s": {
                     "command": "node",
-                    "args": ["${CLAUDE_PLUGIN_ROOT}/server.js"],
+                    "args": ["${ZLOGIC_PLUGIN_ROOT}/server.js"],
                     "env": { "DATA": "${pluginRoot}/data" }
                 } }
             }),

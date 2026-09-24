@@ -83,6 +83,9 @@ pub struct ProWiring {
     pub extension_service: Option<Arc<dyn crate::service::ExtensionService>>,
     pub objects: Option<Arc<dyn crate::service::ObjectService>>,
     pub auxiliary: Option<Arc<dyn crate::service::AuxiliaryService>>,
+    /// Quick translate's history. Absent when the host does not keep one, in which case the RPCs
+    /// answer "not wired" rather than an empty list that looks like an empty history.
+    pub translations: Option<Arc<dyn crate::service::TranslationService>>,
     pub files: Option<Arc<dyn crate::service::WorkspaceFilesService>>,
     pub git: Option<Arc<dyn crate::service::WorkspaceGitService>>,
     pub agent_profiles: Option<Arc<dyn crate::service::AgentProfileService>>,
@@ -203,7 +206,15 @@ impl Engine {
             Err(e) => vec![format!("failed to load env.yaml: {e}")],
         };
 
-        zlogic_credential::init_secret_vault(dirs.master_key_file(), dirs.secrets_blob());
+        // Before the vault is registered, so the process never touches the OS credential store on
+        // a machine that turned it off. Both hosts reach the same directory here, so the switch is
+        // read from wherever this process found `dirs`.
+        zlogic_credential::set_keychain_enabled(zlogic_config::keychain_enabled(&dirs));
+
+        zlogic_credential::init_secret_vault(
+            zlogic_credential::EncryptedPaths::new(dirs.master_key_file(), dirs.secrets_blob()),
+            dirs.secrets_plain_file(),
+        );
 
         let credential_store: Arc<dyn CredentialStore> = Arc::new(SystemCredentialStore);
         let config = AppConfig::load(&dirs, |reference| credential_store.is_available(reference))
@@ -340,6 +351,10 @@ impl Engine {
         let auxiliary_service: Arc<dyn crate::service::AuxiliaryService> = pro
             .as_ref()
             .and_then(|pro| pro.auxiliary.clone())
+            .unwrap_or_else(|| Arc::new(crate::not_wired::NotWired));
+        let translation_service: Arc<dyn crate::service::TranslationService> = pro
+            .as_ref()
+            .and_then(|pro| pro.translations.clone())
             .unwrap_or_else(|| Arc::new(crate::not_wired::NotWired));
         // The registry keeps serving `WorkspaceService`: the file and Git halves are separate
         // services, so a build without a closed half simply has none.
@@ -500,6 +515,7 @@ impl Engine {
             .with_workspace_files(files_service)
             .with_workspace_git(git_service)
             .with_auxiliary(auxiliary_service)
+            .with_translations(translation_service)
             .with_memories(memories)
             .with_agent_profiles(agent_profile_service)
             .with_sessions(sessions)

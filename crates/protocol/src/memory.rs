@@ -120,15 +120,3 @@ pub struct MemoryRemoveReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_turn_id: Option<TurnId>,
 }
-
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MemoryUndoReq {
-    pub scope: MemoryScope,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_id: Option<WorkspaceId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_session_id: Option<SessionId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_turn_id: Option<TurnId>,
-}

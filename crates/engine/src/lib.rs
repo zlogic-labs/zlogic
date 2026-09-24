@@ -49,6 +49,7 @@ pub mod memory;
 pub mod not_wired;
 pub mod policy;
 pub mod prompt;
+pub mod provider_auth;
 pub mod router;
 pub mod service;
 pub mod sessions;
@@ -67,10 +68,11 @@ use std::sync::Arc;
 use zlogic_protocol::query::{
     ApiResult, ConfigRemoveProviderReq, ConfigView, CredentialDeleteReq, CredentialSetReq,
     CredentialState, CredentialVerifyReq, CredentialVerifyResult, EntriesReq,
-    OpenAiCompatibleProviderReq, Page, ProviderCatalog, SessionListReq, SessionOpenReq,
-    SessionOpened, SessionRenameReq, SessionSearchHit, SessionSearchReq, SessionSummary,
-    TranscriptEntry, TranscriptReq, TurnItem, TurnsReq, UsageSummary, UsageSummaryReq,
-    WorkspaceSelector, WorkspaceSummary,
+    OpenAiCompatibleProviderReq, Page, ProviderCatalog, ProviderModels, ProviderModelsReq,
+    ProviderSignInBegin, ProviderSignInBeginReq, ProviderSignInCancelReq, ProviderSignInStatus,
+    ProviderSignInStatusReq, SessionListReq, SessionOpenReq, SessionOpened, SessionRenameReq,
+    SessionSearchHit, SessionSearchReq, SessionSummary, TranscriptEntry, TranscriptReq, TurnItem,
+    TurnsReq, UsageSummary, UsageSummaryReq, WorkspaceSelector, WorkspaceSummary,
 };
 use zlogic_protocol::{Command, SessionId, Submission, SubmitAck, WorkspaceId};
 
@@ -78,7 +80,8 @@ use crate::hub::EventHub;
 use crate::service::{
     AgentProfileService, AuxiliaryService, ConfigService, CredentialService, ExtensionService,
     ManagedResourceService, MemoryService, ObjectService, SessionService, TaskService,
-    ToolCatalogService, TurnService, WorkspaceFilesService, WorkspaceGitService, WorkspaceService,
+    ToolCatalogService, TranslationService, TurnService, WorkspaceFilesService,
+    WorkspaceGitService, WorkspaceService,
 };
 
 pub use agent_profile::{BUILTIN_AGENTS, builtin_system_prompt};
@@ -115,6 +118,10 @@ pub enum EngineError {
     Task(#[from] zlogic_task::StoreError),
     #[error("no available model for role {role} (tried: {})", tried.join(", "))]
     NoModel { role: String, tried: Vec<String> },
+    #[error(
+        "provider {provider} is not signed in to a ChatGPT subscription, so {model} cannot be used; run `zlogic auth login {provider}`"
+    )]
+    NoSubscription { provider: String, model: String },
     #[error("could not get credential {credential_ref} for {model}")]
     NoCredential {
         model: String,
@@ -152,6 +159,11 @@ impl From<EngineError> for zlogic_protocol::query::ApiError {
             } => ApiError::unavailable("credential_missing", e.to_string())
                 .with_detail("model", model.clone())
                 .with_detail("credential_ref", credential_ref.clone()),
+            EngineError::NoSubscription { provider, model } => {
+                ApiError::unavailable("provider_not_signed_in", e.to_string())
+                    .with_detail("provider", provider.clone())
+                    .with_detail("model", model.clone())
+            }
             EngineError::Invalid(m) => ApiError::invalid_code("engine_invalid_argument", m.clone()),
             EngineError::Conflict(m) => ApiError::conflict_code("engine_state_conflict", m.clone()),
             EngineError::Config(zlogic_config::ConfigError::Invalid(m)) => {
@@ -234,11 +246,25 @@ pub trait EngineApi: Send + Sync {
         &self,
         req: CredentialVerifyReq,
     ) -> ApiResult<CredentialVerifyResult>;
+
+    // ── subscription sign-in and model discovery ──
+    async fn credential_sign_in_begin(
+        &self,
+        req: ProviderSignInBeginReq,
+    ) -> ApiResult<ProviderSignInBegin>;
+    async fn credential_sign_in_status(
+        &self,
+        req: ProviderSignInStatusReq,
+    ) -> ApiResult<ProviderSignInStatus>;
+    async fn credential_sign_in_cancel(&self, req: ProviderSignInCancelReq) -> ApiResult<()>;
+    async fn provider_models(&self, req: ProviderModelsReq) -> ApiResult<ProviderModels>;
+    async fn provider_models_forget(&self, req: ProviderModelsReq) -> ApiResult<()>;
 }
 
 #[derive(Clone)]
 pub struct Engine {
     pub auxiliary: Arc<dyn AuxiliaryService>,
+    pub translations: Arc<dyn TranslationService>,
     pub memories: Arc<dyn MemoryService>,
     pub agent_profiles: Arc<dyn AgentProfileService>,
     pub sessions: Arc<dyn SessionService>,
@@ -260,6 +286,7 @@ impl Engine {
     pub fn not_wired() -> Self {
         Self {
             auxiliary: Arc::new(not_wired::NotWired),
+            translations: Arc::new(not_wired::NotWired),
             memories: Arc::new(not_wired::NotWired),
             agent_profiles: Arc::new(not_wired::NotWired),
             sessions: Arc::new(not_wired::NotWired),
@@ -290,6 +317,11 @@ impl Engine {
 
     pub fn with_auxiliary(mut self, auxiliary: Arc<dyn AuxiliaryService>) -> Self {
         self.auxiliary = auxiliary;
+        self
+    }
+
+    pub fn with_translations(mut self, translations: Arc<dyn TranslationService>) -> Self {
+        self.translations = translations;
         self
     }
 
@@ -473,5 +505,31 @@ impl EngineApi for Engine {
         req: CredentialVerifyReq,
     ) -> ApiResult<CredentialVerifyResult> {
         self.credentials.verify(req).await
+    }
+
+    async fn credential_sign_in_begin(
+        &self,
+        req: ProviderSignInBeginReq,
+    ) -> ApiResult<ProviderSignInBegin> {
+        self.credentials.sign_in_begin(req).await
+    }
+
+    async fn credential_sign_in_status(
+        &self,
+        req: ProviderSignInStatusReq,
+    ) -> ApiResult<ProviderSignInStatus> {
+        self.credentials.sign_in_status(req).await
+    }
+
+    async fn credential_sign_in_cancel(&self, req: ProviderSignInCancelReq) -> ApiResult<()> {
+        self.credentials.sign_in_cancel(req).await
+    }
+
+    async fn provider_models(&self, req: ProviderModelsReq) -> ApiResult<ProviderModels> {
+        self.credentials.models(req).await
+    }
+
+    async fn provider_models_forget(&self, req: ProviderModelsReq) -> ApiResult<()> {
+        self.credentials.forget_models(req).await
     }
 }
