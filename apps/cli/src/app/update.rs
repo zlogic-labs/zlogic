@@ -3143,6 +3143,7 @@ fn on_stream(state: &mut AppState, ev: CoreEvent, session: &dyn CoreSession) {
                     turn_id: Some(turn_id),
                     ..Default::default()
                 };
+                state.mode = Mode::Streaming;
                 ensure_assistant_history_header(state);
             }
         }
@@ -3153,6 +3154,7 @@ fn on_stream(state: &mut AppState, ev: CoreEvent, session: &dyn CoreSession) {
                     turn_id: Some(turn_id),
                     ..Default::default()
                 };
+                state.mode = Mode::Streaming;
                 ensure_assistant_history_header(state);
             }
             state.live.start_round(round_id);
@@ -3639,6 +3641,28 @@ mod tests {
         }
     }
 
+    /// Records the one command these tests care about.
+    struct CancelAwareSession(std::sync::atomic::AtomicBool);
+
+    impl CancelAwareSession {
+        fn cancelled(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl CoreSession for CancelAwareSession {
+        fn subscribe(&self) -> std::sync::mpsc::Receiver<CoreEvent> {
+            let (_tx, rx) = std::sync::mpsc::channel();
+            rx
+        }
+        fn send(&self, cmd: Command) -> bool {
+            if matches!(cmd, Command::TurnCancel) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            true
+        }
+    }
+
     fn state() -> AppState {
         let mut s = AppState::new(
             ThemeState {
@@ -3714,6 +3738,33 @@ mod tests {
             s.input, "inp",
             "a burst after the anchor expires is unaffected by the burst guard"
         );
+    }
+
+    #[test]
+    fn esc_cancels_a_turn_that_started_from_the_stream() {
+        let mut s = state();
+        let session = CancelAwareSession(std::sync::atomic::AtomicBool::new(false));
+        on_stream(
+            &mut s,
+            CoreEvent::TurnStart {
+                turn_id: "t1".into(),
+                proactive: false,
+            },
+            &session,
+        );
+        assert_eq!(
+            s.mode,
+            Mode::Streaming,
+            "a turn the CLI did not start itself (mailbox / steering) is streaming all the same"
+        );
+        for _ in 0..2 {
+            on_key(
+                &mut s,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &session,
+            );
+        }
+        assert!(session.cancelled(), "the second Esc must reach the engine");
     }
 
     #[test]

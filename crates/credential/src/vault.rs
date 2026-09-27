@@ -6,7 +6,9 @@ use std::sync::{OnceLock, RwLock};
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 
-use crate::{CredentialError, KEYRING_SERVICE};
+use crate::CredentialError;
+#[cfg(not(test))]
+use crate::KEYRING_SERVICE;
 
 pub const MASTER_KEY_LEN: usize = 32;
 pub const MASTER_ENV_VAR: &str = "ZLOGIC_MASTER_KEY";
@@ -201,10 +203,25 @@ fn load_or_create_master(
     Ok(key)
 }
 
+/// The keychain entry holding the master key: one per machine, shared by every vault in the
+/// process and by an installation of the product. Under `cfg(test)` there is none, so the master
+/// falls back to the file next to the blob, which is per-vault. The vault tests build several
+/// vaults at once and would otherwise race on that one entry — each generating a key and
+/// overwriting the key another test just sealed its blob with, and overwriting an installation's.
+/// The keychain path itself is exercised by the credential-store tests.
+#[cfg(not(test))]
+fn keychain_entry() -> Option<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, MASTER_ACCOUNT).ok()
+}
+
+#[cfg(test)]
+fn keychain_entry() -> Option<keyring::Entry> {
+    None
+}
+
 fn keychain_master() -> Option<[u8; MASTER_KEY_LEN]> {
-    keyring::Entry::new(KEYRING_SERVICE, MASTER_ACCOUNT)
-        .and_then(|entry| entry.get_password())
-        .ok()
+    keychain_entry()
+        .and_then(|entry| entry.get_password().ok())
         .and_then(|hex| parse_master_hex(&hex))
 }
 
@@ -215,10 +232,7 @@ fn persist_master(
 ) -> Result<(), CredentialError> {
     if backend == Backend::Keychain {
         let hex = to_hex(key);
-        if keyring::Entry::new(KEYRING_SERVICE, MASTER_ACCOUNT)
-            .and_then(|entry| entry.set_password(&hex))
-            .is_ok()
-        {
+        if keychain_entry().is_some_and(|entry| entry.set_password(&hex).is_ok()) {
             return Ok(());
         }
     }

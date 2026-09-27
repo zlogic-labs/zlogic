@@ -588,6 +588,11 @@ mod tests {
 
     fn repo_with_commit(dir: &Path) {
         let repo = git2::Repository::init(dir).unwrap();
+        // A host's `core.autocrlf` decides what a checkout contains — Git for Windows ships `true`
+        // by default, and a runner has it — while these tests are about which version of a file
+        // lands in the worktree, not about how the host spells line endings.
+        let mut config = repo.config().unwrap();
+        config.set_bool("core.autocrlf", false).unwrap();
         std::fs::write(dir.join("a.txt"), "x").unwrap();
         let mut index = repo.index().unwrap();
         index.add_path(Path::new("a.txt")).unwrap();

@@ -1,0 +1,99 @@
+# CI — the checks CONTRIBUTING.md asks for before a pull request, on the three platforms the
+# README claims.
+#
+# The test matrix is three operating systems on purpose. `cfg(unix)` and `cfg(windows)` are both
+# load-bearing in this tree — terminal capabilities, console control events, the platform
+# keychain, the clipboard — so a green run on one platform proves nothing about another.
+#
+# No path filters: a documentation-only pull request is cheap next to a required check that
+# never reports because the workflow was skipped.
+#
+# Read-only, no secrets, no artifacts: this answers "is it formatted, does it compile, do the
+# tests pass". Packaging the shipped binary happens in the private repository that welds this
+# tree together with the daemon.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A pull request runs the `pull_request` event and a push of the same commit: drop the older run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  lint:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+      # Not `-D warnings` yet: the tree carries a couple of hundred of them, mostly rustdoc's
+      # "doc list item without indentation" across the older modules. This job fails on clippy
+      # errors and reports the rest — turning the warnings into a gate is its own change, made
+      # once the tree is quiet.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # `crates/credential` reaches the freedesktop secret service over the session bus, which
+      # builds against libdbus-1. These are the only system libraries the workspace needs.
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+
+      # The runner has a session bus but no secret service provider, so the keyring tests would
+      # fail there. Start one with a throwaway password (the recipe uv's CI uses): `--unlock`
+      # both creates the login keyring and unlocks it, and the entry never outlives the job.
+      - name: Linux secret service
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y --no-install-recommends gnome-keyring
+          gnome-keyring-daemon --components=secrets --daemonize --unlock <<< 'zlogic-ci'
+
+      - name: test
+        run: cargo test --workspace --locked

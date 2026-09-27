@@ -160,7 +160,40 @@ pub fn install_signal_handlers() {
     });
 }
 
-/// Windows has no POSIX signals (console close tears the process down at the OS
-/// level, and signal-hook's iterator is unix-only) — keep the call site unconditional.
-#[cfg(not(unix))]
+/// Windows' half of the same job: console control events. They are delivered on a thread
+/// Windows creates for the event, so the allocation-light `restore_terminal()` is fine here —
+/// the same reasoning as the unix handler above.
+/// Raw mode clears `ENABLE_PROCESSED_INPUT`, so a Ctrl+C the TUI owns arrives as a KEY EVENT:
+/// what reaches this handler came from outside — the console window closing, a `taskkill`, or a
+/// Ctrl+C pressed after raw mode is already back but while the process is still shutting down
+/// (`EngineSession::drop` lets a cancelled turn drain, long enough for the extra tap of the
+/// double-tap gesture). Windows' default ends such a process with `STATUS_CONTROL_C_EXIT`, which
+/// `cargo run` reports as a run that did not exit successfully: the user asked to quit, so
+/// restore the terminal and exit clean.
+#[cfg(windows)]
+pub fn install_signal_handlers() {
+    use windows_sys::Win32::System::Console::{
+        SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
+        CTRL_SHUTDOWN_EVENT,
+    };
+
+    unsafe extern "system" fn handler(event: u32) -> i32 {
+        match event {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT
+            | CTRL_SHUTDOWN_EVENT => {
+                restore_terminal();
+                std::process::exit(0);
+            }
+            // FALSE: not an event this handler claims, so the next one in the chain gets it.
+            _ => 0,
+        }
+    }
+
+    unsafe {
+        SetConsoleCtrlHandler(Some(handler), 1);
+    }
+}
+
+/// Neither platform's mechanism exists here; the panic hook + RAII Guard still cover exits.
+#[cfg(not(any(unix, windows)))]
 pub fn install_signal_handlers() {}
