@@ -24,6 +24,7 @@ use zlogic_protocol::query::{
 };
 use zlogic_protocol::stream::{OutputStream, TaskOutputDelta};
 use zlogic_protocol::{MessagePart, SessionId, TaskUpdatePart};
+use zlogic_proctree::{Console, Tree};
 use zlogic_store::{Delivery, NewSession, TitleSource};
 use zlogic_task::{
     AgentResult, AgentSpec, ConcurrencyPolicy, ExecutorSpec, JobDefinition, JobStore, NewJob,
@@ -222,7 +223,7 @@ impl TaskManager {
                 None
             };
             if let Some(stop) = stopped_before_start {
-                terminate_process(&mut process.child).await;
+                process.child.terminate().await;
                 inner.finish_stopped(task_id, TaskState::Queued, stop, None);
                 inner.runtimes().remove(&task_id);
                 return;
@@ -230,7 +231,7 @@ impl TaskManager {
             if let Err(error) =
                 inner.transition(task_id, TaskState::Queued, TaskState::Running, None, None)
             {
-                terminate_process(&mut process.child).await;
+                process.child.terminate().await;
                 tracing::error!(target: "zlogic::task", %task_id, "could not claim task: {error}");
                 inner.runtimes().remove(&task_id);
                 return;
@@ -246,7 +247,7 @@ impl TaskManager {
             {
                 Ok(file) => file,
                 Err(error) => {
-                    terminate_process(&mut process.child).await;
+                    process.child.terminate().await;
                     inner.finish(
                         task_id,
                         TaskState::Running,
@@ -324,7 +325,7 @@ impl TaskManager {
             };
 
             if cancelled || write_error.is_some() {
-                terminate_process(&mut process.child).await;
+                process.child.terminate().await;
             }
             let status = process.child.wait().await;
             let _ = spool.flush().await;
@@ -757,16 +758,15 @@ impl TaskManager {
             .envs(&spec.env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(false);
-        // The backgrounded process is a console binary (the resolved shell, or a server the shell
-        // launched). From a GUI host it must not open a console window: run it headless.
-        #[cfg(windows)]
-        command.creation_flags(0x0800_0000);
-        #[cfg(unix)]
-        command.process_group(0);
+            .stderr(Stdio::piped());
 
-        let mut child = match command.spawn() {
+        // The backgrounded process is a console binary (the resolved shell, or a server the shell
+        // launched). From a GUI host it must not open a console window: run it headless. It is
+        // also usually a wrapper around the process that actually does the work, so it is spawned
+        // as a `Tree` — `task_stop`, the turn cancellation and the end of the host all stop the
+        // whole tree rather than just the wrapper, and on Windows the kernel does it even if the
+        // host is killed outright.
+        let mut child = match Tree::spawn(command, Console::Hidden) {
             Ok(child) => child,
             Err(error) => {
                 let reason = format!("cannot start {}: {error}", spec.program);
@@ -780,8 +780,8 @@ impl TaskManager {
                 return Err(reason);
             }
         };
-        let stdout = child.stdout.take().expect("stdout was piped");
-        let stderr = child.stderr.take().expect("stderr was piped");
+        let stdout = child.take_stdout().expect("stdout was piped");
+        let stderr = child.take_stderr().expect("stderr was piped");
         let task_id = self.register_process(
             task,
             SpawnedProcess {
@@ -836,23 +836,40 @@ impl TaskService for TaskManager {
     async fn list_tasks(&self, req: RuntimeTaskListReq) -> ApiResult<RuntimeTaskPage> {
         self.start_scheduler();
         let limit = req.stopped_limit.unwrap_or(20).clamp(1, 100);
-        let (active, stopped, stopped_total) = self
-            .inner
-            .store
-            .with(|db| {
-                let tasks = TaskStore::new(db.conn());
-                Ok::<_, zlogic_task::StoreError>((
-                    tasks.list_active_for_workspace(req.workspace_id, req.only_job_tasks)?,
-                    tasks.list_terminal_for_workspace(
-                        req.workspace_id,
-                        req.stopped_offset,
-                        limit,
-                        req.only_job_tasks,
-                    )?,
-                    tasks.count_terminal_for_workspace(req.workspace_id, req.only_job_tasks)?,
-                ))
-            })
-            .map_err(|error| ApiError::internal(format!("failed to read tasks: {error}")))?;
+        // One conversation's runs (the notification target is snapshotted onto each run) vs. the
+        // workspace's. Both answer "what is running"; only the second one is about jobs and other
+        // sessions, so the caller picks by asking for one or the other.
+        let (active, stopped, stopped_total) = match req.session_id {
+            Some(session_id) => self
+                .inner
+                .store
+                .with(|db| {
+                    let tasks = TaskStore::new(db.conn());
+                    Ok::<_, zlogic_task::StoreError>((
+                        tasks.list_active_for_session(session_id)?,
+                        tasks.list_terminal_for_session(session_id, req.stopped_offset, limit)?,
+                        tasks.count_terminal_for_session(session_id)?,
+                    ))
+                })
+                .map_err(|error| ApiError::internal(format!("failed to read tasks: {error}")))?,
+            None => self
+                .inner
+                .store
+                .with(|db| {
+                    let tasks = TaskStore::new(db.conn());
+                    Ok::<_, zlogic_task::StoreError>((
+                        tasks.list_active_for_workspace(req.workspace_id, req.only_job_tasks)?,
+                        tasks.list_terminal_for_workspace(
+                            req.workspace_id,
+                            req.stopped_offset,
+                            limit,
+                            req.only_job_tasks,
+                        )?,
+                        tasks.count_terminal_for_workspace(req.workspace_id, req.only_job_tasks)?,
+                    ))
+                })
+                .map_err(|error| ApiError::internal(format!("failed to read tasks: {error}")))?,
+        };
         let active = self.runtime_tasks_with_live_sessions(active).await;
         Ok(RuntimeTaskPage {
             active,
@@ -1380,6 +1397,10 @@ fn runtime_task(task: TaskRun, running_agent_session: Option<&str>) -> RuntimeTa
                 .to_string(),
         ),
     };
+    let agent = match &task.executor {
+        ExecutorSpec::Agent(spec) => Some(spec.agent.clone()),
+        ExecutorSpec::Process(_) => None,
+    };
     let agent_session_id = match &task.result {
         Some(TaskResult::Agent(result)) => Some(result.child_session_id.to_string()),
         Some(TaskResult::Process(_)) => None,
@@ -1407,6 +1428,7 @@ fn runtime_task(task: TaskRun, running_agent_session: Option<&str>) -> RuntimeTa
             }),
             None => None,
         }),
+        agent,
         agent_session_id,
         started_at: task.started_at,
         finished_at: task.finished_at,
@@ -1648,7 +1670,7 @@ impl TaskHost for TaskManager {
             })
             .count();
         if active >= 8 {
-            terminate_process(&mut process.child).await;
+            process.child.terminate().await;
             return Err(
                 "this conversation already has 8 active process tasks; stop one first".into(),
             );
@@ -1673,7 +1695,7 @@ impl TaskHost for TaskManager {
         }) {
             Ok(task) => task,
             Err(error) => {
-                terminate_process(&mut process.child).await;
+                process.child.terminate().await;
                 return Err(error.to_string());
             }
         };
@@ -1748,11 +1770,7 @@ impl TaskHost for TaskManager {
         // conclusion is already on the row.
         let output = match &task.executor {
             ExecutorSpec::Process(_) => {
-                let window = read_spool_window(
-                    &self.inner.spool_path(task_id),
-                    PROCESS_HEAD_BYTES,
-                    PROCESS_TAIL_BYTES,
-                )?;
+                let window = read_spool_tail(&self.inner.spool_path(task_id), REPORT_TAIL_BYTES)?;
                 (!window.is_empty()).then_some(window)
             }
             ExecutorSpec::Agent(_) => None,
@@ -1851,6 +1869,11 @@ impl TaskHost for TaskManager {
 
 const PROCESS_HEAD_BYTES: usize = 8 * 1024;
 const PROCESS_TAIL_BYTES: usize = 24 * 1024;
+
+/// `task_get` reads the tail only. The question it answers is "is it still going, and what is it
+/// doing right now", and a build's first 8 KiB answers neither: by the time it is read the head is
+/// history, while the tail is the line the process is on right now.
+const REPORT_TAIL_BYTES: usize = 10 * 1024;
 
 const NOTIFY_HEAD_BYTES: usize = 2 * 1024;
 const NOTIFY_TAIL_BYTES: usize = 6 * 1024;
@@ -2005,6 +2028,33 @@ fn read_spool_preview(path: &Path) -> Result<String, String> {
     read_spool_window(path, PROCESS_HEAD_BYTES, PROCESS_TAIL_BYTES)
 }
 
+/// The last `tail_bytes` of the spool, which is what the model reads through `task_get`. A cut is
+/// marked in the text so a truncated window is never mistaken for the whole transcript.
+fn read_spool_tail(path: &Path, tail_bytes: usize) -> Result<String, String> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let bytes = file.metadata().map_err(|error| error.to_string())?.len() as usize;
+    if bytes <= tail_bytes {
+        let mut all = Vec::with_capacity(bytes);
+        file.read_to_end(&mut all)
+            .map_err(|error| error.to_string())?;
+        return Ok(String::from_utf8_lossy(&all).into_owned());
+    }
+    file.seek(SeekFrom::End(-(tail_bytes as i64)))
+        .map_err(|error| error.to_string())?;
+    let mut tail = vec![0; tail_bytes];
+    file.read_exact(&mut tail)
+        .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "[{} earlier bytes omitted; showing the last {tail_bytes} bytes]\n\n{}",
+        bytes - tail_bytes,
+        String::from_utf8_lossy(&tail)
+    ))
+}
+
 fn read_spool_window(path: &Path, head_bytes: usize, tail_bytes: usize) -> Result<String, String> {
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -2033,27 +2083,6 @@ fn read_spool_window(path: &Path, head_bytes: usize, tail_bytes: usize) -> Resul
         bytes - head_bytes - tail_bytes,
         String::from_utf8_lossy(&tail)
     ))
-}
-
-async fn terminate_process(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        let _ = tokio::process::Command::new("kill")
-            .arg("-TERM")
-            .arg("--")
-            .arg(format!("-{pid}"))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
-        if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
-            .await
-            .is_ok()
-        {
-            return;
-        }
-    }
-    let _ = child.start_kill();
 }
 
 #[cfg(test)]
@@ -2378,15 +2407,17 @@ mod tests {
         let (_spool, objects, manager) = manager(store.clone());
         let hub = Arc::new(crate::hub::EventHub::new());
         manager.bind_hub(Arc::downgrade(&hub));
-        let mut child = tokio::process::Command::new("/bin/sh")
-            .args(["-c", "printf hello; printf error >&2"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
+        let mut child = Tree::spawn(
+            tokio::process::Command::new("/bin/sh")
+                .args(["-c", "printf hello; printf error >&2"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+            Console::Hidden,
+        )
+        .unwrap();
+        let stdout = child.take_stdout().unwrap();
+        let stderr = child.take_stderr().unwrap();
 
         let task_id = manager
             .start_process(
@@ -2760,6 +2791,7 @@ mod tests {
             &manager,
             RuntimeTaskListReq {
                 workspace_id: session.workspace_id,
+                session_id: None,
                 stopped_offset: 0,
                 stopped_limit: Some(1),
                 only_job_tasks: false,
@@ -2777,6 +2809,7 @@ mod tests {
             &manager,
             RuntimeTaskListReq {
                 workspace_id: session.workspace_id,
+                session_id: None,
                 stopped_offset: 0,
                 stopped_limit: Some(20),
                 only_job_tasks: true,
@@ -2787,6 +2820,37 @@ mod tests {
         assert_eq!(job_only.active.len(), 0);
         assert_eq!(job_only.stopped.len(), 0);
         assert_eq!(job_only.stopped_total, 0);
+
+        // The same question asked of one conversation: its own runs, and nothing else.
+        let mine = TaskService::list_tasks(
+            &manager,
+            RuntimeTaskListReq {
+                workspace_id: session.workspace_id,
+                session_id: Some(session.session_id),
+                stopped_offset: 0,
+                stopped_limit: Some(20),
+                only_job_tasks: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(mine.active.len(), 1);
+        assert_eq!(mine.stopped_total, 2);
+
+        let other = TaskService::list_tasks(
+            &manager,
+            RuntimeTaskListReq {
+                workspace_id: session.workspace_id,
+                session_id: Some(SessionId::new()),
+                stopped_offset: 0,
+                stopped_limit: Some(20),
+                only_job_tasks: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(other.active.is_empty());
+        assert_eq!(other.stopped_total, 0);
     }
 
     #[test]

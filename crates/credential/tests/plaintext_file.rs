@@ -17,7 +17,10 @@ fn with_the_keychain_off_a_secret_round_trips_through_the_plaintext_file() {
     let blob = tmp.path().join("security/.key.enc");
 
     set_keychain_enabled(false);
-    init_secret_vault(EncryptedPaths::new(master.clone(), blob.clone()), plain.clone());
+    init_secret_vault(
+        EncryptedPaths::new(master.clone(), blob.clone()),
+        plain.clone(),
+    );
 
     SystemCredentialStore
         .set_keyring("plaintext-entry", "sk-plaintext")

@@ -10,6 +10,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+zlogic-proctree = { path = "../proctree" }
 async-trait.workspace = true
 regex = "1"
 serde.workspace = true

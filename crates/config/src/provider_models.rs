@@ -28,7 +28,9 @@ impl ProviderModelsFile {
     }
 
     pub fn read(dirs: &Dirs) -> Option<Self> {
-        let file: Option<Self> = read_optional(&Self::path(dirs)).ok().flatten();
+        let file: Option<Self> = read_optional(&Self::path(dirs), &mut Vec::new())
+            .ok()
+            .flatten();
         file.filter(|f| !f.provider_id.trim().is_empty())
     }
 

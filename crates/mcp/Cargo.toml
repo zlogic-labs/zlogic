@@ -21,6 +21,7 @@ required-features = ["test-server"]
 zlogic-protocol = { path = "../protocol" }
 zlogic-objects = { path = "../objects" }
 zlogic-tools = { path = "../tools" }
+zlogic-proctree = { path = "../proctree" }
 zlogic-config = { path = "../config" }
 zlogic-credential = { path = "../credential" }
 serde.workspace = true

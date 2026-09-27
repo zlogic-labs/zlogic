@@ -571,8 +571,8 @@ mod tests {
                 .any(|w| w == b"sk-super-secret"),
             "plaintext must never appear in the blob"
         );
-        let master = load_or_create_master(&tmp.path().join("security/.master"), Backend::Keychain)
-            .unwrap();
+        let master =
+            load_or_create_master(&tmp.path().join("security/.master"), Backend::Keychain).unwrap();
         let map = load_blob(Some(&master), &blob_path).unwrap();
         assert_eq!(
             map.get("openai").map(String::as_str),

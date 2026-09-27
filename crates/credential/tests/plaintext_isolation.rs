@@ -21,7 +21,10 @@ fn an_unreadable_encrypted_file_does_not_disturb_the_plaintext_store() {
     std::fs::write(&master, b"not a 32-byte key").unwrap();
 
     set_keychain_enabled(false);
-    init_secret_vault(EncryptedPaths::new(master.clone(), blob.clone()), plain.clone());
+    init_secret_vault(
+        EncryptedPaths::new(master.clone(), blob.clone()),
+        plain.clone(),
+    );
 
     assert_eq!(
         SystemCredentialStore.resolve("keyring:anything"),

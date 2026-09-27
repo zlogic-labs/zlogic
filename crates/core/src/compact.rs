@@ -440,26 +440,56 @@ fn is_closing_fence(line: &str, opening_ticks: usize) -> bool {
     count >= opening_ticks && trimmed.chars().all(|c| c == '`')
 }
 
-/// What the conversation will cost the next request, in tokens — the compaction **post-condition**,
-/// not a figure for the UI.
+/// Model-facing size of a prepared message list, in characters.
+/// Every part the provider is sent counts, not just prose. A working turn is mostly tool results
+/// and tool arguments, and a count that read only `ContentPart::Text` measured one such turn at a
+/// few hundred characters — which is what made the post-condition below read a context the provider
+/// had measured at 155% of the window as "still 155% full after compacting".
+/// Images contribute nothing: their cost is the provider's own pixel arithmetic and nothing here
+/// can guess it. That under-counts a tail whose weight is an image, and the price of guessing one
+/// is a compaction that passes a check it should have failed.
+fn model_facing_chars(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .map(|part| match part {
+            ContentPart::Text(t) => t.text.chars().count(),
+            ContentPart::Reasoning(r) => r.text.chars().count(),
+            ContentPart::ToolCall(group) => group
+                .calls
+                .iter()
+                .map(|call| call.name.chars().count() + call.args.chars().count())
+                .sum(),
+            ContentPart::ToolResult(result) => result.content.chars().count(),
+            ContentPart::Image(_) => 0,
+        })
+        .sum()
+}
+
+/// What the next request will cost, in tokens — the compaction **post-condition**, not a figure for
+/// the UI.
 /// The UI shows `summary_tokens` (what the summary itself cost, measured) after a compaction; this
-/// answers a different question — "did the request actually get smaller than the window?" — and it
-/// is the one place an estimate is unavoidable: the covered range cannot be counted locally, and
+/// answers a different question — "is the request that goes out next inside the window?" — and it
+/// is the one place an estimate is unavoidable: the surviving range cannot be counted locally, and
 /// deliberately so, since a bundled tokenizer would be a second source of truth that drifts from the
-/// provider's. So it is estimated from the model-facing text at ~4 characters per token, and the rest
-/// is measured: `last_input` from the provider's own count, `summary_tokens` from the call that
-/// produced the summary.
+/// provider's. So it is estimated from the model-facing text at ~4 characters per token, with the
+/// summary itself measured when the provider reported it.
+/// **Both sides are local.** The provider's last reported `input_tokens` is deliberately not one of
+/// them: it counts a request this compaction never made, with a tokenizer this code does not have, so
+/// subtracting a local estimate of the removed range from it compared two different scales — and
+/// reported a turn the summariser had just read end to end as having nothing worth removing.
 /// It does not include the message about to be sent in this turn — compaction runs before that
 /// request is built. A few hundred tokens on a window's worth of conversation.
 fn remaining_after_compaction(
-    last_input: u64,
-    covered_chars: usize,
+    prefix_chars: usize,
+    tail_chars: usize,
     summary_tokens: Option<u64>,
     summary_chars: usize,
 ) -> u64 {
-    let covered = covered_chars as u64 / 4;
-    let added = summary_tokens.unwrap_or(summary_chars as u64 / 4);
-    last_input.saturating_sub(covered).saturating_add(added)
+    let prefix = prefix_chars as u64 / 4;
+    let tail = tail_chars as u64 / 4;
+    let summary = summary_tokens.unwrap_or(summary_chars as u64 / 4);
+    prefix + tail + summary
 }
 
 /// Whether the summary call can be assembled as one more request of the conversation itself.
@@ -505,9 +535,9 @@ struct Window {
     /// **Exactly the range being replaced** — the protected tail is not in here. It is not
     /// summarised, so showing it to the summariser would only invite it to restate what stays.
     messages: Vec<Message>,
-    /// Characters of model-facing text the covered range contributes — the lower bound on what
-    /// compaction removes.
-    chars: usize,
+    /// Model-facing characters of the protected tail — the part compaction cannot shrink, and so
+    /// what decides whether the next request fits at all.
+    tail_chars: usize,
 }
 
 impl Core {
@@ -605,20 +635,23 @@ impl Core {
                 .collect();
             let covered =
                 context::build_context(&window, &aux.model.source, &loader, &object_loader)?;
-            let chars = covered
-                .messages
+            // What survives, projected for the **conversation's** model rather than the
+            // summariser's: this is the payload the next request carries, so it is what the
+            // post-condition is measured against.
+            let tail: Vec<EntryRecord> = all
                 .iter()
-                .flat_map(|m| &m.content)
-                .filter_map(|p| match p {
-                    ContentPart::Text(t) => Some(t.text.chars().count()),
-                    _ => None,
-                })
-                .sum();
+                .filter(|e| e.turn_seq > to)
+                .cloned()
+                .collect();
+            let tail_chars = model_facing_chars(
+                &context::build_context(&tail, &plan.model.source, &loader, &object_loader)?
+                    .messages,
+            );
             Ok(Some(Window {
                 from,
                 to,
                 messages: covered.messages,
-                chars,
+                tail_chars,
             }))
         })?;
 
@@ -626,7 +659,7 @@ impl Core {
             from,
             to,
             messages,
-            chars,
+            tail_chars,
         }) = prepared
         else {
             nothing_to_compact(emitter, reason);
@@ -846,25 +879,30 @@ impl Core {
             model_ref: Some(aux.model_key()),
             summary_tokens,
         };
-        self.append(NewEntry::new(
-            session,
-            turn_id,
-            turn_seq,
-            EntryKind::Compaction,
-            serde_json::to_value(&summary)?,
-        ))?;
 
         // A post-condition that compaction actually shrinks the request. If even the floor exceeds
         // the window, the protected tail itself is the problem — retrying would resend the same
         // oversized tail again, so this is a hard error rather than a silent retry.
-        let remaining = self
-            .services()
-            .store
-            .with(|db| db.usage().last_conversation_input_tokens(session))?
-            .map(|last| {
-                remaining_after_compaction(last, chars, summary_tokens, summary.content.len())
-            })
-            .unwrap_or(0);
+        //
+        // Checked **before** the entry is appended. A compaction that cannot make the request fit
+        // has to leave the history exactly as it found it: written first, it failed the turn *and*
+        // folded one more turn, and since the turn died before any main request recorded a fresh
+        // input size, the next message read the same pre-compaction figure and compacted again.
+        // What the next **main** request carries ahead of the conversation: this turn's system
+        // prompt and tool definitions — not the ones the summary call was assembled with, which
+        // are a different set whenever it could not ride the prefix.
+        let prefix_chars = plan
+            .system
+            .iter()
+            .map(|section| section.chars().count())
+            .sum::<usize>()
+            + serde_json::to_string(&tools.definitions()).map_or(0, |json| json.chars().count());
+        let remaining = remaining_after_compaction(
+            prefix_chars,
+            tail_chars,
+            summary_tokens,
+            summary.content.len(),
+        );
         let window = plan.model.context_window;
         if remaining >= window {
             return Err(CoreError::ContextUncompressible(format!(
@@ -875,6 +913,14 @@ impl Core {
                  trim the tail (e.g. a single oversized tool result) before continuing."
             )));
         }
+
+        self.append(NewEntry::new(
+            session,
+            turn_id,
+            turn_seq,
+            EntryKind::Compaction,
+            serde_json::to_value(&summary)?,
+        ))?;
 
         emitter.send(StreamPayload::CompactionEnd {
             replaces: (from as u32, to as u32),
@@ -1291,5 +1337,45 @@ mod tests {
         assert_eq!(covered_prefix_end(&[summary(1, 3), summary(4, 8)]), Some(8));
         assert_eq!(covered_prefix_end(&[summary(2, 8)]), None);
         assert_eq!(covered_prefix_end(&[summary(1, 3), summary(5, 8)]), Some(3));
+    }
+
+    /// The regression: a turn of nothing but tool traffic measured as a few hundred characters, so
+    /// the post-condition subtracted almost nothing from the provider's count and called a context
+    /// that was over the window "uncompressible" — on every message, because the failed compaction
+    /// had already folded a turn and the trigger kept reading the same stale figure.
+    #[test]
+    fn the_size_of_a_tool_heavy_tail_is_the_size_the_model_was_sent() {
+        use zlogic_protocol::message::{Role, ToolCall, ToolCallPart, ToolResultPart};
+
+        let body = "x".repeat(4_000);
+        let round = Message {
+            role: Role::Assistant,
+            source: None,
+            content: vec![ContentPart::ToolCall(ToolCallPart {
+                calls: vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    args: format!("{{\"path\":\"{body}\"}}"),
+                    raw: None,
+                }],
+            })],
+        };
+        let results = Message::tool(vec![ContentPart::ToolResult(ToolResultPart {
+            call_id: "call_1".into(),
+            name: "read_file".into(),
+            content: body.clone(),
+            files: Vec::new(),
+            is_error: false,
+        })]);
+        let chars = model_facing_chars(&[round, results]);
+
+        assert!(
+            chars > 8_000,
+            "a tool round of 8k characters measured as {chars}"
+        );
+        // The window the post-condition compares against: prefix + this tail + the summary.
+        let remaining = remaining_after_compaction(0, chars, Some(1_628), 4_186);
+        assert_eq!(remaining, (chars / 4) as u64 + 1_628);
+        assert!(remaining < 100_000, "a 8k-character tail must fit a 100k window");
     }
 }

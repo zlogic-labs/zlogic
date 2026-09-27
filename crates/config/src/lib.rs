@@ -28,8 +28,9 @@ pub use provider::{
 pub use provider_models::ProviderModelsFile;
 pub use roles::{RoleSettings, RoleThinking, SESSION};
 pub use settings::{
-    ApprovalMode, AutoTitle, ContextConfig, CostConfig, ExchangeRate, LimitsConfig, LogConfig,
-    NetworkSettings, SessionConfig, ShellPreference, ToolsConfig, WebSearchConfig, WorktreeConfig,
+    ApprovalMode, AutoTitle, CheckpointsConfig, ContextConfig, CostConfig, ExchangeRate,
+    LimitsConfig, LogConfig, NetworkSettings, RetentionConfig, SessionConfig, ShellPreference,
+    ToolsConfig, WebSearchConfig, WorktreeConfig,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -70,12 +71,14 @@ pub const DEFAULT_KEYCHAIN_ENABLED: bool = !cfg!(target_os = "macos");
 /// Credentials are read before the rest of the config is parsed: whether the OS store may be
 /// touched at all decides which backend the vault picks, and a process that has already asked the
 /// keychain for one entry has already shown the dialog it was trying to avoid. A file that cannot
-/// be read falls back to the platform default rather than failing startup.
+/// be read falls back to the platform default rather than failing startup — and so does a file
+/// carrying keys this build cannot use, which is the same case: the switch is one line in a file
+/// that may be newer than the process reading it.
 pub fn keychain_enabled(dirs: &Dirs) -> bool {
     std::fs::read_to_string(dirs.config_file())
         .ok()
-        .and_then(|body| serde_yaml_ng::from_str::<ConfigFile>(&body).ok())
-        .and_then(|file| file.keychain)
+        .and_then(|body| parse_dropping_unusable_keys::<ConfigFile>(&body).ok())
+        .and_then(|(file, _, _)| file.keychain)
         .unwrap_or(DEFAULT_KEYCHAIN_ENABLED)
 }
 
@@ -85,7 +88,9 @@ pub fn keychain_enabled(dirs: &Dirs) -> bool {
 /// `None` removes the key, which restores the platform default: a macOS user who turns the
 /// keychain back on gets a file that says nothing rather than one that freezes today's default.
 pub fn write_keychain_enabled(dirs: &Dirs, on: Option<bool>) -> Result<bool> {
-    let current = ConfigFiles::read(dirs)?.config.and_then(|file| file.keychain);
+    let current = ConfigFiles::read(dirs)?
+        .config
+        .and_then(|file| file.keychain);
     if current == on {
         return Ok(false);
     }
@@ -112,6 +117,8 @@ pub struct ConfigFile {
     pub tools: Option<ToolsConfig>,
     pub log: Option<LogConfig>,
     pub worktree: Option<WorktreeConfig>,
+    pub checkpoints: Option<CheckpointsConfig>,
+    pub retention: Option<RetentionConfig>,
     pub cost: Option<CostConfig>,
     pub limits: Option<LimitsConfig>,
     pub network: Option<NetworkSettings>,
@@ -139,6 +146,8 @@ pub struct AppConfig {
     pub tools: ToolsConfig,
     pub log: LogConfig,
     pub worktree: WorktreeConfig,
+    pub checkpoints: CheckpointsConfig,
+    pub retention: RetentionConfig,
     pub cost: CostConfig,
     pub limits: LimitsConfig,
     pub network: NetworkSettings,
@@ -159,6 +168,8 @@ impl Default for AppConfig {
             tools: ToolsConfig::default(),
             log: LogConfig::default(),
             worktree: WorktreeConfig::default(),
+            checkpoints: CheckpointsConfig::default(),
+            retention: RetentionConfig::default(),
             cost: CostConfig::default(),
             limits: LimitsConfig::default(),
             network: NetworkSettings::default(),
@@ -175,16 +186,22 @@ pub struct ConfigFiles {
     pub prices: Option<PriceFile>,
     pub catalog: Option<CatalogFile>,
     pub provider_models: Option<ProviderModelsFile>,
+    /// What the files carried that this build could not use, phrased for the user.
+    pub warnings: Vec<String>,
 }
 
 impl ConfigFiles {
     pub fn read(dirs: &Dirs) -> Result<Self> {
+        let mut warnings = Vec::new();
+        let models = read_optional::<ModelsFile>(&dirs.models_file(), &mut warnings)?;
+        let config = read_optional::<ConfigFile>(&dirs.config_file(), &mut warnings)?;
         Ok(Self {
-            models: read_optional::<ModelsFile>(&dirs.models_file())?,
-            config: read_optional::<ConfigFile>(&dirs.config_file())?,
+            models,
+            config,
             prices: PriceFile::read(dirs),
             catalog: CatalogFile::read(dirs),
             provider_models: ProviderModelsFile::read(dirs),
+            warnings,
         })
     }
 }
@@ -243,6 +260,7 @@ impl AppConfig {
             revision: 1,
             auto_detect_env,
             keychain,
+            warnings: files.warnings.clone(),
             ..Default::default()
         };
 
@@ -353,9 +371,11 @@ impl AppConfig {
     }
 
     pub fn from_file(path: &Path) -> Result<Self> {
-        let file = read_optional(path)?.unwrap_or_default();
+        let mut warnings = Vec::new();
+        let file = read_optional(path, &mut warnings)?.unwrap_or_default();
         let mut cfg = AppConfig {
             revision: 1,
+            warnings,
             ..Default::default()
         };
         cfg.apply(file);
@@ -388,6 +408,12 @@ impl AppConfig {
         }
         if let Some(w) = file.worktree {
             self.worktree = w;
+        }
+        if let Some(c) = file.checkpoints {
+            self.checkpoints = c;
+        }
+        if let Some(r) = file.retention {
+            self.retention = r;
         }
         if let Some(c) = file.cost {
             self.cost = c;
@@ -423,9 +449,12 @@ impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         self.context.validate().map_err(ConfigError::Invalid)?;
         self.worktree.validate().map_err(ConfigError::Invalid)?;
+        self.checkpoints.validate().map_err(ConfigError::Invalid)?;
+        self.retention.validate().map_err(ConfigError::Invalid)?;
         self.cost.validate().map_err(ConfigError::Invalid)?;
         self.limits.validate().map_err(ConfigError::Invalid)?;
         self.network.validate().map_err(ConfigError::Invalid)?;
+        self.tools.shell.validate().map_err(ConfigError::Invalid)?;
         self.tools
             .web_search
             .validate()
@@ -710,7 +739,11 @@ fn write_json_file(path: &Path, value: &impl Serialize) -> Result<()> {
     std::fs::rename(&tmp, path).map_err(io)
 }
 
-fn read_optional<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+/// Read one optional file and refuse anything that does not fit, whole file or not.
+///
+/// For the files where a bad line has nowhere to hide: a flat `KEY: value` map, where dropping the
+/// entry would leave a secret that simply does not exist and an error the user only meets as a 401.
+fn read_optional_strict<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     match std::fs::read_to_string(path) {
         Ok(text) => {
             let file = serde_yaml_ng::from_str(&text).map_err(|source| ConfigError::Parse {
@@ -727,9 +760,148 @@ fn read_optional<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T
     }
 }
 
+/// Read one optional config file, dropping what this build cannot use instead of failing on it.
+///
+/// These files outlive the binary reading them: a section a newer release added, a key this build
+/// has never heard of, a value written in a shape it does not accept. Refusing to start over a key
+/// that would have been ignored anyway turns a slightly stale build into a program that will not
+/// open, so an unusable key is **dropped and named in a warning** while the rest of the file still
+/// applies. Only a file that is unusable as a whole (malformed YAML, a document that is not a
+/// mapping) still fails, and it fails with the original error.
+///
+/// The rule stays narrow on purpose: a key is dropped only when removing it is what makes the file
+/// parse, so a section that is fine is never touched and a key this build *does* understand is
+/// never second-guessed. `policy.yaml` splits the same way — its document level is lenient, the
+/// rules inside it are not.
+fn read_optional<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    dropped: &mut Vec<String>,
+) -> Result<Option<T>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let (file, unusable, unknown_field) =
+                parse_dropping_unusable_keys(&text).map_err(|source| ConfigError::Parse {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            let reason = if unknown_field {
+                "this build does not know it"
+            } else {
+                "its value does not fit what this build expects"
+            };
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            dropped.extend(
+                unusable
+                    .into_iter()
+                    .map(|key| format!("{name}: ignored `{key}` — {reason}")),
+            );
+            Ok(Some(file))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Parse `T` out of `text`, dropping the mapping keys this build cannot use.
+///
+/// Returns the value, the keys that had to go, and whether the first failure was an unknown field
+/// — the caller's warning is phrased around that, since it is the common case (a section a newer
+/// build wrote) and says something different from a value that does not fit.
+fn parse_dropping_unusable_keys<T: serde::de::DeserializeOwned>(
+    text: &str,
+) -> std::result::Result<(T, Vec<String>, bool), serde_yaml_ng::Error> {
+    let strict = match serde_yaml_ng::from_str::<T>(text) {
+        Ok(file) => return Ok((file, Vec::new(), false)),
+        Err(error) => error,
+    };
+    let Ok(mut document) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(text) else {
+        return Err(strict);
+    };
+    let unknown_field = strict.to_string().contains("unknown field");
+
+    let mut dropped = Vec::new();
+    // One pass per dropped key: removing one can expose the next. A key that is not the problem is
+    // never removed, because the document still fails to parse without it — and the pass stops as
+    // soon as the document parses, since an empty document always would.
+    loop {
+        if T::deserialize(document.clone()).is_ok() {
+            break;
+        }
+        let mut paths = Vec::new();
+        collect_key_paths(&document, &mut Vec::new(), &mut paths);
+        // Deepest key first, so one misspelled key inside a section costs that key and not the
+        // section around it. A whole section this build has never heard of has no working inner
+        // key to drop it instead, so it is dropped whole either way.
+        paths.sort_by_key(|path| std::cmp::Reverse(path.len()));
+        let mut removed = None;
+        for path in paths {
+            let mut pruned = document.clone();
+            if remove_at(&mut pruned, &path) && T::deserialize(pruned.clone()).is_ok() {
+                removed = Some((pruned, key_label(&path)));
+                break;
+            }
+        }
+        let Some((pruned, label)) = removed else { break };
+        document = pruned;
+        dropped.push(label);
+    }
+
+    match T::deserialize(document) {
+        Ok(file) => Ok((file, dropped, unknown_field)),
+        // Nothing could be dropped to make it parse; the original error is the one that helps.
+        Err(_) => Err(strict),
+    }
+}
+
+/// Every mapping key in the document, each parent ahead of the keys nested under it.
+fn collect_key_paths(
+    value: &serde_yaml_ng::Value,
+    prefix: &mut Vec<serde_yaml_ng::Value>,
+    out: &mut Vec<Vec<serde_yaml_ng::Value>>,
+) {
+    let Some(mapping) = value.as_mapping() else { return };
+    for key in mapping.keys() {
+        prefix.push(key.clone());
+        out.push(prefix.clone());
+        if let Some(child) = mapping.get(key) {
+            collect_key_paths(child, prefix, out);
+        }
+        prefix.pop();
+    }
+}
+
+/// Remove the key `path` names, reporting whether it was there.
+fn remove_at(root: &mut serde_yaml_ng::Value, path: &[serde_yaml_ng::Value]) -> bool {
+    let Some((key, rest)) = path.split_first() else {
+        return false;
+    };
+    if rest.is_empty() {
+        return root
+            .as_mapping_mut()
+            .is_some_and(|mapping| mapping.remove(key).is_some());
+    }
+    root.as_mapping_mut()
+        .and_then(|mapping| mapping.get_mut(key))
+        .is_some_and(|child| remove_at(child, rest))
+}
+
+/// `providers.my-gw.models.qwen.no_such_field`, for a warning a user can act on.
+fn key_label(path: &[serde_yaml_ng::Value]) -> String {
+    path.iter()
+        .map(|key| match key.as_str() {
+            Some(name) => name.to_owned(),
+            None => format!("{key:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 pub fn load_env_file(dirs: &Dirs) -> Result<BTreeMap<String, String>> {
     let path = dirs.config.join("env.yaml");
-    let file: Option<BTreeMap<String, String>> = read_optional(&path)?;
+    let file: Option<BTreeMap<String, String>> = read_optional_strict(&path)?;
     let Some(file) = file else {
         return Ok(BTreeMap::new());
     };
@@ -991,8 +1163,34 @@ const CONFIG_TEMPLATE: &str = r#"# zlogic's basic settings. The provider / model
 #   default_shell: auto
 #   # A single tool result over this many characters goes to the object store, and only head and tail are fed to the model.
 #   max_result_chars: 30000
-#   # Tool execution timeout (seconds). 0 = unlimited.
+#   # Blanket ceiling on **any** tool call, on top of whatever that tool allows. 0 = off.
+#   # It overrides the per-class shell budgets below, so it is an emergency stop, not the normal
+#   # way to bound a run: set it and a 20-minute build is killed at whatever this says, with an
+#   # error that names neither the class nor the budget that actually applied.
 #   timeout_secs: 0
+#
+#   # How long `shell` may run, per kind of command. **You never set these per call** — the model
+#   # says whether it needs the result (`wait: true`) and shell matches the command to a class,
+#   # because a number guessed before the work is known is wrong in both directions: too short and
+#   # a test suite is killed at 30s and re-run four times, too long and one call holds the turn.
+#   # A workspace may override any single field in `<project>/.zlogic/settings.yaml`, same paths:
+#   #   tools:
+#   #     shell:
+#   #       test_secs: 1800          # an integration suite that is genuinely slow
+#   shell:
+#     quick_secs: 60               # git status, ls, a grep
+#     test_secs: 600               # cargo test, pytest, vitest — generous on purpose: a suite killed
+#                                   #   at the quick budget has told nobody anything
+#     build_secs: 1200             # cargo build, tsc, an install
+#     wait_secs: 3600              # ceiling for `wait: true`, which opts out of its class budget.
+#                                   #   Not unlimited: a command blocked on a port nobody opened
+#                                   #   would otherwise hold the turn until you give up on it
+#     stall_secs: 600              # no output at all for this long = stuck, not slow. Independent of
+#                                   #   the budgets above on purpose, and reported differently,
+#                                   #   because the two call for opposite responses
+#     progress_secs: 30            # how often a running call says it is still running. Display only;
+#                                   #   not in the settings UI, because it changes what you see and
+#                                   #   never what the tool does
 #
 #   # Who web_search calls. **It works unconfigured too** — both vendors have a free tier, just a low quota.
 #   web_search:
@@ -1261,16 +1459,53 @@ providers:
     }
 
     #[test]
-    fn typos_in_yaml_are_rejected_not_silently_defaulted() {
+    fn an_unknown_key_is_dropped_with_a_warning_and_the_rest_still_applies() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Dirs::under(tmp.path());
         dirs.ensure().unwrap();
-        write(&dirs.config, "config.yaml", "defualt_model: a/b\n");
-        let err = load(&dirs, &[]).unwrap_err();
-        assert!(
-            matches!(err, ConfigError::Parse { .. }),
-            "a misspelled key must be an error"
+        write(
+            &dirs.config,
+            "config.yaml",
+            "defualt_model: a/b\ndefault_model: p:m\n",
         );
+        let cfg = load(&dirs, &[]).unwrap();
+        assert_eq!(cfg.default_model.as_deref(), Some("p:m"));
+        assert!(
+            cfg.warnings
+                .iter()
+                .any(|w| w.contains("defualt_model") && w.contains("config.yaml")),
+            "the dropped key has to be named, or a typo is invisible: {:?}",
+            cfg.warnings
+        );
+    }
+
+    #[test]
+    fn a_known_key_whose_value_does_not_fit_loses_only_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        dirs.ensure().unwrap();
+        write(
+            &dirs.config,
+            "config.yaml",
+            "default_model: p:m\ncontext:\n  compact_ratio: not-a-number\n",
+        );
+        let cfg = load(&dirs, &[]).unwrap();
+        assert_eq!(cfg.default_model.as_deref(), Some("p:m"));
+        assert_eq!(cfg.context, ContextConfig::default());
+        assert!(
+            cfg.warnings.iter().any(|w| w.contains("compact_ratio")),
+            "{:?}",
+            cfg.warnings
+        );
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_at_all_is_still_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        dirs.ensure().unwrap();
+        write(&dirs.config, "config.yaml", "providers: [this is not a map\n");
+        assert!(matches!(load(&dirs, &[]), Err(ConfigError::Parse { .. })));
     }
 
     #[test]
@@ -1805,7 +2040,7 @@ providers:
     }
 
     #[test]
-    fn non_model_sections_are_rejected_in_models_yaml() {
+    fn a_section_that_belongs_to_another_file_is_dropped_from_models_yaml() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Dirs::under(tmp.path());
         write(
@@ -1813,7 +2048,15 @@ providers:
             "models.yaml",
             "context:\n  compact_ratio: 0.5\n",
         );
-        assert!(matches!(load(&dirs, &[]), Err(ConfigError::Parse { .. })));
+        let cfg = load(&dirs, &[]).unwrap();
+        assert_eq!(cfg.context, ContextConfig::default());
+        assert!(
+            cfg.warnings
+                .iter()
+                .any(|w| w.contains("models.yaml") && w.contains("context")),
+            "{:?}",
+            cfg.warnings
+        );
     }
 }
 

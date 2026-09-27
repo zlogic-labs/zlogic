@@ -103,10 +103,10 @@ pub enum ToolDisplay {
     },
 
     /// A sandboxed HTML widget. Source is stored as an object and fetched only when the card is
-    /// expanded; generated markup never enters the host application's document.
+    /// expanded; generated markup never enters the host application's document. The card is
+    /// untitled by design — the surrounding prose names it, and a second title only duplicates it.
     Widget {
         object_id: ObjectId,
-        title: String,
         height: u16,
         libraries: Vec<String>,
     },
@@ -167,25 +167,38 @@ impl ToolDisplay {
 
     /// Guesses a MIME type from the extension, for the common text formats only.
     /// Returns `None` when unsure. A wrong `text/*` label on a binary is worse than no label:
-    /// the UI would try to render it.
+    /// the UI would try to render it. A caller that has the bytes should ask
+    /// [`crate::file::sniff::detect_mime`] instead — it weighs them against the name.
     pub fn guess_mime(path: &str) -> Option<&'static str> {
         let ext = path.rsplit('.').next()?.to_ascii_lowercase();
         Some(match ext.as_str() {
             "rs" => "text/rust",
-            "ts" | "tsx" => "text/typescript",
-            "js" | "jsx" | "mjs" => "text/javascript",
-            "py" => "text/x-python",
+            "ts" | "tsx" | "mts" | "cts" => "text/typescript",
+            "js" | "jsx" | "mjs" | "cjs" => "text/javascript",
+            "py" | "pyi" => "text/x-python",
             "go" => "text/x-go",
             "java" => "text/x-java",
+            "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "cs" => "text/x-c",
+            "rb" => "text/x-ruby",
+            "php" => "text/x-php",
+            "swift" => "text/x-swift",
+            "kt" | "kts" | "scala" => "text/x-kotlin",
+            "lua" => "text/x-lua",
+            "pl" | "pm" => "text/x-perl",
             "json" => "application/json",
             "yaml" | "yml" => "application/yaml",
             "toml" => "application/toml",
-            "md" | "markdown" => "text/markdown",
+            "md" | "markdown" | "mdx" => "text/markdown",
             "html" | "htm" => "text/html",
             "css" => "text/css",
-            "sh" | "bash" | "zsh" => "text/x-shellscript",
+            "sh" | "bash" | "zsh" | "fish" => "text/x-shellscript",
+            "ps1" | "psm1" | "bat" | "cmd" => "text/plain",
             "sql" => "application/sql",
-            "txt" | "log" => "text/plain",
+            // Everything a build, a test run or a service leaves behind: the files a user
+            // most often opens to find out what went wrong.
+            "txt" | "text" | "log" | "out" | "err" | "trace" | "list" | "lock" | "conf" | "cfg"
+            | "ini" | "properties" | "env" => "text/plain",
+            "patch" | "diff" => "text/x-diff",
             "csv" => "text/csv",
             "tsv" | "tab" => "text/tab-separated-values",
             "pdf" => "application/pdf",

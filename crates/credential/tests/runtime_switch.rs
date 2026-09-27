@@ -60,7 +60,9 @@ fn flipping_the_switch_moves_between_stores_without_migrating_either() {
     // And back off again: the plaintext entry survived both flips.
     set_keychain_enabled(false);
     assert_eq!(
-        SystemCredentialStore.resolve("keyring:local-only").as_deref(),
+        SystemCredentialStore
+            .resolve("keyring:local-only")
+            .as_deref(),
         Some("sk-plaintext")
     );
 }

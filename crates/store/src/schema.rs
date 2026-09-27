@@ -13,7 +13,7 @@
 /// Every migration, in order. The index is the schema version.
 pub const MIGRATIONS: &[&str] = &[
     V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19, V20, V21,
-    V22,
+    V22, V23, V24,
 ];
 
 /// The current version — what a freshly created database reports.
@@ -449,6 +449,34 @@ CREATE TABLE IF NOT EXISTS translation (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_translation_recent ON translation(created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_translation_cache ON translation(target_code, source_text);
+"#;
+
+/// The transcript head page, which the client re-derives on every poll, and the turn anchors it
+/// reads alongside it.
+///
+/// `turn_page` filters on `kind != 'event'`, which `idx_entry_turn` cannot serve: the index has
+/// `(session_id, turn_seq, seq)` and the filter needs `kind`, so every candidate row was fetched
+/// from the table — on a 155k-row `session_entry` that is 21 s for the page alone. A partial
+/// covering index answers both `COUNT(DISTINCT turn_seq)` and the `DISTINCT … ORDER BY turn_seq
+/// DESC LIMIT` from the index alone, with no table access: 124 ms → 1.8 ms measured.
+///
+/// `turn_anchors` groups by turn to pick `MIN(created_at)`, so it needs `created_at` and `turn_id`
+/// too; without them in the index it visits every row of the requested turns.
+const V23: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_entry_turn_page
+ON session_entry(session_id, turn_seq) WHERE kind != 'event';
+CREATE INDEX IF NOT EXISTS idx_entry_turn_anchor
+ON session_entry(session_id, turn_seq, created_at, turn_id);
+-- V19 dropped this, but only for databases that had not already passed version 19 when the drop
+-- was added. It duplicates idx_entry_kind column for column, so every insert was paying to
+-- maintain two identical B-trees over the whole table.
+DROP INDEX IF EXISTS idx_session_entry_session_kind_seq;
+"#;
+
+const V24: &str = r#"
+ALTER TABLE workspaces ADD COLUMN kind TEXT NOT NULL DEFAULT 'coding';
+UPDATE workspaces SET kind = 'chat'
+WHERE tools = '["time","web_fetch","web_search"]';
 "#;
 
 #[cfg(test)]

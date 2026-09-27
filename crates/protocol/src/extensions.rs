@@ -3,6 +3,8 @@
 //! executable MCP declarations are returned as explicit capabilities. The caller must repeat the
 //! install with `accept_capabilities = true`; there is no hidden "install and run" operation.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +74,28 @@ pub struct ExtensionDescriptor {
     pub authentication: Option<McpAuthMode>,
     /// Last observed MCP connection state. Live process state; never persisted.
     pub runtime_status: Option<McpRuntimeStatus>,
+    /// The repository brought this one, so the switch can only be flipped per workspace.
+    #[serde(default)]
+    pub workspace_scoped: bool,
+    /// Only set for a repository-provided server. What the workspace has already confirmed.
+    #[serde(default)]
+    pub trust: Option<McpTrust>,
+    /// What turning it on would allow, in one sentence. Set while it still needs confirming.
+    #[serde(default)]
+    pub disclosure: Option<String>,
+}
+
+/// A repository-provided server's standing in one workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum McpTrust {
+    /// Confirmed for the definition as it stands, or never needed confirming.
+    Trusted,
+    /// Never confirmed here: it does not start.
+    Unconfirmed,
+    /// Confirmed once, but the definition changed since. It does not start.
+    DefinitionChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,7 +127,13 @@ pub struct ExtensionCatalog {
 pub struct ActiveSkill {
     pub name: String,
     pub description: String,
+    /// Locale (`zh-CN`, `en-US`, …) to description, for a UI that knows the reader's language.
+    #[serde(default)]
+    pub descriptions: BTreeMap<String, String>,
     pub source_path: String,
+    /// Compiled into the binary rather than installed, so the UI offers no switch for it.
+    #[serde(default)]
+    pub builtin: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +165,9 @@ pub struct ExtensionSetEnabledReq {
     pub kind: ExtensionKind,
     pub id: String,
     pub enabled: bool,
+    /// The workspace this switch belongs to. Absent means the machine-wide switch.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -56,7 +56,7 @@ pub mod sink;
 pub mod spawn;
 pub mod steer;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use zlogic_llm::LlmClient;
@@ -78,7 +78,8 @@ use zlogic_store::{Delivery, NewEntry};
 use zlogic_task::{ExecutorSpec, TaskRun, TaskTrigger};
 pub use zlogic_tools::CancellationToken;
 use zlogic_tools::{
-    AgentMailboxGate, AgentSpawner, RuntimePathProvider, SkillHost, TaskHost, ToolRegistry,
+    AgentMailboxGate, AgentSpawner, CheckpointHost, CheckpointOutcome, CheckpointRequest,
+    CheckpointTrigger, RuntimePathProvider, SkillHost, TaskHost, ToolMeta, ToolRegistry, ToolRisk,
     WorktreeHost,
 };
 
@@ -435,6 +436,9 @@ pub struct Core {
     /// Per-run rather than in [`CoreServices`], because it is bound to one session: what it
     /// changes is that session's `exec_cwd`.
     worktree: Option<Arc<dyn WorktreeHost>>,
+    /// Wired in when checkpoints are available. Absent = the workspace is not checkpointed and
+    /// every trigger is skipped silently.
+    checkpoints: Option<Arc<dyn CheckpointHost>>,
     /// The tool set for this run. `None` = [`CoreServices::tools`], the built-ins.
     /// Per-run rather than in [`CoreServices`], because the extension part of the tool set is
     /// **per workspace**: MCP servers are configured globally *and* inside a repository, so two
@@ -463,6 +467,7 @@ impl Core {
             agent_mailbox: None,
             skills: None,
             worktree: None,
+            checkpoints: None,
             tools: None,
             hooks: None,
         }
@@ -507,6 +512,12 @@ impl Core {
         self
     }
 
+    /// Wires in checkpoints. Without them nothing is snapshotted and nothing is reported.
+    pub fn with_checkpoints(mut self, checkpoints: Option<Arc<dyn CheckpointHost>>) -> Self {
+        self.checkpoints = checkpoints;
+        self
+    }
+
     /// Marks this run as a sub-agent's, `depth` levels below the root.
     pub fn as_sub_agent(mut self, agent: AgentRef, depth: u32) -> Self {
         self.agent = agent;
@@ -536,6 +547,97 @@ impl Core {
 
     pub(crate) fn worktree(&self) -> Option<Arc<dyn WorktreeHost>> {
         self.worktree.clone()
+    }
+
+    /// Stores the working tree as a restore point, if checkpoints are wired in.
+    ///
+    /// A checkpoint is a safety net, so it is never allowed to become a new way for a turn to
+    /// fail: the store's own failures come back as a receipt and leave a line in the log, and the
+    /// tool or the turn carries on. The one thing that would be lost by ignoring that is the
+    /// user's ability to know the net was not there, which is why a genuine failure is a warning
+    /// rather than a `debug!` — but it is still not a failed `edit`.
+    pub(crate) async fn checkpoint(
+        &self,
+        workspace: &Path,
+        turn_id: Option<TurnId>,
+        trigger: CheckpointTrigger,
+        tool: Option<&str>,
+        detail: Option<String>,
+    ) {
+        let Some(host) = &self.checkpoints else {
+            return;
+        };
+        let request = CheckpointRequest {
+            workspace: workspace.to_path_buf(),
+            session_id: self.session_id.to_string(),
+            turn_id: turn_id.map(|id| id.to_string()),
+            trigger,
+            tool: tool.map(str::to_string),
+            detail,
+        };
+        let receipt = match host.capture(request).await {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                tracing::warn!(
+                    target: "zlogic::core",
+                    session_id = %self.session_id,
+                    ?error,
+                    "checkpoint host failed"
+                );
+                return;
+            }
+        };
+        match receipt.outcome {
+            CheckpointOutcome::Captured => tracing::debug!(
+                target: "zlogic::core",
+                session_id = %self.session_id,
+                checkpoint = %receipt.id,
+                ?trigger,
+                tool,
+                "checkpoint stored"
+            ),
+            CheckpointOutcome::Skipped => tracing::debug!(
+                target: "zlogic::core",
+                session_id = %self.session_id,
+                note = receipt.note.as_deref().unwrap_or(""),
+                "checkpoint skipped"
+            ),
+            CheckpointOutcome::Failed => tracing::warn!(
+                target: "zlogic::core",
+                session_id = %self.session_id,
+                note = receipt.note.as_deref().unwrap_or(""),
+                "checkpoint could not be taken"
+            ),
+        }
+    }
+
+    /// The tree to snapshot: the session's own working directory, which is where its tools act
+    /// and can differ from the workspace root when the session is in a worktree.
+    fn checkpoint_workspace(&self) -> PathBuf {
+        self.exec_cwd().unwrap_or_else(|_| self.root.clone())
+    }
+
+    /// The point before a tool that can change something. Read-only tools are skipped: they cost
+    /// a full directory walk and produce the same tree the last snapshot has.
+    pub(crate) async fn checkpoint_before_tool(
+        &self,
+        workspace: &Path,
+        turn_id: TurnId,
+        meta: &ToolMeta,
+        tool: &str,
+        detail: Option<String>,
+    ) {
+        if meta.risk == ToolRisk::Read && meta.source != "mcp" {
+            return;
+        }
+        self.checkpoint(
+            workspace,
+            Some(turn_id),
+            CheckpointTrigger::BeforeTool,
+            Some(tool),
+            detail,
+        )
+        .await;
     }
 
     async fn ask_budget(
@@ -985,6 +1087,19 @@ impl Core {
             proactive: false,
         });
 
+        // The baseline this turn is measured against: what the tree looked like before any of its
+        // tools ran. Taken after the input is in the history, so what is stored is the state the
+        // turn actually starts from.
+        let workspace = self.checkpoint_workspace();
+        self.checkpoint(
+            &workspace,
+            Some(turn_id),
+            CheckpointTrigger::TurnStart,
+            None,
+            None,
+        )
+        .await;
+
         let registry = self.tools.as_ref().unwrap_or(&self.services.tools);
         // Tools loaded via `load_tool` are session state (recorded in `kind: tool_load` entries),
         // so the next turn seeds its materialised set from them instead of asking the model to
@@ -1285,6 +1400,17 @@ impl Core {
                 );
             }
         }
+
+        // The turn's own result: a restore point that puts the tree back to how it looks now,
+        // after every tool in the turn has had its say.
+        self.checkpoint(
+            &workspace,
+            Some(turn_id),
+            CheckpointTrigger::TurnEnd,
+            None,
+            None,
+        )
+        .await;
 
         emitter.turn_end(&status, limit_reason.as_deref(), &stats);
 

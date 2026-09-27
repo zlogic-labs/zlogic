@@ -10,7 +10,7 @@ use zlogic_protocol::query::{
     ModelSelectionSource, Page, PendingOrigin, PendingSubmission, SessionListReq, SessionOpenReq,
     SessionOpened, SessionRenameReq, SessionSearchHit, SessionSearchReq, SessionSummary,
     TranscriptBody, TranscriptEntry, TranscriptKind, TranscriptPart, TranscriptReq, TurnAnswer,
-    TurnAnswerKind, TurnCompaction, TurnItem, TurnWidget, TurnsReq, WorkspaceSummary,
+    TurnAnswerKind, TurnCompaction, TurnItem, TurnWake, TurnWidget, TurnsReq, WorkspaceSummary,
 };
 use zlogic_protocol::usage::Purpose;
 use zlogic_protocol::{Effort, SessionId, TurnId, query::TitleSource};
@@ -237,7 +237,6 @@ impl Sessions {
                 .or_default()
                 .push(TurnWidget {
                     object_id: asset.object_id,
-                    title: asset.label.unwrap_or_default(),
                     height: meta.as_ref().map(|m| m.height).unwrap_or(0),
                     libraries: meta.map(|m| m.libraries).unwrap_or_default(),
                 });
@@ -280,7 +279,38 @@ impl Sessions {
             if widgets.len() > MAX_TURN_WIDGETS {
                 widgets.drain(..widgets.len() - MAX_TURN_WIDGETS);
             }
+            /* A task notification that arrived **before anything else** in the turn is what
+             * started it: the row then has no user message, and the collapsed line would be an
+             * answer to a question nobody asked. A notification injected later (the turn was
+             * already replying) is left to the detail — the turn was not woken by it. */
+            let mut wakes: Vec<TurnWake> = Vec::new();
+            let mut before_any_content = true;
             for entry in entries {
+                if let TranscriptBody::TaskUpdate {
+                    task_id,
+                    state,
+                    agent,
+                    command,
+                    child_session_id,
+                    job_title,
+                    source,
+                    ..
+                } = &entry.body
+                {
+                    if before_any_content {
+                        wakes.push(TurnWake {
+                            task_id: task_id.clone(),
+                            state: state.clone(),
+                            agent: agent.clone(),
+                            command: command.clone(),
+                            child_session_id: *child_session_id,
+                            job_title: job_title.clone(),
+                            source: source.clone(),
+                        });
+                    }
+                    continue;
+                }
+                before_any_content = false;
                 match &entry.body {
                     TranscriptBody::User { parts } => user.extend(parts.iter().cloned()),
                     TranscriptBody::Text { text, truncated } if entry.is_final => {
@@ -335,6 +365,7 @@ impl Sessions {
                 detail,
                 compaction,
                 widgets,
+                wakes,
             });
         }
         let missing: Vec<i64> = items

@@ -42,14 +42,18 @@ impl RateLimiter {
                 let mut windows = self.windows.lock().expect("rate limiter");
                 let seen = windows.entry(key.to_string()).or_default();
                 let now = Instant::now();
-                while seen.front().is_some_and(|at| now.duration_since(*at) >= WINDOW) {
+                while seen
+                    .front()
+                    .is_some_and(|at| now.duration_since(*at) >= WINDOW)
+                {
                     seen.pop_front();
                 }
                 if seen.len() < rpm as usize {
                     seen.push_back(now);
                     return;
                 }
-                WINDOW.saturating_sub(now.duration_since(*seen.front().expect("window is not empty")))
+                WINDOW
+                    .saturating_sub(now.duration_since(*seen.front().expect("window is not empty")))
             };
             tracing::info!(
                 target: "zlogic::llm::ratelimit",

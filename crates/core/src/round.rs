@@ -980,22 +980,20 @@ impl RoundCtx<'_> {
             let Some(object_id) = display.object_id() else {
                 continue;
             };
-            /* A widget is classified apart from other outputs, and carries the label and meta the
-             * renderer needs (title, `libraries`, `height`): the carousel card needs them, and they
-             * are only available right here on this card — re-parsing them back out of `display`
-             * later is both slow and unreliable (older widget cards never landed in `display`). */
+            /* A widget is classified apart from other outputs, and carries the meta the renderer
+             * needs (`libraries`, `height`). A card has no title of its own — the prose around it
+             * names it — so the object row gets no label, and re-parsing the meta back out of
+             * `display` later would be both slow and unreliable (older widget cards never landed
+             * in `display`). */
             if let zlogic_tools::ToolDisplay::Widget {
-                title,
-                height,
-                libraries,
-                ..
+                height, libraries, ..
             } = display
             {
                 entry = entry.references(zlogic_objects::ObjectRef::classified(
                     object_id.clone(),
                     zlogic_objects::ObjectRole::Output,
                     "widget",
-                    Some(title.clone()),
+                    None,
                     Some(
                         serde_json::json!({ "height": height, "libraries": libraries }).to_string(),
                     ),
@@ -1185,6 +1183,20 @@ impl RoundCtx<'_> {
                 return ToolExecResult::failed(format!("cannot resolve a working directory: {e}"));
             }
         };
+
+        // The last point where this tool has not yet touched anything. Read-only tools are left
+        // out — a snapshot of an unchanged tree costs a full directory walk and buys nothing — but
+        // an MCP tool is never skipped whatever its risk claims, because "what this server writes
+        // is nobody's guess" is exactly the case a restore point exists for.
+        self.core
+            .checkpoint_before_tool(
+                &exec_cwd,
+                self.turn_id,
+                &meta,
+                &effective.name,
+                call_gist(&effective.name, &effective.args),
+            )
+            .await;
 
         let ctx = ToolCtx {
             exec_cwd,
@@ -1509,4 +1521,56 @@ pub(crate) fn wire_status(status: ToolExecStatus) -> ToolStatus {
         ToolExecStatus::PrecheckFailed => ToolStatus::PrecheckFailed,
         ToolExecStatus::Cancelled => ToolStatus::Cancelled,
     }
+}
+
+/// One line saying what a tool call is about to do, for the checkpoint record.
+///
+/// A timeline that says only "before `shell`" cannot answer the question a user comes back with,
+/// which is *which* command ran. The argument is a JSON object and there is no schema to consult,
+/// so this reads the first string that looks like a command or a path and stops: display-only,
+/// best-effort, and never worth a failure. The shell tool's `command` is the case that matters
+/// and it is read by name, so the dangerous commands are never the ones missed.
+fn call_gist(tool: &str, args: &str) -> Option<String> {
+    let object = match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(serde_json::Value::Object(object)) => object,
+        _ => return clip(args, 200),
+    };
+    const LIMIT: usize = 200;
+    let preferred = match tool {
+        "shell" | "exec" | "bash" => ["command", "cmd", "script"].as_slice(),
+        _ => &[] as &[&str],
+    };
+    for key in preferred {
+        if let Some(text) = object.get(*key).and_then(|value| value.as_str()) {
+            return clip(text, LIMIT);
+        }
+    }
+    for key in [
+        "command",
+        "cmd",
+        "path",
+        "file_path",
+        "file",
+        "url",
+        "query",
+        "prompt",
+    ] {
+        if let Some(text) = object.get(key).and_then(|value| value.as_str()) {
+            return clip(text, LIMIT);
+        }
+    }
+    None
+}
+
+fn clip(text: &str, limit: usize) -> Option<String> {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return None;
+    }
+    if flat.chars().count() <= limit {
+        return Some(flat);
+    }
+    let mut out: String = flat.chars().take(limit).collect();
+    out.push('…');
+    Some(out)
 }

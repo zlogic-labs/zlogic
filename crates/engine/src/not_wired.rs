@@ -24,9 +24,15 @@ use zlogic_protocol::query::{
     WorkspaceFileRenameReq, WorkspaceFileSearchReq, WorkspaceFileText, WorkspaceFileWriteReq,
     WorkspaceGitBranchReq, WorkspaceGitCommitDetail, WorkspaceGitCommitDetailReq,
     WorkspaceGitCommitReq, WorkspaceGitDiff, WorkspaceGitDiffReq,
-    WorkspaceGitGenerateCommitMessageReq, WorkspaceGitInfo, WorkspaceGitOverview,
-    WorkspaceGitOverviewReq, WorkspaceGitStageReq, WorkspaceGitSyncReq, WorkspaceKind,
-    WorkspaceSelector, WorkspaceSummary, WorkspaceUpdateReq,
+    WorkspaceGitGenerateCommitMessageReq, WorkspaceGitInfo, WorkspaceGitInitReq,
+    WorkspaceGitOverview, WorkspaceGitOverviewReq, WorkspaceGitStageReq, WorkspaceGitSyncReq,
+    WorkspaceKind, WorkspaceSelector, WorkspaceSummary, WorkspaceUpdateReq,
+};
+use zlogic_protocol::query::{
+    WorkspaceCheckpoint, WorkspaceCheckpointCaptureReq, WorkspaceCheckpointFileDiff,
+    WorkspaceCheckpointFileDiffReq, WorkspaceCheckpointList, WorkspaceCheckpointListReq,
+    WorkspaceCheckpointPlan, WorkspaceCheckpointPlanReq, WorkspaceCheckpointRestore,
+    WorkspaceCheckpointRestoreReq, WorkspaceCheckpointStep, WorkspaceCheckpointStepReq,
 };
 use zlogic_protocol::{
     AgentProfile, AgentProfileCreateReq, AgentProfileDeleteReq, AgentProfileListReq,
@@ -39,8 +45,8 @@ use zlogic_protocol::{
 use crate::service::{
     AgentProfileService, AuxiliaryService, ConfigService, CredentialService, ExtensionService,
     ManagedResourceService, MemoryService, ObjectService, SessionService, TaskService,
-    ToolCatalogService, TranslationService, TurnService, WorkspaceFilesService,
-    WorkspaceGitService, WorkspaceService,
+    ToolCatalogService, TranslationService, TurnService, WorkspaceCheckpointsService,
+    WorkspaceFilesService, WorkspaceGitService, WorkspaceService,
 };
 
 pub struct NotWired;
@@ -236,6 +242,9 @@ impl WorkspaceGitService for NotWired {
     async fn git_stage(&self, _req: WorkspaceGitStageReq) -> ApiResult<WorkspaceGitOverview> {
         nope!("workspace_git_stage")
     }
+    async fn git_init(&self, _req: WorkspaceGitInitReq) -> ApiResult<WorkspaceGitOverview> {
+        nope!("workspace_git_init")
+    }
     async fn git_sync(&self, _req: WorkspaceGitSyncReq) -> ApiResult<WorkspaceGitOverview> {
         nope!("workspace_git_sync")
     }
@@ -250,6 +259,46 @@ impl WorkspaceGitService for NotWired {
     }
     async fn git_diff(&self, _req: WorkspaceGitDiffReq) -> ApiResult<WorkspaceGitDiff> {
         nope!("workspace_git_diff")
+    }
+}
+
+#[async_trait]
+impl WorkspaceCheckpointsService for NotWired {
+    async fn checkpoint_list(
+        &self,
+        _req: WorkspaceCheckpointListReq,
+    ) -> ApiResult<WorkspaceCheckpointList> {
+        nope!("workspace_checkpoint_list")
+    }
+    async fn checkpoint_plan(
+        &self,
+        _req: WorkspaceCheckpointPlanReq,
+    ) -> ApiResult<WorkspaceCheckpointPlan> {
+        nope!("workspace_checkpoint_plan")
+    }
+    async fn checkpoint_step(
+        &self,
+        _req: WorkspaceCheckpointStepReq,
+    ) -> ApiResult<WorkspaceCheckpointStep> {
+        nope!("workspace_checkpoint_step")
+    }
+    async fn checkpoint_diff(
+        &self,
+        _req: WorkspaceCheckpointFileDiffReq,
+    ) -> ApiResult<WorkspaceCheckpointFileDiff> {
+        nope!("workspace_checkpoint_diff")
+    }
+    async fn checkpoint_capture(
+        &self,
+        _req: WorkspaceCheckpointCaptureReq,
+    ) -> ApiResult<WorkspaceCheckpoint> {
+        nope!("workspace_checkpoint_capture")
+    }
+    async fn checkpoint_restore(
+        &self,
+        _req: WorkspaceCheckpointRestoreReq,
+    ) -> ApiResult<WorkspaceCheckpointRestore> {
+        nope!("workspace_checkpoint_restore")
     }
 }
 

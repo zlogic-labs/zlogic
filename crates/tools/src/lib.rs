@@ -81,7 +81,7 @@ pub use agent::{AgentMailboxGate, AgentOutcome, AgentRequest, AgentSpawner, Crea
 pub use archive::{ArchiveInfo, ArchiveProcess};
 pub use compute::Time;
 pub use display::{DiffStat, FileChange, MathLine, ToolDisplay};
-pub use exec::{Shell, ShellDialect, ShellPreference};
+pub use exec::{Shell, ShellBudgets, ShellDialect, ShellPreference};
 pub use file::{Edit, ReadFile, WriteFile};
 pub use net::{SearchKeySource, SearchProvider, WebFetch, WebSearch, WebSearchSettings};
 pub use registry::{Materialized, ToolRegistry, ToolSource};
@@ -92,8 +92,9 @@ pub use sensitive::{
     ResourceAuthorization, SensitiveEnvironment, SensitiveResource, authorize_sensitive_resource,
 };
 pub use session::{
-    AskUser, EnterWorktree, ExitAction, ExitWorktree, ExitedWorktree, LoadedSkill, MemoryHost,
-    MemoryUpdate, Skill, SkillHost, WorktreeChanges, WorktreeHost, WorktreeState,
+    AskUser, CheckpointHost, CheckpointOutcome, CheckpointReceipt, CheckpointRequest,
+    CheckpointTrigger, EnterWorktree, ExitAction, ExitWorktree, ExitedWorktree, LoadedSkill,
+    MemoryHost, MemoryUpdate, Skill, SkillHost, WorktreeChanges, WorktreeHost, WorktreeState,
 };
 pub use task::{ProcessRequest, SpawnedProcess, TaskGet, TaskHost, TaskReport, TaskStop};
 // Interaction lives in `protocol`, not here: core raises permission requests from the

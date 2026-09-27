@@ -11,6 +11,7 @@
 //! here rather than with the file tools, which all take a path and touch nothing but it.
 
 pub mod ask_user;
+pub mod checkpoint;
 pub mod memory;
 pub mod skill;
 pub mod worktree;
@@ -18,6 +19,9 @@ pub mod worktree;
 use std::sync::Arc;
 
 pub use ask_user::AskUser;
+pub use checkpoint::{
+    CheckpointHost, CheckpointOutcome, CheckpointReceipt, CheckpointRequest, CheckpointTrigger,
+};
 pub use memory::{MemoryHost, MemoryUpdate};
 pub use skill::{LoadedSkill, Skill, SkillHost};
 pub use worktree::{

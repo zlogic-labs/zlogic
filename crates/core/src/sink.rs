@@ -412,12 +412,10 @@ pub(crate) fn display_to_wire(d: &zlogic_tools::ToolDisplay) -> ToolDisplay {
         },
         T::Widget {
             object_id,
-            title,
             height,
             libraries,
         } => ToolDisplay::Widget {
             object: object_id.to_string(),
-            title: title.clone(),
             height: *height,
             libraries: libraries.clone(),
         },

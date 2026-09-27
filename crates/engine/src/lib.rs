@@ -35,6 +35,7 @@ pub mod agent_profile;
 pub mod auxiliary;
 pub mod bootstrap;
 pub mod budget;
+pub mod checkpoints;
 pub mod config;
 pub mod credentials;
 pub mod dispatch;
@@ -50,9 +51,11 @@ pub mod not_wired;
 pub mod policy;
 pub mod prompt;
 pub mod provider_auth;
+pub mod retention;
 pub mod router;
 pub mod service;
 pub mod sessions;
+pub mod shell_budgets;
 pub mod skills;
 pub mod store_call;
 pub mod task;
@@ -80,8 +83,8 @@ use crate::hub::EventHub;
 use crate::service::{
     AgentProfileService, AuxiliaryService, ConfigService, CredentialService, ExtensionService,
     ManagedResourceService, MemoryService, ObjectService, SessionService, TaskService,
-    ToolCatalogService, TranslationService, TurnService, WorkspaceFilesService,
-    WorkspaceGitService, WorkspaceService,
+    ToolCatalogService, TranslationService, TurnService, WorkspaceCheckpointsService,
+    WorkspaceFilesService, WorkspaceGitService, WorkspaceService,
 };
 
 pub use agent_profile::{BUILTIN_AGENTS, builtin_system_prompt};
@@ -271,6 +274,7 @@ pub struct Engine {
     pub workspaces: Arc<dyn WorkspaceService>,
     pub files: Arc<dyn WorkspaceFilesService>,
     pub git: Arc<dyn WorkspaceGitService>,
+    pub checkpoints: Arc<dyn WorkspaceCheckpointsService>,
     pub turns: Arc<dyn TurnService>,
     pub objects: Arc<dyn ObjectService>,
     pub config: Arc<dyn ConfigService>,
@@ -293,6 +297,7 @@ impl Engine {
             workspaces: Arc::new(not_wired::NotWired),
             files: Arc::new(not_wired::NotWired),
             git: Arc::new(not_wired::NotWired),
+            checkpoints: Arc::new(not_wired::NotWired),
             turns: Arc::new(not_wired::NotWired),
             objects: Arc::new(not_wired::NotWired),
             config: Arc::new(not_wired::NotWired),
@@ -342,6 +347,11 @@ impl Engine {
 
     pub fn with_workspace_git(mut self, git: Arc<dyn WorkspaceGitService>) -> Self {
         self.git = git;
+        self
+    }
+
+    pub fn with_checkpoints(mut self, checkpoints: Arc<dyn WorkspaceCheckpointsService>) -> Self {
+        self.checkpoints = checkpoints;
         self
     }
 

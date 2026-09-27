@@ -333,11 +333,11 @@ mod tests {
             widgets: (0..widgets)
                 .map(|i| TurnWidget {
                     object_id: format!("sha256:{i}"),
-                    title: format!("Chart {i}"),
                     height: 300,
                     libraries: vec!["chart".into()],
                 })
                 .collect(),
+            wakes: Vec::new(),
         }
     }
 

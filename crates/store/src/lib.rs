@@ -83,6 +83,55 @@ pub fn now() -> DateTime<Utc> {
     Utc::now()
 }
 
+/// How hard [`Db::checkpoint`] tries. Each step costs more than the last, and only the last two
+/// shrink the WAL file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalCheckpoint {
+    /// Copy what it can without waiting for anybody. Never blocks a reader or a writer, and never
+    /// truncates — so a busy desktop keeps the file at whatever size it reached.
+    Passive,
+    /// Copy everything up to the oldest live reader, then let new readers start. The usual choice
+    /// for a background sweep: it never waits, and the file still shrinks on the next one.
+    Restart,
+    /// Copy everything, wait for every reader, then truncate the file to zero. The only mode that
+    /// returns the disk space, and the only one that can block. `busy` comes back set when a
+    /// reader was in the way, and nothing was changed.
+    Truncate,
+}
+
+impl WalCheckpoint {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Passive => "PASSIVE",
+            Self::Restart => "RESTART",
+            Self::Truncate => "TRUNCATE",
+        }
+    }
+}
+
+/// What a `PRAGMA wal_checkpoint` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalCheckpointReport {
+    /// Another connection was reading or writing, so nothing was checkpointed.
+    pub busy: bool,
+    /// Frames in the WAL when the call started.
+    pub log_frames: u64,
+    /// How many of them were copied back into the database file.
+    pub checkpointed_frames: u64,
+}
+
+/// The ceiling [`Db::configure_connection`] puts on the WAL file. Past it, a checkpoint truncates
+/// rather than merely resetting.
+const WAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
+/// SQLite's own naming: the write-ahead log is the database path plus `-wal`. Only used to report a
+/// size — nothing here depends on the file existing.
+fn wal_path(db: &Path) -> PathBuf {
+    let mut name = db.file_name().unwrap_or_default().to_os_string();
+    name.push("-wal");
+    db.with_file_name(name)
+}
+
 /// Starts a transaction, or joins the caller's if one is already open.
 /// SQLite has no nested transactions, and these stores compose: `MailboxStore::deliver` wraps
 /// `EntryStore::append` so that delivery is one atomic move. Each of them wants atomicity on its
@@ -516,7 +565,40 @@ impl Db {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "synchronous", "normal")?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        // Without a ceiling the WAL file keeps the high-water mark it reached: a long-lived reader
+        // blocks the reset, writes keep appending, and the file stays at its largest size forever
+        // even after every frame has been copied back. 64 MiB is far above the autocheckpoint
+        // threshold and far below the 107 MB a busy desktop had accumulated.
+        conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
         Ok(())
+    }
+
+    /// Checkpoints the write-ahead log, reporting what it managed to move.
+    ///
+    /// `TRUNCATE` is the only mode that shrinks the file, and the only one that waits for readers:
+    /// it comes back `busy` without touching anything if another connection is mid-read. That is
+    /// the normal answer while a turn is streaming, which is why the startup maintenance runs this
+    /// on a delay rather than inline.
+    pub fn checkpoint(&self, mode: WalCheckpoint) -> Result<WalCheckpointReport> {
+        let (busy, log, moved): (i64, i64, i64) = self.conn.query_row(
+            &format!("PRAGMA wal_checkpoint({})", mode.as_str()),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(WalCheckpointReport {
+            busy: busy != 0,
+            log_frames: log.max(0) as u64,
+            checkpointed_frames: moved.max(0) as u64,
+        })
+    }
+
+    /// The WAL file's current size in bytes, or 0 when there is no WAL.
+    pub fn wal_size(&self) -> Result<u64> {
+        let Some(path) = self.path.as_ref() else {
+            return Ok(0);
+        };
+        let wal = wal_path(path);
+        Ok(std::fs::metadata(wal).map(|m| m.len()).unwrap_or(0))
     }
 
     fn ensure_wal(&self) -> Result<()> {

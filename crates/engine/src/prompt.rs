@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use zlogic_config::{AppConfig, Dirs};
 use zlogic_objects::RepoFacts;
-use zlogic_protocol::{MemoryRecord, WorkspaceId};
+use zlogic_protocol::{MemoryRecord, SessionId, WorkspaceId};
 use zlogic_tools::{ShellDialect, ToolPrompt};
 
 use crate::skills::{self, SkillDef};
@@ -22,11 +22,17 @@ pub struct SystemPrompts {
     config: Arc<AppConfig>,
     shell: Option<ShellDialect>,
     renders_math: bool,
+    /// What the host says about this session, asked afresh every turn. See
+    /// [`SessionEnvironmentService`](crate::service::SessionEnvironmentService).
+    session_environment: Option<Arc<dyn crate::service::SessionEnvironmentService>>,
 }
 
 pub struct PromptRequest<'a> {
     /// Stable workspace identity, used for personal extension overrides.
     pub workspace_id: WorkspaceId,
+    /// The turn's session, which decides where the model is told to put its temporary files.
+    /// `None` only where there is no session yet — the system prompt itself, and the tests.
+    pub session_id: Option<SessionId>,
     pub root: &'a Path,
     pub exec_cwd: &'a Path,
     pub tools: &'a [String],
@@ -50,7 +56,16 @@ impl SystemPrompts {
             config,
             shell,
             renders_math: false,
+            session_environment: None,
         }
+    }
+
+    pub fn with_session_environment(
+        mut self,
+        service: Option<Arc<dyn crate::service::SessionEnvironmentService>>,
+    ) -> Self {
+        self.session_environment = service;
+        self
     }
 
     pub fn with_math_rendering(mut self, on: bool) -> Self {
@@ -121,9 +136,10 @@ impl SystemPrompts {
             lines.push(format!("workspace: {}", req.root.display()));
 
             lines.push(format!(
-                "cache: {} — write the temporary files you generate here (scripts, dumps); \
-                 keep them out of the repo tree, and create the directory if it does not exist",
-                req.root.join(".zlogic").join("cache").display()
+                "cache: {} — write the temporary files you generate for this session here \
+                 (scripts, dumps); keep them out of the repo tree, and create the directory if \
+                 it does not exist",
+                crate::retention::session_cache_dir(req.root, req.session_id).display()
             ));
 
             if req.exec_cwd != req.root {
@@ -137,7 +153,10 @@ impl SystemPrompts {
 
             let facts = RepoFacts::discover(req.exec_cwd);
             match (&facts.is_repo, &facts.branch, &facts.head) {
-                (true, Some(branch), _) => lines.push(format!("git: on branch {branch}")),
+                (true, Some(branch), Some(_)) => lines.push(format!("git: on branch {branch}")),
+                (true, Some(branch), None) => {
+                    lines.push(format!("git: on branch {branch}, which has no commits yet"))
+                }
                 (true, None, Some(sha)) => {
                     lines.push(format!("git: detached at {}", &sha[..sha.len().min(12)]))
                 }
@@ -153,6 +172,21 @@ impl SystemPrompts {
                 "mcp: configured but not available this turn — {}",
                 req.unavailable_mcp.join("; ")
             ));
+        }
+
+        // Asked last so a host's own line reads as the most specific fact on the block. A failure
+        // costs the line, never the turn: the model falls back to having no device rather than to
+        // an error in its system prompt.
+        if let (Some(service), Some(session_id)) = (&self.session_environment, req.session_id) {
+            match service.environment(session_id) {
+                Some(text) if !text.trim().is_empty() => lines.push(text),
+                Some(_) => {}
+                None => tracing::debug!(
+                    target: "zlogic::engine",
+                    %session_id,
+                    "the host has nothing to add to this turn's environment"
+                ),
+            }
         }
 
         if self.config.session.approval_mode == zlogic_protocol::settings::ApprovalMode::Bypass
@@ -415,10 +449,12 @@ fn capabilities(
     }
     if tools.has("shell") {
         push_line!(
-            "- `shell` waits for the command it runs. When you can not continue without the \
-             result — a test suite, a type check, a build that takes minutes — pass `wait: true` \
-             and no `timeout_ms`: it then runs to completion, however long that takes. \
-             `background: true` is for the other case: work you are deliberately not waiting for.",
+            "- `shell` waits for the command it runs, and the time it is allowed to take comes from \
+             the command itself — a test run is not cut off at the same budget as `git status`. \
+             You do not set a timeout. When you cannot continue without the result and the \
+             command's own budget might not be enough — a long suite, a cold build — pass \
+             `wait: true`. `background: true` is for the other case: work you are deliberately \
+             not waiting for.",
         );
     }
     if tools.has("task_message") {
@@ -552,7 +588,8 @@ fn skills_section(found: &[SkillDef]) -> Option<String> {
         "Skills available here. A skill is a written procedure for one kind of task. When the task \
          at hand matches one, load it with the `skill` tool (by name, with arguments if it \
          takes any) and follow it — it is more specific than anything you would work out yourself. \
-         Do not load them speculatively.\n{}",
+         A description that names when to reach for it is binding, not advisory; load nothing else \
+         speculatively.\n{}",
         list.join("\n")
     ))
 }
@@ -626,6 +663,7 @@ mod tests {
         let tools: Vec<String> = tools.iter().map(|t| t.to_string()).collect();
         p.build(PromptRequest {
             workspace_id: WorkspaceId::new(),
+            session_id: None,
             root,
             exec_cwd,
             tools: &tools,
@@ -708,7 +746,7 @@ mod tests {
     #[test]
     fn every_tool_name_this_module_mentions_is_a_real_tool() {
         const SOURCE: &str = include_str!("prompt.rs");
-        let (registry, _, _) = crate::bootstrap::tool_registry(&AppConfig::default(), None);
+        let registry = crate::bootstrap::tool_registry(&AppConfig::default(), None).tools;
         let registered = registry.names();
 
         let mut mentioned: Vec<String> = Vec::new();
@@ -807,6 +845,7 @@ mod tests {
         let tools = tool_names(&["memory_update"]);
         let parts = prompts(tmp.path()).build(PromptRequest {
             workspace_id: WorkspaceId::new(),
+            session_id: None,
             root: tmp.path(),
             exec_cwd: tmp.path(),
             tools: &tools,
@@ -845,6 +884,7 @@ mod tests {
         };
         let parts = prompts(tmp.path()).build(PromptRequest {
             workspace_id: WorkspaceId::new(),
+            session_id: None,
             root: tmp.path(),
             exec_cwd: tmp.path(),
             tools: &[],
@@ -897,6 +937,7 @@ mod tests {
         };
         let parts = prompts(tmp.path()).build(PromptRequest {
             workspace_id: WorkspaceId::new(),
+            session_id: None,
             root: tmp.path(),
             exec_cwd: tmp.path(),
             tools: &[],
@@ -992,6 +1033,42 @@ mod tests {
             !parts[0].contains(".zlogic/cache"),
             "a path in the stable block would invalidate the cache: {}",
             parts[0]
+        );
+    }
+
+    #[test]
+    fn each_session_is_announced_its_own_cache_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let tools = vec!["read_file".to_string()];
+
+        let env_of = |session_id| {
+            prompts(tmp.path()).build(PromptRequest {
+                workspace_id: WorkspaceId::new(),
+                session_id: Some(session_id),
+                root: &root,
+                exec_cwd: &root,
+                tools: &tools,
+                tool_guidance: &[],
+                unavailable_mcp: &[],
+                allows_mcp: true,
+                effectful: false,
+                global_memory: &[],
+                workspace_memory: &[],
+            })[1]
+                .clone()
+        };
+
+        let one = zlogic_protocol::SessionId::new();
+        let two = zlogic_protocol::SessionId::new();
+        let a = env_of(one);
+        let b = env_of(two);
+        let cache = root.join(".zlogic").join("cache");
+        assert!(a.contains(&cache.to_string_lossy().to_string()), "{a}");
+        assert_ne!(
+            a, b,
+            "two sessions must not be pointed at the same scratch directory"
         );
     }
 
@@ -1159,6 +1236,7 @@ mod tests {
         let env = prompts(tmp.path())
             .build(PromptRequest {
                 workspace_id: WorkspaceId::new(),
+                session_id: None,
                 root: tmp.path(),
                 exec_cwd: tmp.path(),
                 tools: &[],
@@ -1184,6 +1262,7 @@ mod tests {
         let unavailable = vec!["github (still starting)".to_string()];
         let parts = prompts(tmp.path()).build(PromptRequest {
             workspace_id: WorkspaceId::new(),
+            session_id: None,
             root: tmp.path(),
             exec_cwd: tmp.path(),
             tools: &[],
@@ -1281,10 +1360,14 @@ mod tests {
     }
 
     #[test]
-    fn no_skills_means_no_section() {
+    fn the_built_in_guide_is_listed_without_anything_installed() {
         let tmp = tempfile::tempdir().unwrap();
         let stable = build(&prompts(tmp.path()), tmp.path(), tmp.path(), &["skill"]).remove(0);
-        assert!(!stable.contains("Skills available"), "{stable}");
+        assert!(stable.contains("zlogic-guide"), "{stable}");
+        assert!(
+            stable.contains("<builtin>/skills/zlogic-guide/SKILL.md"),
+            "the index says where it came from, and a built-in has no file to edit: {stable}"
+        );
     }
 
     #[test]
@@ -1309,6 +1392,7 @@ mod tests {
             .collect::<Vec<_>>();
         let parts = prompts(tmp.path()).build(PromptRequest {
             workspace_id: WorkspaceId::new(),
+            session_id: None,
             root: tmp.path(),
             exec_cwd: tmp.path(),
             tools: &tools,

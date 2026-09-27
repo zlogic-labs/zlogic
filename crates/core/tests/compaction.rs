@@ -681,8 +681,9 @@ async fn a_second_overflow_is_not_retried_again() {
     assert!(h.saw("error"));
 }
 
-/// A tail that itself exceeds the window is reported once at threshold time, before any
-/// with a Completed status while the request never shrank.
+/// A tail that itself exceeds the window is reported once at threshold time, before any main
+/// request is issued, and leaves the history exactly as it found it — a compaction that cannot
+/// make the request fit must not fold a turn on its way out.
 #[tokio::test]
 async fn threshold_compaction_that_cannot_fit_fails_the_turn_immediately() {
     let h = Harness::new().context(ContextPolicy {
@@ -691,8 +692,7 @@ async fn threshold_compaction_that_cannot_fit_fails_the_turn_immediately() {
         overflow_retries: 1,
     });
     light_history(&h, 3).await;
-    // Near-window signal: threshold (50k) fires, but even removing the light prefix cannot
-    // bring the estimate below the 100k window — the protected tail is the whole problem.
+    // The trigger is the last reported input, so one heavy round is what arms it (50k threshold).
     h.store
         .with(|db| {
             db.usage().record(zlogic_store::NewUsage::new(
@@ -707,12 +707,22 @@ async fn threshold_compaction_that_cannot_fit_fails_the_turn_immediately() {
         })
         .unwrap();
 
+    // The protected tail — the turn being run — is itself bigger than the 100k window, so no
+    // summary can bring the next request inside it. The size is the message the model is sent,
+    // not a usage row claiming it: the post-condition is measured on what compaction leaves.
+    let oversized = "x".repeat(500_000);
+
     // Only the summarisation call is consumed — the turn must fail at the post-condition,
     // never issuing the main request at all.
     let client = Scripted::new(vec![MockScript::text("a summary")]);
     let out = h
         .core()
-        .run(TurnId::new(), h.plan(client.clone()), user("go"), h.token())
+        .run(
+            TurnId::new(),
+            h.plan(client.clone()),
+            user(&oversized),
+            h.token(),
+        )
         .await
         .unwrap();
 
@@ -722,7 +732,10 @@ async fn threshold_compaction_that_cannot_fit_fails_the_turn_immediately() {
         1,
         "no main request after the hard error"
     );
-    assert_eq!(summaries(&h).len(), 1);
+    assert!(
+        summaries(&h).is_empty(),
+        "a compaction that failed its post-condition must not be written"
+    );
     let error = h
         .sink
         .payloads()

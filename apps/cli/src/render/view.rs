@@ -3581,9 +3581,9 @@ mod tests {
     use crate::app::SuggestState;
     use crate::glyph::IconTier;
     use crate::session::dto::{CommandKind, CommandSpec};
-    use crate::theme::{ColorTier, ThemeState, themes};
-    use ratatui::Terminal;
+    use crate::theme::{themes, ColorTier, ThemeState};
     use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     fn state() -> AppState {
         AppState::new(

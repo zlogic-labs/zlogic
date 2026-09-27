@@ -768,7 +768,7 @@ fn trim_transcript(mut entries: Vec<Value>) -> Value {
 /// commands; it does not need file bodies, patches, credentials or arbitrary payloads.
 fn classifier_args(tool: &str, args: &Value) -> Value {
     let fields: &[&str] = match tool {
-        "shell" => &["command", "path", "timeout_ms", "background"],
+        "shell" => &["command", "path", "wait", "background"],
         "write_file" => &["path", "append"],
         "edit" => &["path", "allow_multiple"],
         "list_dir" | "glob" | "grep" => &["path", "pattern"],

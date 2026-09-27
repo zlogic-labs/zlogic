@@ -32,6 +32,10 @@ pub struct Config {
     transport: Option<Arc<dyn zlogic_llm::transport::HttpTransport>>,
     store: SharedStore,
     workspaces: Arc<dyn WorkspaceService>,
+    /// The snapshot store keeps its own copy of the checkpoint policy. Pushing it here — same as
+    /// the bypass flag and the network settings — is what makes the panel's switch take effect
+    /// without asking the user to restart the app.
+    checkpoints: Option<Arc<zlogic_checkpoints::Checkpoints>>,
     /// Reports are asked for far more often than the usage rows change; see
     /// [`crate::usage_cache`].
     usage_reports: crate::usage_cache::ReportCache,
@@ -54,8 +58,14 @@ impl Config {
             transport: None,
             store,
             workspaces,
+            checkpoints: None,
             usage_reports: crate::usage_cache::ReportCache::new(),
         }
+    }
+
+    pub fn with_checkpoints(mut self, store: Arc<zlogic_checkpoints::Checkpoints>) -> Self {
+        self.checkpoints = Some(store);
+        self
     }
 
     pub fn with_bypass_flag(mut self, cell: BypassFlag) -> Self {
@@ -83,6 +93,17 @@ impl Config {
         if let Some(transport) = &self.transport {
             transport.apply_network(&cfg.network);
         }
+        if let Some(store) = &self.checkpoints {
+            let c = &cfg.checkpoints;
+            store.set_config(zlogic_checkpoints::Config {
+                enabled: c.enabled,
+                retention_days: c.retention_days,
+                max_snapshots: c.max_snapshots as usize,
+                max_bytes: u64::from(c.max_size_gb) * 1024 * 1024 * 1024,
+                max_file_bytes: c.max_file_mb * 1024 * 1024,
+                max_files: c.max_files as usize,
+            });
+        }
     }
 
     pub async fn snapshot(&self) -> Arc<AppConfig> {
@@ -103,6 +124,8 @@ impl Config {
                 cost: cfg.cost.clone(),
                 limits: cfg.limits.clone(),
                 network: cfg.network.clone(),
+                retention: cfg.retention.clone(),
+                checkpoints: cfg.checkpoints.clone(),
                 auto_detect_env: cfg.auto_detect_env,
                 keychain: cfg.keychain,
             },
@@ -219,6 +242,12 @@ impl Config {
         }
         if let Some(v) = &req.network {
             config_patch.insert("network".into(), value_or_default(v)?);
+        }
+        if let Some(v) = &req.retention {
+            config_patch.insert("retention".into(), value_or_default(v)?);
+        }
+        if let Some(v) = &req.checkpoints {
+            config_patch.insert("checkpoints".into(), value_or_default(v)?);
         }
         if let Some(roles) = &req.llm_roles {
             config_patch.insert("llm_roles".into(), value_or_default(roles)?);
@@ -768,27 +797,38 @@ impl Config {
             utc_offset_minutes: req.utc_offset_minutes,
         };
 
+        let include_tools = req.include_tools;
         let report = self
             .usage_reports
-            .get(crate::usage_cache::ReportKey::of(&query), || {
-                let store = self.store.clone();
-                let query = query.clone();
-                async move {
-                    crate::store_call::report_at(
-                        &store,
-                        "usage.summary",
-                        std::panic::Location::caller(),
-                        move |db| {
-                            let aggregate = db.usage().aggregate(&query)?;
-                            let tools = db.usage().aggregate_tools(&query)?;
-                            Ok::<_, zlogic_store::StoreError>((aggregate, tools))
-                        },
-                    )
-                    .await
-                    .map(|(aggregate, tools)| crate::usage_cache::UsageReport { aggregate, tools })
-                    .map_err(EngineError::from)
-                }
-            })
+            .get(
+                crate::usage_cache::ReportKey::of(&query, include_tools),
+                || {
+                    let store = self.store.clone();
+                    let query = query.clone();
+                    async move {
+                        crate::store_call::report_at(
+                            &store,
+                            "usage.summary",
+                            std::panic::Location::caller(),
+                            move |db| {
+                                let aggregate = db.usage().aggregate(&query)?;
+                                let tools = if include_tools {
+                                    Some(db.usage().aggregate_tools(&query)?)
+                                } else {
+                                    None
+                                };
+                                Ok::<_, zlogic_store::StoreError>((aggregate, tools))
+                            },
+                        )
+                        .await
+                        .map(|(aggregate, tools)| crate::usage_cache::UsageReport {
+                            aggregate,
+                            tools,
+                        })
+                        .map_err(EngineError::from)
+                    }
+                },
+            )
             .await?;
 
         Ok(crate::usage::summarise_aggregate(
@@ -1023,6 +1063,12 @@ fn apply_update(cfg: &mut AppConfig, req: &ConfigUpdateReq) {
     }
     if let Some(v) = &req.network {
         cfg.network = v.clone();
+    }
+    if let Some(v) = &req.retention {
+        cfg.retention = v.clone();
+    }
+    if let Some(v) = &req.checkpoints {
+        cfg.checkpoints = v.clone();
     }
     if let Some(v) = &req.auto_detect_env {
         cfg.auto_detect_env = *v;
@@ -1631,6 +1677,48 @@ providers:
     }
 
     #[tokio::test]
+    async fn toggling_checkpoints_reaches_the_live_store_without_a_restart() {
+        let rig = Rig::new(YAML, &[]);
+        let store = zlogic_checkpoints::Checkpoints::new(
+            std::env::temp_dir().join("zlogic-checkpoints-switch-test"),
+            zlogic_checkpoints::Config::default(),
+        );
+        assert!(
+            !store.enabled(),
+            "a fresh install must not be snapshotting before anyone agreed to it"
+        );
+        let config = rig.config.with_checkpoints(store.clone());
+
+        config
+            .update(ConfigUpdateReq {
+                checkpoints: Some(zlogic_config::CheckpointsConfig {
+                    enabled: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(store.enabled(), "turning it on must take effect at once");
+        assert!(config.get().await.unwrap().settings.checkpoints.enabled);
+
+        config
+            .update(ConfigUpdateReq {
+                checkpoints: Some(zlogic_config::CheckpointsConfig {
+                    enabled: false,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !store.enabled(),
+            "turning it off must take effect at once too"
+        );
+    }
+
+    #[tokio::test]
     async fn a_declared_provider_is_marked_as_the_users_own() {
         let rig = Rig::new(YAML, &[]);
         let view = rig.config.get().await.unwrap();
@@ -1675,6 +1763,7 @@ providers:
                 since: None,
                 until: None,
                 utc_offset_minutes: 0,
+                include_tools: false,
                 self_only: false,
             })
             .await
@@ -1733,6 +1822,7 @@ providers:
                 since: None,
                 until: None,
                 utc_offset_minutes: 0,
+                include_tools: false,
                 self_only: false,
             })
             .await
@@ -1760,6 +1850,7 @@ providers:
                 since: None,
                 until: None,
                 utc_offset_minutes: 0,
+                include_tools: false,
                 self_only: false,
             })
             .await
@@ -1809,6 +1900,7 @@ providers:
                 since: None,
                 until: None,
                 utc_offset_minutes: 0,
+                include_tools: false,
                 self_only: false,
             })
             .await
@@ -1848,6 +1940,7 @@ providers:
                 since: Some("2020-01-01T00:00:00Z".parse().unwrap()),
                 until: Some("2020-01-02T00:00:00Z".parse().unwrap()),
                 utc_offset_minutes: 0,
+                include_tools: false,
                 self_only: false,
             })
             .await
@@ -2373,6 +2466,7 @@ providers:
             since: None,
             until: None,
             utc_offset_minutes: offset,
+            include_tools: false,
         };
 
         record(100);

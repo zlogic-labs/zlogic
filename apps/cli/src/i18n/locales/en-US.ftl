@@ -371,17 +371,15 @@ error-submit-no-usable-model = This message was not sent: no usable model ({ $er
 error-submit-queued-no-model = No model is currently available, so this message is queued. Configure a model and an API key in settings ({ $error })
 error-submit-queued-turn-failed = This message was queued, but a reply could not be started yet: { $error }
 error-submit-rejected = Submission rejected: { $reason }
-notice-mcp-tools-pending = Still fetching the tool manifest for { $servers }; they are not included this round (they will be next round)
 notice-mcp-server-no-tools = MCP server `{ $server }` connected but did not provide any tools
-notice-mcp-tools-expensive = MCP tool definitions total { $how_much }, and you pay that cost **every round**. The biggest consumers: { $biggest }. To tighten: restrict which tools ship in the definition (`tools`: ["only these"]), or turn off servers you do not need right now with `/mcp off <id>`.
+notice-mcp-tools-expensive = MCP tool definitions total { $how_much }, and you pay that cost **every round**. The biggest consumers: { $biggest }. To tighten: restrict which tools ship in the definition (`tools`: ["only these"]), or turn off the servers you do not need in this workspace's MCP list.
 notice-llm-interrupted-retry = The reply was interrupted mid-generation and is being continued automatically (retried { $n } times so far). What you already saw stays; the model picks up from where it stopped.
 notice-agent-model-unavailable = Sub-agent `{ $name }` could not resolve a model ({ $error }); it will not run in this turn
 notice-session-title-failed = The session title could not be refined: { $error }
 notice-turn-start-failed = A queued message could not start a reply: { $error }. Configure a model and an API key, then try again.
 notice-mcp-server-untrusted =
-    { $count } MCP servers from this project will not start until you confirm them:
+    { $count } MCP servers from this project will not start until you allow them in this workspace:
     { $lines }
-    Confirm one with `/mcp trust <id>`; list all with `/mcp`.
 notice-tasks-still-running = Background tasks started by this turn are still running; you will be notified when they finish:
     { $tasks }
 

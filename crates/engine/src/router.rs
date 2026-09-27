@@ -280,7 +280,8 @@ fn builtin_chain(role: &Purpose) -> &'static [&'static str] {
     match role {
         Purpose::Main | Purpose::Agent(_) => &[SESSION],
         Purpose::Title | Purpose::Approval | Purpose::Utility => &[SESSION, "light"],
-        Purpose::Compaction | Purpose::ApprovalDeep => &["main", SESSION],
+        Purpose::Compaction => &[SESSION],
+        Purpose::ApprovalDeep => &[SESSION, "main"],
     }
 }
 

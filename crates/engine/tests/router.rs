@@ -163,16 +163,27 @@ fn short_output_roles_fall_back_when_session_is_unavailable() {
 }
 
 #[test]
-fn judgement_roles_prefer_the_main_tier() {
+fn compaction_runs_on_the_session_model() {
     let r = router(TIERED, KEYS);
-    for role in [Purpose::Compaction, Purpose::ApprovalDeep] {
-        let routed = r.resolve(&role, Some("cheap:small")).unwrap();
-        assert_eq!(
-            routed.model_ref(),
-            "big:opus",
-            "{role} must not be economised on"
-        );
-    }
+    let routed = r.resolve(&Purpose::Compaction, Some("cheap:small")).unwrap();
+    assert_eq!(
+        routed.model_ref(),
+        "cheap:small",
+        "the summary is written by the conversation's own model"
+    );
+    assert_eq!(routed.via, "session");
+}
+
+#[test]
+fn deep_approval_prefers_the_session_model() {
+    let r = router(TIERED, KEYS);
+    let routed = r.resolve(&Purpose::ApprovalDeep, Some("cheap:small")).unwrap();
+    assert_eq!(
+        routed.model_ref(),
+        "cheap:small",
+        "deep approval starts from the conversation's own model, like every other role"
+    );
+    assert_eq!(routed.via, "session");
 }
 
 #[test]

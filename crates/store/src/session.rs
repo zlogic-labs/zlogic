@@ -405,6 +405,31 @@ impl<'a> SessionStore<'a> {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Top-level chat sessions across every workspace whose last activity is before `cutoff`.
+    ///
+    /// "Last activity" is the newest of the two clocks rather than `updated_at` alone: that
+    /// column moves for a rename or an effort change, so a session nobody has talked to in a
+    /// month can still look recent because a settings panel touched it. A session that never
+    /// finished a turn falls back to when it was created.
+    ///
+    /// Only root **chat** sessions. Sub-agents are reached by deleting their root, and a task
+    /// session belongs to the scheduler — a job's completion target points at one as a plain
+    /// column, so sweeping it away would leave that reference dangling. Locked sessions are
+    /// excluded here rather than at the call site: a live turn's rows must never be a candidate,
+    /// and this is the only query that can say so in one pass.
+    pub fn idle_chat_roots_before(&self, cutoff: DateTime<Utc>) -> Result<Vec<SessionRecord>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM session
+             WHERE kind = 'chat'
+               AND parent_session_id IS NULL
+               AND MAX(updated_at, COALESCE(last_message_at, created_at)) < :cutoff
+               AND session_id NOT IN (SELECT session_id FROM session_locks)
+             ORDER BY updated_at"
+        ))?;
+        let rows = st.query_map(named_params! { ":cutoff": cutoff }, map_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Records a deviation from the workspace root — entering a worktree.
     pub fn set_exec_cwd(&self, session_id: SessionId, exec_cwd: &str) -> Result<()> {
         self.update_one(

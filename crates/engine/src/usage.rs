@@ -365,21 +365,21 @@ pub fn summarise(rows: &[UsageRow], tools: &[ToolObservation], cost: &CostConfig
         by_aux_purpose: ranked(by_aux_purpose, cost),
         by_cost_source: ranked(by_cost_source, cost),
         latest_turn: None,
-        by_tool: tool_groups(tools),
+        by_tool: Some(tool_groups(tools)),
     }
 }
 
 pub fn summarise_aggregate(
     aggregate: UsageAggregate,
-    tools: Vec<ToolUsageAggregate>,
+    tools: Option<Vec<ToolUsageAggregate>>,
     cost: &CostConfig,
 ) -> UsageSummary {
     let total = merge_parts(aggregate.total, cost)
         .into_iter()
         .next()
         .unwrap_or_else(|| empty_group(String::new()));
-    let total_tool_calls = tools.iter().map(|tool| tool.stats.total).sum();
-    let total_tool_duration_ms = tools.iter().map(|tool| tool.duration_ms).sum();
+    let total_tool_calls = tools.iter().flatten().map(|tool| tool.stats.total).sum();
+    let total_tool_duration_ms = tools.iter().flatten().map(|tool| tool.duration_ms).sum();
     let estimated_calls = total.estimated_calls;
     let aux_cost = total_cost(&aggregate.by_aux_purpose, cost);
     let latest_turn = merge_parts(aggregate.latest_turn, cost).into_iter().next();
@@ -429,14 +429,16 @@ pub fn summarise_aggregate(
         by_aux_purpose: ranked_groups(merge_parts(aggregate.by_aux_purpose, cost)),
         by_cost_source: key_groups(merge_parts(aggregate.by_cost_source, cost)),
         latest_turn,
-        by_tool: tools
-            .into_iter()
-            .map(|tool| ToolUsageGroup {
-                name: tool.name,
-                stats: tool.stats,
-                duration_ms: tool.duration_ms,
-            })
-            .collect(),
+        by_tool: tools.map(|tools| {
+            tools
+                .into_iter()
+                .map(|tool| ToolUsageGroup {
+                    name: tool.name,
+                    stats: tool.stats,
+                    duration_ms: tool.duration_ms,
+                })
+                .collect()
+        }),
     }
 }
 
@@ -1118,7 +1120,9 @@ mod tests {
                 duration_ms: 10,
             },
         ];
-        let groups = summarise(&[], &tools, &CostConfig::default()).by_tool;
+        let groups = summarise(&[], &tools, &CostConfig::default())
+            .by_tool
+            .unwrap();
 
         assert_eq!(groups[0].name, "shell");
         assert_eq!(groups[0].duration_ms, 500);
@@ -1146,7 +1150,10 @@ mod tests {
                 duration_ms: 0,
             },
         ];
-        let stats = &summarise(&[], &tools, &CostConfig::default()).by_tool[0].stats;
+        let stats = &summarise(&[], &tools, &CostConfig::default())
+            .by_tool
+            .unwrap()[0]
+            .stats;
         assert_eq!(stats.denied, 1);
         assert_eq!(stats.failed, 1);
         assert_eq!(stats.cancelled, 1);
@@ -1158,7 +1165,7 @@ mod tests {
         assert_eq!(s.calls, 0);
         assert_eq!(s.tokens, TokenUsage::default());
         assert_eq!(s.cost, None);
-        assert!(s.by_model.is_empty() && s.by_day.is_empty() && s.by_tool.is_empty());
+        assert!(s.by_model.is_empty() && s.by_day.is_empty() && s.by_tool.unwrap().is_empty());
     }
 
     fn timed_row(
@@ -1265,7 +1272,7 @@ mod tests {
             ],
             ..UsageAggregate::default()
         };
-        let s = summarise_aggregate(aggregate, Vec::new(), &CostConfig::default());
+        let s = summarise_aggregate(aggregate, None, &CostConfig::default());
 
         assert_eq!(s.avg_first_token_ms, Some(850 / 3));
         assert_eq!(s.avg_response_ms, Some(8_000 / 3));
@@ -1292,11 +1299,7 @@ mod tests {
 
     #[test]
     fn no_timing_data_means_none_not_zero() {
-        let s = summarise_aggregate(
-            UsageAggregate::default(),
-            Vec::new(),
-            &CostConfig::default(),
-        );
+        let s = summarise_aggregate(UsageAggregate::default(), None, &CostConfig::default());
         assert_eq!(s.avg_first_token_ms, None);
         assert_eq!(s.avg_response_ms, None);
         assert_eq!(s.avg_turn_ms, None);
