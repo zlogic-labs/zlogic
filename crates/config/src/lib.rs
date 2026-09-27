@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod dirs;
 pub mod prices;
 pub mod provider;
+pub mod provider_models;
 pub mod write;
 
 pub use zlogic_protocol::{roles, settings};
@@ -15,17 +16,21 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use zlogic_credential::{CredentialRef, credential_candidates};
-use zlogic_protocol::config::{ResolvedModel, Tier};
+use zlogic_credential::CredentialRef;
+use zlogic_protocol::config::{ProviderAuth, ResolvedModel, Tier};
 
 pub use catalog::CatalogFile;
 pub use dirs::Dirs;
 pub use prices::PriceFile;
-pub use provider::{ModelSettings, ProviderSettings, detect_providers, resolve_model};
+pub use provider::{
+    ModelSettings, ProviderSettings, credential_refs_for, detect_providers, resolve_model,
+};
+pub use provider_models::ProviderModelsFile;
 pub use roles::{RoleSettings, RoleThinking, SESSION};
 pub use settings::{
-    ApprovalMode, AutoTitle, ContextConfig, CostConfig, ExchangeRate, LimitsConfig, LogConfig,
-    NetworkSettings, SessionConfig, ShellPreference, ToolsConfig, WebSearchConfig, WorktreeConfig,
+    ApprovalMode, AutoTitle, CheckpointsConfig, ContextConfig, CostConfig, ExchangeRate,
+    LimitsConfig, LogConfig, NetworkSettings, RetentionConfig, SessionConfig, ShellPreference,
+    ToolsConfig, WebSearchConfig, WorktreeConfig,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +59,50 @@ pub enum ConfigError {
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
 
+/// The OS keychain is opt-in on macOS and opt-out everywhere else.
+///
+/// A macOS build without a stable signing identity gets a Keychain authorization dialog for every
+/// entry it touches, and nothing the user can click makes it stop — so on macOS the local secret
+/// store is the default and the keychain is a switch the user turns on themselves.
+pub const DEFAULT_KEYCHAIN_ENABLED: bool = !cfg!(target_os = "macos");
+
+/// The keychain switch on its own, without loading the rest of the configuration.
+///
+/// Credentials are read before the rest of the config is parsed: whether the OS store may be
+/// touched at all decides which backend the vault picks, and a process that has already asked the
+/// keychain for one entry has already shown the dialog it was trying to avoid. A file that cannot
+/// be read falls back to the platform default rather than failing startup — and so does a file
+/// carrying keys this build cannot use, which is the same case: the switch is one line in a file
+/// that may be newer than the process reading it.
+pub fn keychain_enabled(dirs: &Dirs) -> bool {
+    std::fs::read_to_string(dirs.config_file())
+        .ok()
+        .and_then(|body| parse_dropping_unusable_keys::<ConfigFile>(&body).ok())
+        .and_then(|(file, _, _)| file.keychain)
+        .unwrap_or(DEFAULT_KEYCHAIN_ENABLED)
+}
+
+/// Write the keychain switch alone, leaving every other line of the file where it is. Returns
+/// whether the file changed.
+///
+/// `None` removes the key, which restores the platform default: a macOS user who turns the
+/// keychain back on gets a file that says nothing rather than one that freezes today's default.
+pub fn write_keychain_enabled(dirs: &Dirs, on: Option<bool>) -> Result<bool> {
+    let current = ConfigFiles::read(dirs)?
+        .config
+        .and_then(|file| file.keychain);
+    if current == on {
+        return Ok(false);
+    }
+    let mut patch = write::YamlPatch::new();
+    patch.insert(
+        "keychain".into(),
+        on.map(|value| serde_yaml_ng::Value::Bool(value)),
+    );
+    write::patch_yaml_file(&dirs.config_file(), &patch)?;
+    Ok(true)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConfigFile {
@@ -61,11 +110,15 @@ pub struct ConfigFile {
     pub providers: BTreeMap<String, ProviderSettings>,
     #[serde(default)]
     pub llm_roles: BTreeMap<String, RoleSettings>,
+    /// Whether the OS credential store may be used. Absent means the platform default.
+    pub keychain: Option<bool>,
     pub session: Option<SessionConfig>,
     pub context: Option<ContextConfig>,
     pub tools: Option<ToolsConfig>,
     pub log: Option<LogConfig>,
     pub worktree: Option<WorktreeConfig>,
+    pub checkpoints: Option<CheckpointsConfig>,
+    pub retention: Option<RetentionConfig>,
     pub cost: Option<CostConfig>,
     pub limits: Option<LimitsConfig>,
     pub network: Option<NetworkSettings>,
@@ -82,6 +135,10 @@ pub struct ModelsFile {
 pub struct AppConfig {
     pub default_model: Option<String>,
     pub auto_detect_env: bool,
+    /// Whether the OS credential store may be used. Off — the default on macOS — every `keyring:`
+    /// entry is answered from the vault file instead, which is what keeps an unsigned build from
+    /// raising a Keychain dialog it cannot get out of.
+    pub keychain: bool,
     pub providers: BTreeMap<String, ProviderSettings>,
     pub llm_roles: BTreeMap<String, RoleSettings>,
     pub session: SessionConfig,
@@ -89,6 +146,8 @@ pub struct AppConfig {
     pub tools: ToolsConfig,
     pub log: LogConfig,
     pub worktree: WorktreeConfig,
+    pub checkpoints: CheckpointsConfig,
+    pub retention: RetentionConfig,
     pub cost: CostConfig,
     pub limits: LimitsConfig,
     pub network: NetworkSettings,
@@ -101,6 +160,7 @@ impl Default for AppConfig {
         Self {
             default_model: None,
             auto_detect_env: true,
+            keychain: DEFAULT_KEYCHAIN_ENABLED,
             providers: BTreeMap::new(),
             llm_roles: BTreeMap::new(),
             session: SessionConfig::default(),
@@ -108,6 +168,8 @@ impl Default for AppConfig {
             tools: ToolsConfig::default(),
             log: LogConfig::default(),
             worktree: WorktreeConfig::default(),
+            checkpoints: CheckpointsConfig::default(),
+            retention: RetentionConfig::default(),
             cost: CostConfig::default(),
             limits: LimitsConfig::default(),
             network: NetworkSettings::default(),
@@ -123,15 +185,23 @@ pub struct ConfigFiles {
     pub config: Option<ConfigFile>,
     pub prices: Option<PriceFile>,
     pub catalog: Option<CatalogFile>,
+    pub provider_models: Option<ProviderModelsFile>,
+    /// What the files carried that this build could not use, phrased for the user.
+    pub warnings: Vec<String>,
 }
 
 impl ConfigFiles {
     pub fn read(dirs: &Dirs) -> Result<Self> {
+        let mut warnings = Vec::new();
+        let models = read_optional::<ModelsFile>(&dirs.models_file(), &mut warnings)?;
+        let config = read_optional::<ConfigFile>(&dirs.config_file(), &mut warnings)?;
         Ok(Self {
-            models: read_optional::<ModelsFile>(&dirs.models_file())?,
-            config: read_optional::<ConfigFile>(&dirs.config_file())?,
+            models,
+            config,
             prices: PriceFile::read(dirs),
             catalog: CatalogFile::read(dirs),
+            provider_models: ProviderModelsFile::read(dirs),
+            warnings,
         })
     }
 }
@@ -180,10 +250,17 @@ impl AppConfig {
             .as_ref()
             .and_then(|m| m.auto_detect_env)
             .unwrap_or(true);
+        let keychain = files
+            .config
+            .as_ref()
+            .and_then(|c| c.keychain)
+            .unwrap_or(DEFAULT_KEYCHAIN_ENABLED);
 
         let mut cfg = AppConfig {
             revision: 1,
             auto_detect_env,
+            keychain,
+            warnings: files.warnings.clone(),
             ..Default::default()
         };
 
@@ -207,9 +284,30 @@ impl AppConfig {
         }
 
         cfg.materialise_builtin_providers(&probe, files.catalog.as_ref(), files.prices.as_ref());
+        cfg.apply_provider_models(files.provider_models.as_ref(), files.models.as_ref());
 
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Overlay the fetched model list of subscription providers on top of what they ship with.
+    fn apply_provider_models(
+        &mut self,
+        snapshot: Option<&ProviderModelsFile>,
+        declared: Option<&ModelsFile>,
+    ) {
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        let Some(provider) = self.providers.get_mut(&snapshot.provider_id) else {
+            return;
+        };
+        let declared: std::collections::BTreeSet<String> = declared
+            .and_then(|file| file.providers.get(&snapshot.provider_id))
+            .map(|p| p.models.keys().cloned().collect())
+            .unwrap_or_default();
+        snapshot.apply(provider, &declared);
+        self.revision += 1;
     }
 
     fn materialise_builtin_providers(
@@ -218,7 +316,7 @@ impl AppConfig {
         catalog: Option<&CatalogFile>,
         prices: Option<&PriceFile>,
     ) {
-        let builtin: CatalogFile = match serde_yaml_ng::from_str(CATALOG) {
+        let builtin: CatalogFile = match builtin_catalog_with_local() {
             Ok(c) => c,
             Err(e) => {
                 self.warnings.push(format!(
@@ -231,7 +329,8 @@ impl AppConfig {
         self.warnings.extend(effective.warnings);
 
         let auto = self.auto_detect_env;
-        let has_key = |id: &str| credential_candidates(id, auto).iter().any(probe);
+        let has_key =
+            |id: &str, auth: ProviderAuth| credential_refs_for(id, auth, auto).iter().any(probe);
 
         for (pid, cat) in effective.catalog.providers {
             match self.providers.get_mut(&pid) {
@@ -259,7 +358,7 @@ impl AppConfig {
                         }
                     }
                 }
-                None if has_key(&pid) => {
+                None if has_key(&pid, cat.auth) => {
                     self.providers.insert(pid, cat);
                 }
                 None => {}
@@ -267,14 +366,16 @@ impl AppConfig {
         }
 
         for (id, p) in self.providers.iter_mut() {
-            p.credential_ok = Some(credential_candidates(id, auto).iter().any(probe));
+            p.credential_ok = Some(credential_refs_for(id, p.auth, auto).iter().any(probe));
         }
     }
 
     pub fn from_file(path: &Path) -> Result<Self> {
-        let file = read_optional(path)?.unwrap_or_default();
+        let mut warnings = Vec::new();
+        let file = read_optional(path, &mut warnings)?.unwrap_or_default();
         let mut cfg = AppConfig {
             revision: 1,
+            warnings,
             ..Default::default()
         };
         cfg.apply(file);
@@ -290,6 +391,9 @@ impl AppConfig {
         for (role, incoming) in file.llm_roles {
             self.llm_roles.insert(role, incoming);
         }
+        if let Some(k) = file.keychain {
+            self.keychain = k;
+        }
         if let Some(s) = file.session {
             self.session = s;
         }
@@ -304,6 +408,12 @@ impl AppConfig {
         }
         if let Some(w) = file.worktree {
             self.worktree = w;
+        }
+        if let Some(c) = file.checkpoints {
+            self.checkpoints = c;
+        }
+        if let Some(r) = file.retention {
+            self.retention = r;
         }
         if let Some(c) = file.cost {
             self.cost = c;
@@ -339,9 +449,12 @@ impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         self.context.validate().map_err(ConfigError::Invalid)?;
         self.worktree.validate().map_err(ConfigError::Invalid)?;
+        self.checkpoints.validate().map_err(ConfigError::Invalid)?;
+        self.retention.validate().map_err(ConfigError::Invalid)?;
         self.cost.validate().map_err(ConfigError::Invalid)?;
         self.limits.validate().map_err(ConfigError::Invalid)?;
         self.network.validate().map_err(ConfigError::Invalid)?;
+        self.tools.shell.validate().map_err(ConfigError::Invalid)?;
         self.tools
             .web_search
             .validate()
@@ -498,10 +611,41 @@ fn usable(p: &ProviderSettings) -> bool {
 
 const CATALOG: &str = include_str!("../defaults/models.yaml");
 
+/// The ChatGPT subscription provider, which is not part of the generated catalog.
+pub const CODEX_PROVIDER_ID: &str = "codex";
+const CODEX_PROVIDER: &str = include_str!("../defaults/codex.yaml");
+
 pub fn builtin_catalog() -> Result<CatalogFile> {
     serde_yaml_ng::from_str(CATALOG).map_err(|e| {
         ConfigError::Invalid(format!("failed to parse the built-in model catalog: {e}"))
     })
+}
+
+/// The built-in catalog plus the hand-written provider definitions that are not part of it.
+pub fn builtin_catalog_with_local() -> Result<CatalogFile> {
+    let mut catalog = builtin_catalog()?;
+    if let Some(codex) = codex_provider() {
+        catalog
+            .providers
+            .entry(CODEX_PROVIDER_ID.to_string())
+            .or_insert(codex);
+    }
+    Ok(catalog)
+}
+
+/// The hand-written provider definition for the ChatGPT subscription backend. A file that fails
+/// to parse loses that one provider and is logged — the rest of the catalog still loads.
+pub fn codex_provider() -> Option<ProviderSettings> {
+    match serde_yaml_ng::from_str::<BTreeMap<String, ProviderSettings>>(CODEX_PROVIDER) {
+        Ok(mut providers) => providers.remove(CODEX_PROVIDER_ID),
+        Err(e) => {
+            tracing::warn!(
+                target: "zlogic::config",
+                "the built-in codex provider failed to parse and will be missing: {e}"
+            );
+            None
+        }
+    }
 }
 
 fn fill_model_gaps(mine: &mut ModelSettings, cat: ModelSettings) {
@@ -595,7 +739,11 @@ fn write_json_file(path: &Path, value: &impl Serialize) -> Result<()> {
     std::fs::rename(&tmp, path).map_err(io)
 }
 
-fn read_optional<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+/// Read one optional file and refuse anything that does not fit, whole file or not.
+///
+/// For the files where a bad line has nowhere to hide: a flat `KEY: value` map, where dropping the
+/// entry would leave a secret that simply does not exist and an error the user only meets as a 401.
+fn read_optional_strict<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     match std::fs::read_to_string(path) {
         Ok(text) => {
             let file = serde_yaml_ng::from_str(&text).map_err(|source| ConfigError::Parse {
@@ -612,9 +760,152 @@ fn read_optional<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T
     }
 }
 
+/// Read one optional config file, dropping what this build cannot use instead of failing on it.
+///
+/// These files outlive the binary reading them: a section a newer release added, a key this build
+/// has never heard of, a value written in a shape it does not accept. Refusing to start over a key
+/// that would have been ignored anyway turns a slightly stale build into a program that will not
+/// open, so an unusable key is **dropped and named in a warning** while the rest of the file still
+/// applies. Only a file that is unusable as a whole (malformed YAML, a document that is not a
+/// mapping) still fails, and it fails with the original error.
+///
+/// The rule stays narrow on purpose: a key is dropped only when removing it is what makes the file
+/// parse, so a section that is fine is never touched and a key this build *does* understand is
+/// never second-guessed. `policy.yaml` splits the same way — its document level is lenient, the
+/// rules inside it are not.
+fn read_optional<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    dropped: &mut Vec<String>,
+) -> Result<Option<T>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let (file, unusable, unknown_field) =
+                parse_dropping_unusable_keys(&text).map_err(|source| ConfigError::Parse {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            let reason = if unknown_field {
+                "this build does not know it"
+            } else {
+                "its value does not fit what this build expects"
+            };
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            dropped.extend(
+                unusable
+                    .into_iter()
+                    .map(|key| format!("{name}: ignored `{key}` — {reason}")),
+            );
+            Ok(Some(file))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Parse `T` out of `text`, dropping the mapping keys this build cannot use.
+///
+/// Returns the value, the keys that had to go, and whether the first failure was an unknown field
+/// — the caller's warning is phrased around that, since it is the common case (a section a newer
+/// build wrote) and says something different from a value that does not fit.
+fn parse_dropping_unusable_keys<T: serde::de::DeserializeOwned>(
+    text: &str,
+) -> std::result::Result<(T, Vec<String>, bool), serde_yaml_ng::Error> {
+    let strict = match serde_yaml_ng::from_str::<T>(text) {
+        Ok(file) => return Ok((file, Vec::new(), false)),
+        Err(error) => error,
+    };
+    let Ok(mut document) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(text) else {
+        return Err(strict);
+    };
+    let unknown_field = strict.to_string().contains("unknown field");
+
+    let mut dropped = Vec::new();
+    // One pass per dropped key: removing one can expose the next. A key that is not the problem is
+    // never removed, because the document still fails to parse without it — and the pass stops as
+    // soon as the document parses, since an empty document always would.
+    loop {
+        if T::deserialize(document.clone()).is_ok() {
+            break;
+        }
+        let mut paths = Vec::new();
+        collect_key_paths(&document, &mut Vec::new(), &mut paths);
+        // Deepest key first, so one misspelled key inside a section costs that key and not the
+        // section around it. A whole section this build has never heard of has no working inner
+        // key to drop it instead, so it is dropped whole either way.
+        paths.sort_by_key(|path| std::cmp::Reverse(path.len()));
+        let mut removed = None;
+        for path in paths {
+            let mut pruned = document.clone();
+            if remove_at(&mut pruned, &path) && T::deserialize(pruned.clone()).is_ok() {
+                removed = Some((pruned, key_label(&path)));
+                break;
+            }
+        }
+        let Some((pruned, label)) = removed else {
+            break;
+        };
+        document = pruned;
+        dropped.push(label);
+    }
+
+    match T::deserialize(document) {
+        Ok(file) => Ok((file, dropped, unknown_field)),
+        // Nothing could be dropped to make it parse; the original error is the one that helps.
+        Err(_) => Err(strict),
+    }
+}
+
+/// Every mapping key in the document, each parent ahead of the keys nested under it.
+fn collect_key_paths(
+    value: &serde_yaml_ng::Value,
+    prefix: &mut Vec<serde_yaml_ng::Value>,
+    out: &mut Vec<Vec<serde_yaml_ng::Value>>,
+) {
+    let Some(mapping) = value.as_mapping() else {
+        return;
+    };
+    for key in mapping.keys() {
+        prefix.push(key.clone());
+        out.push(prefix.clone());
+        if let Some(child) = mapping.get(key) {
+            collect_key_paths(child, prefix, out);
+        }
+        prefix.pop();
+    }
+}
+
+/// Remove the key `path` names, reporting whether it was there.
+fn remove_at(root: &mut serde_yaml_ng::Value, path: &[serde_yaml_ng::Value]) -> bool {
+    let Some((key, rest)) = path.split_first() else {
+        return false;
+    };
+    if rest.is_empty() {
+        return root
+            .as_mapping_mut()
+            .is_some_and(|mapping| mapping.remove(key).is_some());
+    }
+    root.as_mapping_mut()
+        .and_then(|mapping| mapping.get_mut(key))
+        .is_some_and(|child| remove_at(child, rest))
+}
+
+/// `providers.my-gw.models.qwen.no_such_field`, for a warning a user can act on.
+fn key_label(path: &[serde_yaml_ng::Value]) -> String {
+    path.iter()
+        .map(|key| match key.as_str() {
+            Some(name) => name.to_owned(),
+            None => format!("{key:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 pub fn load_env_file(dirs: &Dirs) -> Result<BTreeMap<String, String>> {
     let path = dirs.config.join("env.yaml");
-    let file: Option<BTreeMap<String, String>> = read_optional(&path)?;
+    let file: Option<BTreeMap<String, String>> = read_optional_strict(&path)?;
     let Some(file) = file else {
         return Ok(BTreeMap::new());
     };
@@ -792,6 +1083,15 @@ auto_detect_env: true
 const CONFIG_TEMPLATE: &str = r#"# zlogic's basic settings. The provider / model list is in models.yaml in the same directory.
 # How keys are supplied is described at the top of that file as well.
 
+# ── where a stored secret goes ────────────────────────────────────────────
+# On, a key you enter (or a sign-in) is handed to the operating system's credential store
+# (macOS Keychain / Windows Credential Manager / Linux Secret Service).
+# Off, it is kept unencrypted in this app's own state directory instead, and the OS store is never
+# touched. Turn it off if your macOS build is not signed and macOS keeps asking for Keychain access.
+# Default: off on macOS (an unsigned build gets an authorization prompt per entry, with no way to
+# stop it), on everywhere else. The desktop has the same switch under Settings → Advanced → Credentials.
+# keychain: false
+
 # Left unset, a main model that has a key is picked automatically (tier: main is preferred).
 # default_model: anthropic:claude-sonnet-5
 
@@ -867,8 +1167,34 @@ const CONFIG_TEMPLATE: &str = r#"# zlogic's basic settings. The provider / model
 #   default_shell: auto
 #   # A single tool result over this many characters goes to the object store, and only head and tail are fed to the model.
 #   max_result_chars: 30000
-#   # Tool execution timeout (seconds). 0 = unlimited.
+#   # Blanket ceiling on **any** tool call, on top of whatever that tool allows. 0 = off.
+#   # It overrides the per-class shell budgets below, so it is an emergency stop, not the normal
+#   # way to bound a run: set it and a 20-minute build is killed at whatever this says, with an
+#   # error that names neither the class nor the budget that actually applied.
 #   timeout_secs: 0
+#
+#   # How long `shell` may run, per kind of command. **You never set these per call** — the model
+#   # says whether it needs the result (`wait: true`) and shell matches the command to a class,
+#   # because a number guessed before the work is known is wrong in both directions: too short and
+#   # a test suite is killed at 30s and re-run four times, too long and one call holds the turn.
+#   # A workspace may override any single field in `<project>/.zlogic/settings.yaml`, same paths:
+#   #   tools:
+#   #     shell:
+#   #       test_secs: 1800          # an integration suite that is genuinely slow
+#   shell:
+#     quick_secs: 60               # git status, ls, a grep
+#     test_secs: 600               # cargo test, pytest, vitest — generous on purpose: a suite killed
+#                                   #   at the quick budget has told nobody anything
+#     build_secs: 1200             # cargo build, tsc, an install
+#     wait_secs: 3600              # ceiling for `wait: true`, which opts out of its class budget.
+#                                   #   Not unlimited: a command blocked on a port nobody opened
+#                                   #   would otherwise hold the turn until you give up on it
+#     stall_secs: 600              # no output at all for this long = stuck, not slow. Independent of
+#                                   #   the budgets above on purpose, and reported differently,
+#                                   #   because the two call for opposite responses
+#     progress_secs: 30            # how often a running call says it is still running. Display only;
+#                                   #   not in the settings UI, because it changes what you see and
+#                                   #   never what the tool does
 #
 #   # Who web_search calls. **It works unconfigured too** — both vendors have a free tier, just a low quota.
 #   web_search:
@@ -1137,16 +1463,57 @@ providers:
     }
 
     #[test]
-    fn typos_in_yaml_are_rejected_not_silently_defaulted() {
+    fn an_unknown_key_is_dropped_with_a_warning_and_the_rest_still_applies() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Dirs::under(tmp.path());
         dirs.ensure().unwrap();
-        write(&dirs.config, "config.yaml", "defualt_model: a/b\n");
-        let err = load(&dirs, &[]).unwrap_err();
-        assert!(
-            matches!(err, ConfigError::Parse { .. }),
-            "a misspelled key must be an error"
+        write(
+            &dirs.config,
+            "config.yaml",
+            "defualt_model: a/b\ndefault_model: p:m\n",
         );
+        let cfg = load(&dirs, &[]).unwrap();
+        assert_eq!(cfg.default_model.as_deref(), Some("p:m"));
+        assert!(
+            cfg.warnings
+                .iter()
+                .any(|w| w.contains("defualt_model") && w.contains("config.yaml")),
+            "the dropped key has to be named, or a typo is invisible: {:?}",
+            cfg.warnings
+        );
+    }
+
+    #[test]
+    fn a_known_key_whose_value_does_not_fit_loses_only_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        dirs.ensure().unwrap();
+        write(
+            &dirs.config,
+            "config.yaml",
+            "default_model: p:m\ncontext:\n  compact_ratio: not-a-number\n",
+        );
+        let cfg = load(&dirs, &[]).unwrap();
+        assert_eq!(cfg.default_model.as_deref(), Some("p:m"));
+        assert_eq!(cfg.context, ContextConfig::default());
+        assert!(
+            cfg.warnings.iter().any(|w| w.contains("compact_ratio")),
+            "{:?}",
+            cfg.warnings
+        );
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_at_all_is_still_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        dirs.ensure().unwrap();
+        write(
+            &dirs.config,
+            "config.yaml",
+            "providers: [this is not a map\n",
+        );
+        assert!(matches!(load(&dirs, &[]), Err(ConfigError::Parse { .. })));
     }
 
     #[test]
@@ -1493,6 +1860,59 @@ providers:
     }
 
     #[test]
+    fn the_keychain_switch_defaults_to_the_platform_and_round_trips() {
+        use crate::DEFAULT_KEYCHAIN_ENABLED;
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+
+        assert_eq!(
+            keychain_enabled(&dirs),
+            DEFAULT_KEYCHAIN_ENABLED,
+            "no file at all means the platform default"
+        );
+
+        assert!(write_keychain_enabled(&dirs, Some(false)).unwrap());
+        assert!(!keychain_enabled(&dirs));
+        assert!(
+            !write_keychain_enabled(&dirs, Some(false)).unwrap(),
+            "writing the value already there must not touch the file"
+        );
+
+        assert!(write_keychain_enabled(&dirs, Some(true)).unwrap());
+        assert!(keychain_enabled(&dirs));
+
+        assert!(write_keychain_enabled(&dirs, None).unwrap());
+        assert_eq!(
+            keychain_enabled(&dirs),
+            DEFAULT_KEYCHAIN_ENABLED,
+            "removing the key restores the default instead of freezing today's value"
+        );
+        assert!(
+            !write_keychain_enabled(&dirs, None).unwrap(),
+            "removing a key that is not there is not a write"
+        );
+    }
+
+    #[test]
+    fn the_keychain_switch_lands_in_the_file_and_survives_a_full_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        seed_config_dir(&dirs).unwrap();
+
+        write_keychain_enabled(&dirs, Some(false)).unwrap();
+
+        let body = std::fs::read_to_string(dirs.config_file()).unwrap();
+        assert!(body.contains("keychain: false"), "{body}");
+        assert!(
+            body.contains("# zlogic"),
+            "the template's own documentation must survive the write: {body}"
+        );
+
+        let cfg = load(&dirs, &[]).unwrap();
+        assert!(!cfg.keychain, "the file has to reach the loaded config");
+    }
+
+    #[test]
     fn the_seeded_files_load_back_and_contain_no_builtin_data() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Dirs::under(tmp.path());
@@ -1628,7 +2048,7 @@ providers:
     }
 
     #[test]
-    fn non_model_sections_are_rejected_in_models_yaml() {
+    fn a_section_that_belongs_to_another_file_is_dropped_from_models_yaml() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Dirs::under(tmp.path());
         write(
@@ -1636,7 +2056,15 @@ providers:
             "models.yaml",
             "context:\n  compact_ratio: 0.5\n",
         );
-        assert!(matches!(load(&dirs, &[]), Err(ConfigError::Parse { .. })));
+        let cfg = load(&dirs, &[]).unwrap();
+        assert_eq!(cfg.context, ContextConfig::default());
+        assert!(
+            cfg.warnings
+                .iter()
+                .any(|w| w.contains("models.yaml") && w.contains("context")),
+            "{:?}",
+            cfg.warnings
+        );
     }
 }
 
@@ -1804,6 +2232,12 @@ mod builtin_authority {
     use super::*;
     use crate::dirs::Dirs;
 
+    /// A probe that finds exactly the given keychain entries and no environment variable.
+    fn keyring(entries: &[&str]) -> impl Fn(&CredentialRef) -> bool + use<> {
+        let entries: Vec<String> = entries.iter().map(|entry| entry.to_string()).collect();
+        move |reference: &CredentialRef| matches!(reference, CredentialRef::Keyring(name) if entries.iter().any(|e| e == name))
+    }
+
     #[test]
     fn a_builtin_providers_sdk_comes_from_the_catalog() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1821,5 +2255,50 @@ mod builtin_authority {
             "the catalog says responses, so responses it is; when this one changes, detection is grabbing sdk again"
         );
         assert_eq!(cfg.providers["openai"].models.len(), 3);
+    }
+
+    /// The subscription provider is not in the generated catalog, and it has no API key to detect:
+    /// it exists exactly when a sign-in does.
+    #[test]
+    fn the_subscription_provider_appears_only_once_it_is_signed_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        dirs.ensure().unwrap();
+
+        let signed_out = AppConfig::load(&dirs, keyring(&[])).unwrap();
+        assert!(
+            !signed_out.providers.contains_key(CODEX_PROVIDER_ID),
+            "with no token there is no provider to point a model at"
+        );
+
+        let signed_in = AppConfig::load(&dirs, keyring(&["codex_oauth"])).unwrap();
+        let codex = &signed_in.providers[CODEX_PROVIDER_ID];
+        assert_eq!(codex.auth, ProviderAuth::Chatgpt);
+        assert_eq!(
+            codex.base_url.as_deref(),
+            Some("https://chatgpt.com/backend-api/codex"),
+            "a plan is served by the Codex backend, not by api.openai.com"
+        );
+        assert_eq!(codex.wiring.path.as_deref(), Some("responses"));
+
+        let (model, warnings) = signed_in
+            .resolve("codex:gpt-5.5")
+            .expect("the built-in floor resolves");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(model.auth, ProviderAuth::Chatgpt);
+        assert_eq!(
+            model.credential_refs,
+            ["keyring:codex_oauth"],
+            "a subscription has exactly one home, and it is not an environment variable"
+        );
+        assert_eq!(
+            model.max_output_tokens, None,
+            "the backend decides the output budget; a client-imposed cap is what it rejects"
+        );
+        assert!(
+            model.pricing.is_none(),
+            "a plan is not billed per token, so there is no price to show"
+        );
+        assert!(model.capabilities.thinking.supported);
     }
 }

@@ -1,11 +1,11 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, named_params};
-use zlogic_protocol::WorkspaceId;
+use zlogic_protocol::{WorkspaceId, WorkspaceKind};
 
 use crate::{Result, StoreError, now};
 
 const COLS: &str =
-    "workspace_id, name, path, created_at, pinned, sort_order, last_opened_at, hidden, tools";
+    "workspace_id, name, path, created_at, pinned, sort_order, last_opened_at, hidden, tools, kind";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceRecord {
@@ -18,6 +18,7 @@ pub struct WorkspaceRecord {
     pub last_opened_at: Option<DateTime<Utc>>,
     pub hidden: bool,
     pub tools: Option<Vec<String>>,
+    pub kind: WorkspaceKind,
 }
 
 impl WorkspaceRecord {
@@ -57,6 +58,16 @@ impl<'a> WorkspaceStore<'a> {
         name: Option<&str>,
         tools: Option<&[String]>,
     ) -> Result<(WorkspaceRecord, bool)> {
+        self.resolve_with_kind(path, name, tools, WorkspaceKind::Coding)
+    }
+
+    pub fn resolve_with_kind(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        name: Option<&str>,
+        tools: Option<&[String]>,
+        kind: WorkspaceKind,
+    ) -> Result<(WorkspaceRecord, bool)> {
         let path = normalise(path.as_ref());
         if let Some(existing) = self.find_by_path(&path)? {
             return Ok((existing, false));
@@ -69,14 +80,15 @@ impl<'a> WorkspaceStore<'a> {
             .map(str::to_owned)
             .unwrap_or_else(|| default_name(&path));
         let affected = self.conn.execute(
-            "INSERT OR IGNORE INTO workspaces (workspace_id, name, path, created_at, tools)
-             VALUES (:workspace_id, :name, :path, :ts, :tools)",
+            "INSERT OR IGNORE INTO workspaces (workspace_id, name, path, created_at, tools, kind)
+             VALUES (:workspace_id, :name, :path, :ts, :tools, :kind)",
             named_params! {
                 ":workspace_id": id,
                 ":name": name,
                 ":path": path,
                 ":ts": now(),
                 ":tools": encode_tools(tools)?,
+                ":kind": encode_kind(kind),
             },
         )?;
 
@@ -189,6 +201,18 @@ impl<'a> WorkspaceStore<'a> {
         self.get(workspace_id)
     }
 
+    pub fn set_kind(
+        &self,
+        workspace_id: WorkspaceId,
+        kind: WorkspaceKind,
+    ) -> Result<WorkspaceRecord> {
+        self.conn.execute(
+            "UPDATE workspaces SET kind = :kind WHERE workspace_id = :id",
+            named_params! { ":kind": encode_kind(kind), ":id": workspace_id },
+        )?;
+        self.get(workspace_id)
+    }
+
     pub fn rename(&self, workspace_id: WorkspaceId, name: &str) -> Result<WorkspaceRecord> {
         let name = name.trim();
         if name.is_empty() {
@@ -252,8 +276,33 @@ fn encode_tools(tools: Option<&[String]>) -> Result<Option<String>> {
         .transpose()
 }
 
+fn encode_kind(kind: WorkspaceKind) -> &'static str {
+    match kind {
+        WorkspaceKind::Coding => "coding",
+        WorkspaceKind::Chat => "chat",
+        WorkspaceKind::Custom => "custom",
+        WorkspaceKind::MobileAndroid => "mobile_android",
+    }
+}
+
+fn decode_kind(text: &str) -> rusqlite::Result<WorkspaceKind> {
+    match text {
+        "coding" => Ok(WorkspaceKind::Coding),
+        "chat" => Ok(WorkspaceKind::Chat),
+        "custom" => Ok(WorkspaceKind::Custom),
+        "mobile_android" => Ok(WorkspaceKind::MobileAndroid),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("unknown workspace kind: {text}").into(),
+        )),
+    }
+}
+
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
     let tools: Option<String> = row.get("tools")?;
+    let kind: String = row.get("kind")?;
+    let kind = decode_kind(&kind)?;
     let tools = tools
         .map(|text| {
             serde_json::from_str::<Vec<String>>(&text).map_err(|e| {
@@ -275,6 +324,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
         last_opened_at: row.get("last_opened_at")?,
         hidden: row.get("hidden")?,
         tools,
+        kind,
     })
 }
 

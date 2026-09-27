@@ -27,9 +27,7 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::transport::{
-    AuthClient, ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess,
-};
+use rmcp::transport::{AuthClient, StreamableHttpClientTransport, TokioChildProcess};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -362,21 +360,24 @@ impl Connection {
                 env,
                 cwd,
             } => {
-                let cmd = tokio::process::Command::new(command).configure(|c| {
-                    c.args(args).envs(env).current_dir(cwd);
-                    // MCP servers are often console binaries; from a GUI host they must not open
-                    // a console window for the lifetime of the connection.
-                    #[cfg(windows)]
-                    c.creation_flags(0x0800_0000);
-                });
-                let (child, pipe) = TokioChildProcess::builder(cmd)
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .map_err(|e| {
-                        // The overwhelmingly common case, and worth naming: the command is not
-                        // installed, or not on zlogic's PATH (which is not the shell's).
-                        fail(format!("cannot start `{command}`: {e}"))
-                    })?;
+                let mut cmd = tokio::process::Command::new(command);
+                cmd.args(args).envs(env).current_dir(cwd);
+                // `npx`, `uvx` and `docker` are wrappers that launch the real server as a child,
+                // and the transport's own cleanup only stops the wrapper — so without this the
+                // server itself outlives the connection. Wrapping the command in a job object
+                // (Windows) or a process group (Unix) makes closing the connection stop the whole
+                // tree, and on Windows the kernel does it even if zlogic is killed outright.
+                let (child, pipe) = TokioChildProcess::builder(zlogic_proctree::wrap(
+                    cmd,
+                    zlogic_proctree::Console::Hidden,
+                ))
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| {
+                    // The overwhelmingly common case, and worth naming: the command is not
+                    // installed, or not on zlogic's PATH (which is not the shell's).
+                    fail(format!("cannot start `{command}`: {e}"))
+                })?;
                 if let Some(pipe) = pipe {
                     stderr.clone().drain(server_id.to_string(), pipe);
                 }

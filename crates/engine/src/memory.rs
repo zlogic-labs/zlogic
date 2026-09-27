@@ -7,7 +7,7 @@ use zlogic_objects::ObjectStore;
 use zlogic_protocol::query::{ApiError, ApiResult};
 use zlogic_protocol::{
     MemoryAddReq, MemoryCategory, MemoryEditReq, MemoryId, MemoryListReq, MemoryRecord,
-    MemoryRemoveReq, MemoryScope, MemoryUndoReq, SessionId, TurnId,
+    MemoryRemoveReq, MemoryScope, SessionId, TurnId,
 };
 use zlogic_tools::MemoryHost;
 
@@ -157,12 +157,6 @@ impl MemoryService for Memories {
     async fn remove(&self, req: MemoryRemoveReq) -> ApiResult<MemoryRecord> {
         self.store
             .with(|db| db.memories().remove(req))
-            .map_err(|e| ApiError::from(crate::EngineError::from(e)))
-    }
-
-    async fn undo(&self, req: MemoryUndoReq) -> ApiResult<Option<MemoryRecord>> {
-        self.store
-            .with(|db| db.memories().undo_last(req))
             .map_err(|e| ApiError::from(crate::EngineError::from(e)))
     }
 }

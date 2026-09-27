@@ -90,7 +90,8 @@ impl Tool for Skill {
                 "Load one of the skills listed in your context and follow it. A skill is a \
                           written procedure for a recurring kind of task — when one matches what \
                           you are about to do, it is more specific than anything you would work \
-                          out yourself, so load it first. Do not load skills speculatively."
+                          out yourself, so load it first. A description that names when to reach \
+                          for it is binding; load nothing else speculatively."
                     .into(),
             parameters: json!({
                 "type": "object",

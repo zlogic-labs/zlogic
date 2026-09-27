@@ -10,33 +10,43 @@ use zlogic_protocol::query::{
     ApiError, ApiResult, CatalogCheck, ConfigRemoveProviderReq, ConfigUpdateReq, ConfigView,
     CredentialDeleteReq, CredentialSetReq, CredentialState, CredentialVerifyReq,
     CredentialVerifyResult, EntriesReq, ObjectData, ObjectDataReq, ObjectReadReq, ObjectText,
-    OpenAiCompatibleProviderReq, Page, ProviderCatalog, RuntimeTask, RuntimeTaskDeleteReq,
-    RuntimeTaskListReq, RuntimeTaskLog, RuntimeTaskLogReq, RuntimeTaskPage, RuntimeTaskStopReq,
-    SessionListReq, SessionOpenReq, SessionOpened, SessionRenameReq, SessionSearchHit,
-    SessionSearchReq, SessionSummary, TaskJob, TaskJobCreateReq, TaskJobDeleteReq, TaskJobDraft,
-    TaskJobDraftReq, TaskJobListReq, TaskJobRunReq, TaskJobRunsReq, TaskJobSetEnabledReq, ToolInfo,
-    TranscriptEntry, TranscriptReq, TurnItem, TurnState, TurnsReq, UsageSummary, UsageSummaryReq,
+    OpenAiCompatibleProviderReq, Page, ProviderCatalog, ProviderModels, ProviderModelsReq,
+    ProviderSignInBegin, ProviderSignInBeginReq, ProviderSignInCancelReq, ProviderSignInStatus,
+    ProviderSignInStatusReq, RuntimeTask, RuntimeTaskDeleteReq, RuntimeTaskListReq, RuntimeTaskLog,
+    RuntimeTaskLogReq, RuntimeTaskPage, RuntimeTaskStopReq, SessionListReq, SessionOpenReq,
+    SessionOpened, SessionRenameReq, SessionSearchHit, SessionSearchReq, SessionSummary, TaskJob,
+    TaskJobCreateReq, TaskJobDeleteReq, TaskJobDraft, TaskJobDraftReq, TaskJobListReq,
+    TaskJobRunReq, TaskJobRunsReq, TaskJobSetEnabledReq, TextTranslateReq, TextTranslateResp,
+    ToolInfo, TranscriptEntry, TranscriptReq, TranslationDeleteReq, TranslationEntry,
+    TranslationListReq, TurnItem, TurnState, TurnsReq, UsageSummary, UsageSummaryReq,
     WorkspaceFileBase64, WorkspaceFileCreateReq, WorkspaceFileDeleteReq, WorkspaceFileEntry,
     WorkspaceFileListReq, WorkspaceFileRange, WorkspaceFileRangeReq, WorkspaceFileReadReq,
     WorkspaceFileRenameReq, WorkspaceFileSearchReq, WorkspaceFileText, WorkspaceFileWriteReq,
     WorkspaceGitBranchReq, WorkspaceGitCommitDetail, WorkspaceGitCommitDetailReq,
     WorkspaceGitCommitReq, WorkspaceGitDiff, WorkspaceGitDiffReq,
-    WorkspaceGitGenerateCommitMessageReq, WorkspaceGitInfo, WorkspaceGitOverview,
-    WorkspaceGitOverviewReq, WorkspaceGitStageReq, WorkspaceGitSyncReq, WorkspaceKind,
-    WorkspaceSelector, WorkspaceSummary, WorkspaceUpdateReq,
+    WorkspaceGitGenerateCommitMessageReq, WorkspaceGitInfo, WorkspaceGitInitReq,
+    WorkspaceGitOverview, WorkspaceGitOverviewReq, WorkspaceGitStageReq, WorkspaceGitSyncReq,
+    WorkspaceKind, WorkspaceSelector, WorkspaceSummary, WorkspaceUpdateReq,
+};
+use zlogic_protocol::query::{
+    WorkspaceCheckpoint, WorkspaceCheckpointCaptureReq, WorkspaceCheckpointFileDiff,
+    WorkspaceCheckpointFileDiffReq, WorkspaceCheckpointList, WorkspaceCheckpointListReq,
+    WorkspaceCheckpointPlan, WorkspaceCheckpointPlanReq, WorkspaceCheckpointRestore,
+    WorkspaceCheckpointRestoreReq, WorkspaceCheckpointStep, WorkspaceCheckpointStepReq,
 };
 use zlogic_protocol::{
     AgentProfile, AgentProfileCreateReq, AgentProfileDeleteReq, AgentProfileListReq,
     AgentProfileListRes, AgentProfileUpdateReq, Command, ManagedResource, ManagedResourceDeleteReq,
     ManagedResourceListReq, ManagedResourceTestReq, ManagedResourceTestResult,
     ManagedResourceUpsertReq, MemoryAddReq, MemoryEditReq, MemoryListReq, MemoryRecord,
-    MemoryRemoveReq, MemoryUndoReq, SessionId, Submission, SubmitAck, TurnId, WorkspaceId,
+    MemoryRemoveReq, SessionId, Submission, SubmitAck, TurnId, WorkspaceId,
 };
 
 use crate::service::{
     AgentProfileService, AuxiliaryService, ConfigService, CredentialService, ExtensionService,
     ManagedResourceService, MemoryService, ObjectService, SessionService, TaskService,
-    ToolCatalogService, TurnService, WorkspaceFilesService, WorkspaceGitService, WorkspaceService,
+    ToolCatalogService, TranslationService, TurnService, WorkspaceCheckpointsService,
+    WorkspaceFilesService, WorkspaceGitService, WorkspaceService,
 };
 
 pub struct NotWired;
@@ -59,6 +69,25 @@ impl AuxiliaryService for NotWired {
     async fn draft_task_job(&self, _req: TaskJobDraftReq) -> ApiResult<TaskJobDraft> {
         nope!("task_job_draft")
     }
+
+    async fn text_translate(&self, _req: TextTranslateReq) -> ApiResult<TextTranslateResp> {
+        nope!("text_translate")
+    }
+}
+
+#[async_trait]
+impl TranslationService for NotWired {
+    async fn translation_list(&self, _req: TranslationListReq) -> ApiResult<Vec<TranslationEntry>> {
+        nope!("translation_list")
+    }
+
+    async fn translation_delete(&self, _req: TranslationDeleteReq) -> ApiResult<()> {
+        nope!("translation_delete")
+    }
+
+    async fn translation_clear(&self) -> ApiResult<()> {
+        nope!("translation_clear")
+    }
 }
 
 #[async_trait]
@@ -74,9 +103,6 @@ impl MemoryService for NotWired {
     }
     async fn remove(&self, _req: MemoryRemoveReq) -> ApiResult<MemoryRecord> {
         nope!("memory_remove")
-    }
-    async fn undo(&self, _req: MemoryUndoReq) -> ApiResult<Option<MemoryRecord>> {
-        nope!("memory_undo")
     }
 }
 
@@ -216,6 +242,9 @@ impl WorkspaceGitService for NotWired {
     async fn git_stage(&self, _req: WorkspaceGitStageReq) -> ApiResult<WorkspaceGitOverview> {
         nope!("workspace_git_stage")
     }
+    async fn git_init(&self, _req: WorkspaceGitInitReq) -> ApiResult<WorkspaceGitOverview> {
+        nope!("workspace_git_init")
+    }
     async fn git_sync(&self, _req: WorkspaceGitSyncReq) -> ApiResult<WorkspaceGitOverview> {
         nope!("workspace_git_sync")
     }
@@ -230,6 +259,46 @@ impl WorkspaceGitService for NotWired {
     }
     async fn git_diff(&self, _req: WorkspaceGitDiffReq) -> ApiResult<WorkspaceGitDiff> {
         nope!("workspace_git_diff")
+    }
+}
+
+#[async_trait]
+impl WorkspaceCheckpointsService for NotWired {
+    async fn checkpoint_list(
+        &self,
+        _req: WorkspaceCheckpointListReq,
+    ) -> ApiResult<WorkspaceCheckpointList> {
+        nope!("workspace_checkpoint_list")
+    }
+    async fn checkpoint_plan(
+        &self,
+        _req: WorkspaceCheckpointPlanReq,
+    ) -> ApiResult<WorkspaceCheckpointPlan> {
+        nope!("workspace_checkpoint_plan")
+    }
+    async fn checkpoint_step(
+        &self,
+        _req: WorkspaceCheckpointStepReq,
+    ) -> ApiResult<WorkspaceCheckpointStep> {
+        nope!("workspace_checkpoint_step")
+    }
+    async fn checkpoint_diff(
+        &self,
+        _req: WorkspaceCheckpointFileDiffReq,
+    ) -> ApiResult<WorkspaceCheckpointFileDiff> {
+        nope!("workspace_checkpoint_diff")
+    }
+    async fn checkpoint_capture(
+        &self,
+        _req: WorkspaceCheckpointCaptureReq,
+    ) -> ApiResult<WorkspaceCheckpoint> {
+        nope!("workspace_checkpoint_capture")
+    }
+    async fn checkpoint_restore(
+        &self,
+        _req: WorkspaceCheckpointRestoreReq,
+    ) -> ApiResult<WorkspaceCheckpointRestore> {
+        nope!("workspace_checkpoint_restore")
     }
 }
 
@@ -351,6 +420,24 @@ impl CredentialService for NotWired {
     }
     async fn verify(&self, _req: CredentialVerifyReq) -> ApiResult<CredentialVerifyResult> {
         nope!("credential_verify")
+    }
+    async fn sign_in_begin(&self, _req: ProviderSignInBeginReq) -> ApiResult<ProviderSignInBegin> {
+        nope!("credential_sign_in_begin")
+    }
+    async fn sign_in_status(
+        &self,
+        _req: ProviderSignInStatusReq,
+    ) -> ApiResult<ProviderSignInStatus> {
+        nope!("credential_sign_in_status")
+    }
+    async fn sign_in_cancel(&self, _req: ProviderSignInCancelReq) -> ApiResult<()> {
+        nope!("credential_sign_in_cancel")
+    }
+    async fn models(&self, _req: ProviderModelsReq) -> ApiResult<ProviderModels> {
+        nope!("provider_models")
+    }
+    async fn forget_models(&self, _req: ProviderModelsReq) -> ApiResult<()> {
+        nope!("provider_models_forget")
     }
 }
 

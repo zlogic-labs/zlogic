@@ -3,7 +3,7 @@
 use rusqlite::{Connection, OptionalExtension, named_params};
 use zlogic_protocol::{
     MemoryAddReq, MemoryEditReq, MemoryEventId, MemoryId, MemoryListReq, MemoryRecord,
-    MemoryRemoveReq, MemoryScope, MemoryStatus, MemoryUndoReq,
+    MemoryRemoveReq, MemoryScope, MemoryStatus,
 };
 
 use crate::{Json, Result, StoreError, now};
@@ -242,71 +242,6 @@ impl<'a> MemoryStore<'a> {
         tx.commit()?;
         Ok(after)
     }
-
-    /// Reverses the latest not-yet-undone event in one scope by appending an `undo` event.
-    pub fn undo_last(&self, req: MemoryUndoReq) -> Result<Option<MemoryRecord>> {
-        validate_scope(req.scope, req.workspace_id)?;
-        let tx = self.conn.unchecked_transaction()?;
-        let event: Option<(MemoryEventId, String, Option<Json<MemoryRecord>>)> = tx
-            .query_row(
-                "SELECT e.event_id, e.action, e.before_json
-                 FROM memory_events e
-                 JOIN memory m ON m.memory_id = e.memory_id
-                 WHERE e.action != 'undo'
-                   AND m.scope = :scope
-                   AND ((:workspace_id IS NULL AND m.workspace_id IS NULL)
-                        OR m.workspace_id = :workspace_id)
-                   AND NOT EXISTS (
-                     SELECT 1 FROM memory_events u
-                     WHERE u.action = 'undo' AND u.reverts_event_id = e.event_id
-                   )
-                 ORDER BY e.id DESC
-                 LIMIT 1",
-                named_params! {
-                    ":scope": req.scope,
-                    ":workspace_id": req.workspace_id,
-                },
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        let Some((event_id, action, before)) = event else {
-            tx.commit()?;
-            return Ok(None);
-        };
-
-        let memory_id: MemoryId = tx.query_row(
-            "SELECT memory_id FROM memory_events WHERE event_id = :event_id",
-            named_params! { ":event_id": event_id },
-            |r| r.get(0),
-        )?;
-        let current = get_conn(&tx, memory_id)?;
-        let mut restored = match (action.as_str(), before) {
-            ("add", None) => MemoryRecord {
-                status: MemoryStatus::Removed,
-                ..current.clone()
-            },
-            ("update" | "remove", Some(Json(before))) => before,
-            _ => {
-                return Err(StoreError::Corrupt(format!(
-                    "memory event {event_id} has invalid undo snapshot"
-                )));
-            }
-        };
-        restored.updated_at = now();
-        write_snapshot(&tx, &restored)?;
-        append_event(
-            &tx,
-            memory_id,
-            "undo",
-            Some(&current),
-            Some(&restored),
-            req.source_session_id,
-            req.source_turn_id,
-            Some(event_id),
-        )?;
-        tx.commit()?;
-        Ok(Some(restored))
-    }
 }
 
 const COLS: &str = "memory_id, scope, workspace_id, category, fact, source_quote,
@@ -369,31 +304,6 @@ fn append_event(
             ":source_turn_id": source_turn_id,
             ":reverts_event_id": reverts_event_id,
             ":created_at": now(),
-        },
-    )?;
-    Ok(())
-}
-
-fn write_snapshot(conn: &Connection, record: &MemoryRecord) -> Result<()> {
-    conn.execute(
-        "UPDATE memory SET
-           scope = :scope, workspace_id = :workspace_id, category = :category,
-           fact = :fact, source_quote = :source_quote,
-           source_session_id = :source_session_id, source_turn_id = :source_turn_id,
-           status = :status, created_at = :created_at, updated_at = :updated_at
-         WHERE memory_id = :memory_id",
-        named_params! {
-            ":scope": record.scope,
-            ":workspace_id": record.workspace_id,
-            ":category": record.category,
-            ":fact": record.fact,
-            ":source_quote": record.source_quote,
-            ":source_session_id": record.source_session_id,
-            ":source_turn_id": record.source_turn_id,
-            ":status": record.status,
-            ":created_at": record.created_at,
-            ":updated_at": record.updated_at,
-            ":memory_id": record.memory_id,
         },
     )?;
     Ok(())
@@ -703,41 +613,5 @@ mod tests {
 
         let error = db.memories().add(req).unwrap_err();
         assert!(error.to_string().contains("must be supplied together"));
-    }
-
-    #[test]
-    fn undo_reverses_remove_then_add_without_deleting_history() {
-        let db = Db::open_in_memory().unwrap();
-        let session = SessionId::new();
-        let turn = TurnId::new();
-        let record = db
-            .memories()
-            .add(add(MemoryScope::Global, None, "prefer Rust"))
-            .unwrap();
-        db.memories()
-            .remove(MemoryRemoveReq {
-                memory_id: record.memory_id,
-                source_session_id: Some(session),
-                source_turn_id: Some(turn),
-            })
-            .unwrap();
-        let req = || MemoryUndoReq {
-            scope: MemoryScope::Global,
-            workspace_id: None,
-            source_session_id: None,
-            source_turn_id: None,
-        };
-
-        let restored = db.memories().undo_last(req()).unwrap().unwrap();
-        assert_eq!(restored.status, MemoryStatus::Active);
-        let removed_again = db.memories().undo_last(req()).unwrap().unwrap();
-        assert_eq!(removed_again.status, MemoryStatus::Removed);
-        assert!(db.memories().undo_last(req()).unwrap().is_none());
-
-        let events: i64 = db
-            .conn()
-            .query_row("SELECT count(*) FROM memory_events", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(events, 4, "add + remove + two undo events");
     }
 }

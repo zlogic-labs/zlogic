@@ -22,8 +22,22 @@ const MAX_SKILLS: usize = 100;
 
 const MAX_DESCRIPTION_CHARS: usize = 300;
 
+/// The guide to zlogic itself, compiled in rather than installed. It is the one skill a user needs
+/// before they have installed anything, and a product that cannot explain its own configuration
+/// makes every configuration question a support ticket.
+struct BuiltinSkill {
+    name: &'static str,
+    text: &'static str,
+}
+
+const BUILTIN_SKILL: BuiltinSkill = BuiltinSkill {
+    name: "zlogic-guide",
+    text: include_str!("../defaults/skills/zlogic-guide/SKILL.md"),
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillOrigin {
+    Builtin,
     User,
     Workspace,
 }
@@ -32,6 +46,9 @@ pub enum SkillOrigin {
 pub struct SkillDef {
     pub name: String,
     pub description: String,
+    /// Per-locale descriptions for surfaces that know the reader's language. `description` stays
+    /// the one the model sees, so it is written in the language the skill itself is written in.
+    pub descriptions: BTreeMap<String, String>,
     pub path: PathBuf,
     pub origin: SkillOrigin,
 }
@@ -47,11 +64,27 @@ struct Frontmatter {
     name: Option<String>,
     description: Option<String>,
     when_to_use: Option<String>,
+    #[serde(default)]
+    descriptions: BTreeMap<String, String>,
+}
+
+/// The compiled-in skills alone, for callers with no workspace to scan: a machine-wide settings
+/// page has no root, and the guide is the one skill that still has to be visible there.
+pub fn builtin_skills() -> Skills {
+    let mut by_name: BTreeMap<String, SkillDef> = BTreeMap::new();
+    let mut problems = Vec::new();
+    seed_builtin(&mut by_name, &mut problems);
+    Skills {
+        found: by_name.into_values().collect(),
+        problems,
+    }
 }
 
 pub fn discover(dirs: &Dirs, root: &Path, workspace: Option<WorkspaceId>) -> Skills {
     let mut by_name: BTreeMap<String, SkillDef> = BTreeMap::new();
     let mut problems = Vec::new();
+
+    seed_builtin(&mut by_name, &mut problems);
 
     let sources = [
         (dirs.data.join("skills"), SkillOrigin::User),
@@ -97,9 +130,11 @@ pub fn discover(dirs: &Dirs, root: &Path, workspace: Option<WorkspaceId>) -> Ski
         } else {
             SkillOrigin::User
         };
-        for mut def in read_dir_of_skills(&plugin.root.join("skills"), origin, &mut problems) {
-            def.name = format!("{}:{}", plugin.id, def.name);
-            by_name.insert(def.name.clone(), def);
+        for dir in &plugin.skill_dirs {
+            for mut def in read_plugin_skills(dir, &plugin.id, origin, &mut problems) {
+                def.name = format!("{}:{}", plugin.id, def.name);
+                by_name.insert(def.name.clone(), def);
+            }
         }
     }
 
@@ -113,6 +148,30 @@ pub fn discover(dirs: &Dirs, root: &Path, workspace: Option<WorkspaceId>) -> Ski
         found.truncate(MAX_SKILLS);
     }
     Skills { found, problems }
+}
+
+/// Reads the skills a manifest pointed at.
+///
+/// One of those directories can be the plugin root itself — `skills: ["./"]` says exactly that — so
+/// a `SKILL.md` sitting directly in the directory counts as one skill there, named after the plugin
+/// when the frontmatter does not name it.
+fn read_plugin_skills(
+    dir: &Path,
+    fallback_name: &str,
+    origin: SkillOrigin,
+    problems: &mut Vec<String>,
+) -> Vec<SkillDef> {
+    let file = dir.join("SKILL.md");
+    if file.is_file() {
+        return match read_skill(&file, fallback_name, origin) {
+            Ok(def) => vec![def],
+            Err(why) => {
+                problems.push(format!("failed to load {}: {why}", file.display()));
+                Vec::new()
+            }
+        };
+    }
+    read_dir_of_skills(dir, origin, problems)
 }
 
 fn read_dir_of_skills(
@@ -161,7 +220,41 @@ fn read_skill(file: &Path, fallback_name: &str, origin: SkillOrigin) -> Result<S
         ));
     }
     let text = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    parse_skill(&text, fallback_name, origin, file.to_path_buf())
+}
+
+/// Seeded first so a user or workspace skill of the same name still wins: overriding the guide is
+/// a legitimate thing to want, and the conflict is reported like any other.
+fn seed_builtin(by_name: &mut BTreeMap<String, SkillDef>, problems: &mut Vec<String>) {
+    match parse_skill(
+        BUILTIN_SKILL.text,
+        BUILTIN_SKILL.name,
+        SkillOrigin::Builtin,
+        builtin_path(BUILTIN_SKILL.name),
+    ) {
+        Ok(def) => {
+            by_name.insert(def.name.clone(), def);
+        }
+        Err(why) => problems.push(format!(
+            "built-in skill {} is malformed: {why}",
+            BUILTIN_SKILL.name
+        )),
+    }
+}
+
+/// The synthetic path a built-in reports. It names where the definition came from without
+/// pretending there is a file to edit — the same convention the built-in templates use.
+fn builtin_path(name: &str) -> PathBuf {
+    PathBuf::from(format!("<builtin>/skills/{name}/SKILL.md"))
+}
+
+fn parse_skill(
+    text: &str,
+    fallback_name: &str,
+    origin: SkillOrigin,
+    path: PathBuf,
+) -> Result<SkillDef, String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let front = frontmatter(text)
         .ok_or("the file does not start with a `---`-delimited YAML frontmatter")?;
     let parsed: Frontmatter =
@@ -170,7 +263,7 @@ fn read_skill(file: &Path, fallback_name: &str, origin: SkillOrigin) -> Result<S
     let description = parsed
         .description
         .or(parsed.when_to_use)
-        .map(|d| trim_to(d.trim(), MAX_DESCRIPTION_CHARS))
+        .map(|d| trim_to(&fold_whitespace(d.trim()), MAX_DESCRIPTION_CHARS))
         .filter(|d| !d.is_empty())
         .ok_or(
             "no description in the frontmatter (the model uses it to decide when to load the \
@@ -178,9 +271,21 @@ fn read_skill(file: &Path, fallback_name: &str, origin: SkillOrigin) -> Result<S
         )?;
     reject_invisible(&description, "description")?;
 
+    let descriptions: BTreeMap<String, String> = parsed
+        .descriptions
+        .into_iter()
+        .filter_map(|(locale, text)| {
+            let text = trim_to(&fold_whitespace(text.trim()), MAX_DESCRIPTION_CHARS);
+            (!text.is_empty()).then_some((locale, text))
+        })
+        .collect();
+    for (locale, text) in &descriptions {
+        reject_invisible(text, &format!("description for {locale}"))?;
+    }
+
     let name = parsed
         .name
-        .map(|n| n.trim().to_string())
+        .map(|n| fold_whitespace(n.trim()))
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| fallback_name.to_string());
     reject_invisible(&name, "name")?;
@@ -188,9 +293,29 @@ fn read_skill(file: &Path, fallback_name: &str, origin: SkillOrigin) -> Result<S
     Ok(SkillDef {
         name,
         description,
-        path: file.to_path_buf(),
+        descriptions,
+        path,
         origin,
     })
+}
+
+/// Collapses a run of whitespace into single spaces.
+///
+/// Descriptions are routinely written as a YAML block scalar, so the author's line breaks arrive as
+/// part of the text. The model reads the description as one line, and folding it here is what keeps
+/// [`reject_invisible`] about smuggling rather than about formatting.
+fn fold_whitespace(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if c.is_whitespace() {
+            if !out.ends_with(' ') {
+                out.push(' ');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.trim().to_string()
 }
 
 /// Reject text a model could smuggle past a human reader: control characters and the invisible
@@ -276,6 +401,19 @@ mod tests {
         );
     }
 
+    /// The skills that came off disk. Tests below are about what a directory yields, so the
+    /// built-in guide — which is in every catalog — is filtered out rather than counted.
+    fn installed(skills: Skills) -> Skills {
+        Skills {
+            found: skills
+                .found
+                .into_iter()
+                .filter(|s| s.origin != SkillOrigin::Builtin)
+                .collect(),
+            problems: skills.problems,
+        }
+    }
+
     #[test]
     fn a_skill_is_a_name_a_description_and_a_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -287,7 +425,7 @@ mod tests {
             "---\nname: pdf-forms\ndescription: Fill and flatten PDF forms\n---\n\n# body\nlots of text\n",
         );
 
-        let skills = discover(&dirs, &root, None);
+        let skills = installed(discover(&dirs, &root, None));
         assert_eq!(skills.problems, Vec::<String>::new());
         assert_eq!(skills.found.len(), 1);
         let s = &skills.found[0];
@@ -307,7 +445,7 @@ mod tests {
             "---\nname: mute\n---\nbody\n",
         );
 
-        let skills = discover(&dirs, &tmp.path().join("repo"), None);
+        let skills = installed(discover(&dirs, &tmp.path().join("repo"), None));
         assert!(skills.found.is_empty());
         assert!(
             skills.problems[0].contains("description"),
@@ -327,6 +465,43 @@ mod tests {
         );
         let skills = discover(&dirs, &tmp.path().join("repo"), None);
         assert_eq!(skills.found[0].description, "after a release");
+    }
+
+    #[test]
+    fn a_locale_description_companions_the_one_the_model_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = dirs_under(tmp.path());
+        write_skill(
+            &dirs.data.join("skills"),
+            "x",
+            "---\nname: x\ndescription: the model reads this\ndescriptions:\n  zh-CN: 界面读这一句\n---\nbody\n",
+        );
+        let skills = discover(&dirs, &tmp.path().join("repo"), None);
+        assert_eq!(skills.found[0].description, "the model reads this");
+        assert_eq!(
+            skills.found[0]
+                .descriptions
+                .get("zh-CN")
+                .map(String::as_str),
+            Some("界面读这一句")
+        );
+    }
+
+    #[test]
+    fn the_built_in_guide_carries_both_languages() {
+        let skills = builtin_skills();
+        let guide = &skills.found[0];
+        assert_eq!(guide.name, "zlogic-guide");
+        assert!(
+            guide.descriptions.contains_key("zh-CN"),
+            "{:?}",
+            guide.descriptions
+        );
+        assert!(
+            guide.descriptions.contains_key("en-US"),
+            "{:?}",
+            guide.descriptions
+        );
     }
 
     #[test]
@@ -358,7 +533,7 @@ mod tests {
             "---\ndescription: theirs\n---\n",
         );
 
-        let skills = discover(&dirs, &root, None);
+        let skills = installed(discover(&dirs, &root, None));
         assert_eq!(skills.found.len(), 1);
         assert_eq!(skills.found[0].description, "theirs", "the repo wins");
         assert_eq!(skills.found[0].origin, SkillOrigin::Workspace);
@@ -379,7 +554,7 @@ mod tests {
             "portable",
             "---\ndescription: d\n---\n",
         );
-        assert_eq!(discover(&dirs, &root, None).found.len(), 1);
+        assert_eq!(installed(discover(&dirs, &root, None)).found.len(), 1);
     }
 
     #[test]
@@ -391,7 +566,7 @@ mod tests {
         write_plugin_skill(&dirs, "acme", "review");
 
         assert_eq!(
-            discover(&dirs, &root, Some(workspace)).found[0].name,
+            installed(discover(&dirs, &root, Some(workspace))).found[0].name,
             "acme:review"
         );
 
@@ -404,11 +579,15 @@ mod tests {
         )
         .unwrap();
         assert!(
-            discover(&dirs, &root, Some(workspace)).found.is_empty(),
+            installed(discover(&dirs, &root, Some(workspace)))
+                .found
+                .is_empty(),
             "the same plugin switch must gate its skills as well as its MCP servers"
         );
         assert_eq!(
-            discover(&dirs, &root, Some(WorkspaceId::new())).found.len(),
+            installed(discover(&dirs, &root, Some(WorkspaceId::new())))
+                .found
+                .len(),
             1,
             "a personal override must remain scoped to its workspace"
         );
@@ -417,7 +596,11 @@ mod tests {
     #[test]
     fn nothing_installed_is_not_a_problem() {
         let tmp = tempfile::tempdir().unwrap();
-        let skills = discover(&dirs_under(tmp.path()), &tmp.path().join("repo"), None);
+        let skills = installed(discover(
+            &dirs_under(tmp.path()),
+            &tmp.path().join("repo"),
+            None,
+        ));
         assert_eq!(skills, Skills::default());
     }
 
@@ -432,7 +615,7 @@ mod tests {
                 "---\ndescription: d\n---\n",
             );
         }
-        let names: Vec<String> = discover(&dirs, &tmp.path().join("repo"), None)
+        let names: Vec<String> = installed(discover(&dirs, &tmp.path().join("repo"), None))
             .found
             .iter()
             .map(|s| s.name.clone())
@@ -451,7 +634,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = dirs_under(tmp.path());
         write_skill(&dirs.data.join("skills"), "bare", "# just markdown\n");
-        let skills = discover(&dirs, &tmp.path().join("repo"), None);
+        let skills = installed(discover(&dirs, &tmp.path().join("repo"), None));
         assert!(skills.found.is_empty());
         assert!(
             skills.problems[0].contains("frontmatter"),
@@ -528,8 +711,12 @@ impl zlogic_tools::SkillHost for SessionSkills {
             .find(|s| s.name == name)
             .ok_or_else(|| format!("skill {name} is no longer in the library"))?;
 
-        let text = std::fs::read_to_string(&found.path)
-            .map_err(|e| format!("cannot read {}: {e}", found.path.display()))?;
+        // A built-in's `path` is a label, not a file, so its body comes from the binary.
+        let text = match found.origin {
+            SkillOrigin::Builtin => BUILTIN_SKILL.text.to_string(),
+            _ => std::fs::read_to_string(&found.path)
+                .map_err(|e| format!("cannot read {}: {e}", found.path.display()))?,
+        };
         let body = body_after_frontmatter(&text);
         Ok(zlogic_tools::LoadedSkill {
             name: found.name,

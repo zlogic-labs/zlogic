@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
@@ -13,18 +14,65 @@ pub const MASTER_KEY_LEN: usize = 32;
 pub const MASTER_ENV_VAR: &str = "ZLOGIC_MASTER_KEY";
 pub const MASTER_ACCOUNT: &str = "master";
 
+/// The OS keychain is opt-in on macOS and opt-out everywhere else.
+///
+/// A macOS build that is not signed with a stable identity gets a Keychain authorization dialog
+/// for every entry it touches, and there is nothing the user can click to make it stop. Everywhere
+/// else the credential store is quiet, so it stays the default.
+pub const DEFAULT_KEYCHAIN_ENABLED: bool = !cfg!(target_os = "macos");
+
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 
 static VAULT: OnceLock<RwLock<Option<SecretVault>>> = OnceLock::new();
+static KEYCHAIN: AtomicBool = AtomicBool::new(DEFAULT_KEYCHAIN_ENABLED);
 
 fn vault() -> &'static RwLock<Option<SecretVault>> {
     VAULT.get_or_init(|| RwLock::new(None))
 }
 
-pub fn init_secret_vault(master_path: PathBuf, blob_path: PathBuf) {
+/// Where a `keyring:` reference is answered from.
+///
+/// The two are separate files, so neither can read or overwrite the other's entries: turning the
+/// keychain back on brings those secrets back exactly as they were, and neither store ever has to
+/// guess what format it is looking at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Backend {
+    Keychain,
+    File,
+}
+
+fn backend() -> Backend {
+    if KEYCHAIN.load(Ordering::Relaxed) {
+        Backend::Keychain
+    } else {
+        Backend::File
+    }
+}
+
+/// Point the process at a store. Read once per vault, when it first loads: both paths are handed to
+/// [`init_secret_vault`], so switching backends is a restart rather than a re-read, and a secret
+/// written after the switch cannot land in the store the other backend reads.
+pub fn set_keychain_enabled(on: bool) {
+    KEYCHAIN.store(on, Ordering::Relaxed);
+}
+
+pub fn init_secret_vault(encrypted: EncryptedPaths, plain: PathBuf) {
     *vault().write().expect("secret vault lock poisoned") =
-        Some(SecretVault::new(master_path, blob_path));
+        Some(SecretVault::with_paths(encrypted, plain));
+}
+
+/// The encrypted store's two files: the master key and the ciphertext.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncryptedPaths {
+    pub master: PathBuf,
+    pub blob: PathBuf,
+}
+
+impl EncryptedPaths {
+    pub fn new(master: PathBuf, blob: PathBuf) -> Self {
+        Self { master, blob }
+    }
 }
 
 pub fn secret_vault_initialized() -> bool {
@@ -122,7 +170,10 @@ fn parse_master_hex(hex: &str) -> Option<[u8; MASTER_KEY_LEN]> {
 
 // ─────────────────────────── master key ───────────────────────────
 
-fn load_or_create_master(master_path: &Path) -> Result<[u8; MASTER_KEY_LEN], CredentialError> {
+fn load_or_create_master(
+    master_path: &Path,
+    backend: Backend,
+) -> Result<[u8; MASTER_KEY_LEN], CredentialError> {
     if let Some(hex) = std::env::var(MASTER_ENV_VAR)
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -135,7 +186,9 @@ fn load_or_create_master(master_path: &Path) -> Result<[u8; MASTER_KEY_LEN], Cre
         });
     }
 
-    if let Some(key) = keychain_master() {
+    if backend == Backend::Keychain
+        && let Some(key) = keychain_master()
+    {
         return Ok(key);
     }
 
@@ -146,7 +199,7 @@ fn load_or_create_master(master_path: &Path) -> Result<[u8; MASTER_KEY_LEN], Cre
     }
 
     let key = generate_master_key();
-    persist_master(&key, master_path)?;
+    persist_master(&key, master_path, backend)?;
     Ok(key)
 }
 
@@ -172,10 +225,16 @@ fn keychain_master() -> Option<[u8; MASTER_KEY_LEN]> {
         .and_then(|hex| parse_master_hex(&hex))
 }
 
-fn persist_master(key: &[u8; MASTER_KEY_LEN], master_path: &Path) -> Result<(), CredentialError> {
-    let hex = to_hex(key);
-    if keychain_entry().is_some_and(|entry| entry.set_password(&hex).is_ok()) {
-        return Ok(());
+fn persist_master(
+    key: &[u8; MASTER_KEY_LEN],
+    master_path: &Path,
+    backend: Backend,
+) -> Result<(), CredentialError> {
+    if backend == Backend::Keychain {
+        let hex = to_hex(key);
+        if keychain_entry().is_some_and(|entry| entry.set_password(&hex).is_ok()) {
+            return Ok(());
+        }
     }
     write_master_file(master_path, key)
 }
@@ -198,11 +257,16 @@ fn write_master_file(
 
 // ─────────────────────────── blob ───────────────────────────
 
+/// The secret table of whichever store is in force.
+///
+/// `master` is `None` in file mode, where the table is stored as plain JSON — the point of turning
+/// the keychain off is that there is no key to prompt for, and a key kept beside its ciphertext
+/// protects nothing.
 fn load_blob(
-    master: &[u8; MASTER_KEY_LEN],
+    master: Option<&[u8; MASTER_KEY_LEN]>,
     blob_path: &Path,
 ) -> Result<BTreeMap<String, String>, CredentialError> {
-    let enc = match std::fs::read(blob_path) {
+    let bytes = match std::fs::read(blob_path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(e) => {
@@ -212,20 +276,31 @@ fn load_blob(
             });
         }
     };
-    let plain = decrypt(master, &enc)?;
+    // An empty file is not a corrupt one: it is what an interrupted write or a deliberately
+    // truncated file leaves, and it holds no secrets to lose.
+    if bytes.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let plain = match master {
+        Some(master) => decrypt(master, &bytes)?,
+        None => bytes,
+    };
     serde_json::from_slice(&plain).map_err(|e| {
         CredentialError::Crypto(format!("blob content is not a valid secret table: {e}"))
     })
 }
 
 fn save_blob(
-    master: &[u8; MASTER_KEY_LEN],
+    master: Option<&[u8; MASTER_KEY_LEN]>,
     blob_path: &Path,
     keys: &BTreeMap<String, String>,
 ) -> Result<(), CredentialError> {
     let plain = serde_json::to_vec(keys)
         .map_err(|e| CredentialError::Crypto(format!("failed to serialize secret table: {e}")))?;
-    let enc = encrypt(master, &plain)?;
+    let bytes = match master {
+        Some(master) => encrypt(master, &plain)?,
+        None => plain,
+    };
 
     if let Some(parent) = blob_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| CredentialError::Io {
@@ -234,7 +309,7 @@ fn save_blob(
         })?;
     }
     let tmp = blob_path.with_extension("enc.tmp");
-    write_private(&tmp, &enc).map_err(|e| CredentialError::Io {
+    write_private(&tmp, &bytes).map_err(|e| CredentialError::Io {
         path: tmp.clone(),
         reason: e.to_string(),
     })?;
@@ -268,44 +343,88 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 pub struct SecretVault {
-    master_path: PathBuf,
-    blob_path: PathBuf,
+    encrypted: EncryptedPaths,
+    plain_path: PathBuf,
     state: RwLock<VaultState>,
 }
 
 #[derive(Default)]
 struct VaultState {
-    loaded: bool,
+    /// The backend `keys` was read from. `None` until the first load. Comparing it against the
+    /// backend in force *now* is what makes a switch visible — the two stores live in different
+    /// files, so the answer is only ever "re-read from the other path".
+    from: Option<Backend>,
     error: Option<String>,
     keys: BTreeMap<String, String>,
 }
 
 impl SecretVault {
+    /// The encrypted store alone, for tests that only exercise it. The plaintext store needs its
+    /// own file, so production code goes through [`SecretVault::with_paths`].
     pub fn new(master_path: PathBuf, blob_path: PathBuf) -> Self {
+        Self::with_paths(
+            EncryptedPaths::new(master_path, blob_path),
+            PathBuf::from("unused-plain-store"),
+        )
+    }
+
+    pub fn with_paths(encrypted: EncryptedPaths, plain_path: PathBuf) -> Self {
         Self {
-            master_path,
-            blob_path,
+            encrypted,
+            plain_path,
             state: RwLock::new(VaultState::default()),
         }
     }
 
-    fn ensure_loaded_locked(
-        state: &mut VaultState,
-        master_path: &Path,
-        blob_path: &Path,
-    ) -> Result<(), CredentialError> {
-        if state.loaded {
-            return match &state.error {
-                Some(reason) => Err(CredentialError::MasterKey {
-                    reason: reason.clone(),
-                }),
-                None => Ok(()),
-            };
+    fn path_for(&self, backend: Backend) -> &Path {
+        match backend {
+            Backend::Keychain => &self.encrypted.blob,
+            Backend::File => &self.plain_path,
         }
-        state.loaded = true;
-        match load_or_create_master(master_path).and_then(|master| load_blob(&master, blob_path)) {
+    }
+
+    /// Drop the table when the backend has changed under us, so the next read comes from the store
+    /// that is now in force. Nothing is migrated: each store keeps its own entries, which is why
+    /// turning the keychain back on finds those secrets exactly where they were.
+    fn reload_if_backend_changed(&self) {
+        let wanted = backend();
+        {
+            let state = self.state.read().expect("secret vault state poisoned");
+            if state.from.is_none() || state.from == Some(wanted) {
+                return;
+            }
+        }
+        let mut state = self.state.write().expect("secret vault state poisoned");
+        if state.from != Some(wanted) {
+            *state = VaultState::default();
+        }
+    }
+
+    /// Read the whole table from disk under `backend`.
+    fn load(&self, backend: Backend) -> Result<BTreeMap<String, String>, CredentialError> {
+        match backend {
+            Backend::Keychain => load_or_create_master(&self.encrypted.master, backend)
+                .and_then(|master| load_blob(Some(&master), &self.encrypted.blob)),
+            Backend::File => load_blob(None, &self.plain_path),
+        }
+    }
+
+    fn ensure_loaded(&self) -> Result<(), CredentialError> {
+        self.reload_if_backend_changed();
+        let mut state = self.state.write().expect("secret vault state poisoned");
+        if let Some(reason) = &state.error {
+            return Err(CredentialError::MasterKey {
+                reason: reason.clone(),
+            });
+        }
+        if state.from.is_some() {
+            return Ok(());
+        }
+        let wanted = backend();
+        match self.load(wanted) {
             Ok(keys) => {
                 state.keys = keys;
+                state.from = Some(wanted);
                 Ok(())
             }
             Err(e) => {
@@ -313,11 +432,6 @@ impl SecretVault {
                 Err(e)
             }
         }
-    }
-
-    fn ensure_loaded(&self) -> Result<(), CredentialError> {
-        let mut state = self.state.write().expect("secret vault state poisoned");
-        Self::ensure_loaded_locked(&mut state, &self.master_path, &self.blob_path)
     }
 
     pub fn get(&self, name: &str) -> Option<String> {
@@ -331,36 +445,41 @@ impl SecretVault {
     }
 
     pub fn set(&self, name: &str, secret: &str) -> Result<(), CredentialError> {
-        let mut state = self.state.write().expect("secret vault state poisoned");
-        Self::ensure_loaded_locked(&mut state, &self.master_path, &self.blob_path)?;
-
-        let mut keys = std::mem::take(&mut state.keys);
-        keys.insert(name.to_string(), secret.to_string());
-        let master = load_or_create_master(&self.master_path)?;
-        if let Err(e) = save_blob(&master, &self.blob_path, &keys) {
-            state.keys = keys;
-            return Err(e);
-        }
-        state.keys = keys;
-        state.error = None;
-        Ok(())
+        self.write(name, Some(secret))
     }
 
     pub fn delete(&self, name: &str) -> Result<(), CredentialError> {
-        let mut state = self.state.write().expect("secret vault state poisoned");
-        Self::ensure_loaded_locked(&mut state, &self.master_path, &self.blob_path)?;
+        self.write(name, None)
+    }
 
-        if !state.keys.contains_key(name) {
+    /// `Some` stores, `None` removes. Removing a name this store has never held is a no-op rather
+    /// than an error: the entry may live in the other store, and it is already gone as far as this
+    /// one is concerned.
+    fn write(&self, name: &str, secret: Option<&str>) -> Result<(), CredentialError> {
+        self.ensure_loaded()?;
+        let mut state = self.state.write().expect("secret vault state poisoned");
+
+        // Read after `ensure_loaded`: if the switch moved under us, the table in hand is the one
+        // from the store now in force, and this write belongs in that store's file.
+        let wanted = backend();
+        if secret.is_none() && !state.keys.contains_key(name) {
             return Ok(());
         }
         let mut keys = std::mem::take(&mut state.keys);
-        keys.remove(name);
-        let master = load_or_create_master(&self.master_path)?;
-        if let Err(e) = save_blob(&master, &self.blob_path, &keys) {
+        match secret {
+            Some(value) => keys.insert(name.to_string(), value.to_string()),
+            None => keys.remove(name),
+        };
+        let master = match wanted {
+            Backend::Keychain => Some(load_or_create_master(&self.encrypted.master, wanted)?),
+            Backend::File => None,
+        };
+        if let Err(e) = save_blob(master.as_ref(), self.path_for(wanted), &keys) {
             state.keys = keys;
             return Err(e);
         }
         state.keys = keys;
+        state.from = Some(wanted);
         state.error = None;
         Ok(())
     }
@@ -466,8 +585,9 @@ mod tests {
                 .any(|w| w == b"sk-super-secret"),
             "plaintext must never appear in the blob"
         );
-        let master = load_or_create_master(&tmp.path().join("security/.master")).unwrap();
-        let map = load_blob(&master, &blob_path).unwrap();
+        let master =
+            load_or_create_master(&tmp.path().join("security/.master"), Backend::Keychain).unwrap();
+        let map = load_blob(Some(&master), &blob_path).unwrap();
         assert_eq!(
             map.get("openai").map(String::as_str),
             Some("sk-super-secret")
@@ -501,8 +621,11 @@ mod tests {
     fn global_registration_routes_keyring_ops() {
         let tmp = tempfile::tempdir().unwrap();
         init_secret_vault(
-            tmp.path().join("security/.master"),
-            tmp.path().join("security/.key.enc"),
+            EncryptedPaths::new(
+                tmp.path().join("security/.master"),
+                tmp.path().join("security/.key.enc"),
+            ),
+            tmp.path().join("security/.key.json"),
         );
         assert!(secret_vault_initialized());
 

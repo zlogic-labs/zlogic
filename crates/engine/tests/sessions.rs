@@ -1086,12 +1086,12 @@ async fn turn_items_carry_the_cards_rendered_in_that_turn() {
     let first = objects.put(b"widget one").unwrap();
     let second = objects.put(b"widget two").unwrap();
     let third = objects.put(b"widget three").unwrap();
-    let card = |object_id: &zlogic_objects::ObjectId, title: &str| {
+    let card = |object_id: &zlogic_objects::ObjectId| {
         zlogic_objects::ObjectRef::classified(
             object_id.clone(),
             zlogic_objects::ObjectRole::Output,
             "widget",
-            Some(title.into()),
+            None,
             Some(serde_json::json!({ "height": 360, "libraries": ["chart"] }).to_string()),
         )
     };
@@ -1117,8 +1117,8 @@ async fn turn_items_carry_the_cards_rendered_in_that_turn() {
                     EntryKind::ToolResult,
                     serde_json::json!({ "summary": "charts" }),
                 )
-                .references(card(&first, "Revenue"))
-                .references(card(&second, "Churn")),
+                .references(card(&first))
+                .references(card(&second)),
             )
             .unwrap();
         db.entries()
@@ -1130,7 +1130,7 @@ async fn turn_items_carry_the_cards_rendered_in_that_turn() {
                     EntryKind::ToolResult,
                     serde_json::json!({ "summary": "chart" }),
                 )
-                .references(card(&third, "Margin")),
+                .references(card(&third)),
             )
             .unwrap();
     });
@@ -1158,19 +1158,16 @@ async fn turn_items_carry_the_cards_rendered_in_that_turn() {
     assert_eq!(
         one.widgets
             .iter()
-            .map(|w| (w.object_id.as_str(), w.title.as_str()))
+            .map(|w| w.object_id.as_str())
             .collect::<Vec<_>>(),
-        [
-            (first.to_string().as_str(), "Revenue"),
-            (second.to_string().as_str(), "Churn"),
-        ]
+        [first.to_string().as_str(), second.to_string().as_str(),]
     );
     assert_eq!(one.widgets[0].height, 360);
     assert_eq!(one.widgets[0].libraries, vec!["chart".to_string()]);
 
     let two = turn(2);
     assert_eq!(two.widgets.len(), 1);
-    assert_eq!(two.widgets[0].title, "Margin");
+    assert_eq!(two.widgets[0].object_id, third.to_string());
 
     assert!(one.answer.is_some() && !one.widgets.is_empty());
 }
@@ -1268,4 +1265,107 @@ async fn a_compaction_only_turn_carries_its_summary_on_the_row() {
     let one = turn_of(1);
     assert!(one.compaction.is_none());
     assert!(one.answer.is_some());
+}
+
+#[tokio::test]
+async fn a_turn_opened_by_a_task_notification_carries_it_on_the_row() {
+    let rig = Rig::new();
+    let id = rig.open_new().await;
+    rig.say(id, 1, "start something in the background", "it is running");
+
+    /* Turn 2 is what the engine does when that task finishes: the notification is its input, the
+     * model answers, and a second task reports in while the answer is already being written. */
+    let turn = TurnId::new();
+    let update = |task: &str, state: &str| {
+        serde_json::json!(zlogic_protocol::TaskUpdatePart {
+            task_id: task.into(),
+            state: state.into(),
+            summary: Some("a conclusion".into()),
+            child_session_id: None,
+            command: None,
+            preview: None,
+            cwd: None,
+            agent: Some("reviewer".into()),
+            source: Some("tool".into()),
+            job_title: None,
+        })
+    };
+    let text = |t: &str| {
+        serde_json::to_value(ContentPart::Text(TextPart {
+            text: t.into(),
+            raw: None,
+            truncated: false,
+        }))
+        .unwrap()
+    };
+    rig.store.with(|db| {
+        db.entries()
+            .append(NewEntry::new(
+                id,
+                turn,
+                2,
+                EntryKind::TaskUpdate,
+                update("task-1", "succeeded"),
+            ))
+            .unwrap();
+        db.entries()
+            .append(NewEntry::new(
+                id,
+                turn,
+                2,
+                EntryKind::AssistantText,
+                text("folded in"),
+            ))
+            .unwrap();
+        // A later notification: the turn was already answering, so it did not open this turn.
+        db.entries()
+            .append(NewEntry::new(
+                id,
+                turn,
+                2,
+                EntryKind::TaskUpdate,
+                update("task-2", "failed"),
+            ))
+            .unwrap();
+        db.entries()
+            .append_turn_end(
+                NewEntry::new(
+                    id,
+                    turn,
+                    2,
+                    EntryKind::Event,
+                    serde_json::json!({ "type": "turn_end", "status": "completed" }),
+                ),
+                &MemoryObjectStore::default(),
+            )
+            .unwrap();
+    });
+
+    let page = rig
+        .sessions
+        .turns(zlogic_protocol::query::TurnsReq {
+            session_id: id,
+            after_turn_seq: None,
+            offset: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    let turn_of = |seq: u32| page.items.iter().find(|t| t.turn_seq == seq).unwrap();
+
+    let two = turn_of(2);
+    assert!(
+        two.user.is_empty(),
+        "a woken turn has no user message — that is exactly why the row needs the wake"
+    );
+    assert_eq!(
+        two.wakes
+            .iter()
+            .map(|w| (w.task_id.as_str(), w.state.as_str(), w.agent.as_deref()))
+            .collect::<Vec<_>>(),
+        [("task-1", "succeeded", Some("reviewer"))],
+        "only the notification that opened the turn belongs on the row"
+    );
+    assert!(two.detail);
+    assert!(turn_of(1).wakes.is_empty());
 }

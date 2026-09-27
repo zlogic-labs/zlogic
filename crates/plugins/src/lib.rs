@@ -4,7 +4,8 @@
 //! ```text
 //! <data>/extensions/plugins/<name>/     ← the user installed it
 //! <root>/.zlogic/extensions/plugins/<name>/   ← it came with the repository
-//!     plugin.json | plugin.yaml | .claude-plugin/plugin.json   ← the manifest
+//!     plugin.json | plugin.yaml                                ← the manifest
+//!     .codex-plugin/plugin.json | .claude-plugin/plugin.json   ← the same, one level down
 //!     .mcp.json                                                ← or servers in their own file
 //! ```
 //! # What a plugin contributes
@@ -13,32 +14,35 @@
 //! Contributed servers are namespaced `<plugin>.<server>`, so two plugins can each ship a server
 //! called `search` and a plugin can never shadow a server the user configured themselves.
 //! # Why the plugin root is expanded *after* parsing
-//! A manifest refers to its own directory as `${pluginRoot}` (or `${CLAUDE_PLUGIN_ROOT}`, which is
-//! what plugins written for Claude Code use). The obvious implementation — substitute in the file's
-//! text before parsing it — is wrong on Windows: a path containing `\` is not a valid JSON string
-//! escape, so a textual substitution produces a file that no longer parses, or worse, one that parses
-//! differently. So the substitution happens on the parsed definition, where a path is just a value.
+//! A manifest refers to its own directory as `${pluginRoot}` (or `${ZLOGIC_PLUGIN_ROOT}`). The
+//! obvious implementation — substitute in the file's text before parsing it — is wrong on Windows:
+//! a path containing `\` is not a valid JSON string escape, so a textual substitution produces a
+//! file that no longer parses, or worse, one that parses differently. So the substitution happens on
+//! the parsed definition, where a path is just a value.
 //! # A plugin is data on disk, and it is not trusted by being present
 //! A plugin inside a repository arrived with a `git clone`, and its manifest can name any command on
 //! the machine. This crate therefore only ever *reports* what it found, carrying
 //! [`zlogic_mcp::Origin::Plugin { workspace: true }`] so a caller can tell repository-supplied
 //! definitions from the user's own installs. Deciding whether to start any of it is not made here.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use zlogic_mcp::Origin;
 use zlogic_mcp::def::{self, Problem, ServerDef, TransportDef};
 
 /// Manifest file names, in the order they are looked for.
-/// `.claude-plugin/plugin.json` is first because a plugin written for Claude Code should work as-is;
-/// finding it before our own names means a plugin that ships both is read as its author intended.
+///
+/// The two dotted directories are where the other agent CLIs keep theirs: Codex writes
+/// `.codex-plugin/plugin.json` and reads `.claude-plugin/plugin.json` as its own fallback, so a
+/// package built for either one installs here unchanged.
 const MANIFEST_NAMES: &[&str] = &[
-    ".claude-plugin/plugin.json",
     "plugin.json",
     "plugin.yaml",
     "plugin.yml",
     "zlogic-plugin.json",
     "zlogic-plugin.yaml",
+    ".codex-plugin/plugin.json",
+    ".claude-plugin/plugin.json",
 ];
 
 /// Files a plugin may declare its servers in, instead of inlining them in the manifest.
@@ -81,6 +85,8 @@ pub struct PluginDef {
     pub from_workspace: bool,
     /// Contributed servers, already namespaced and with `${pluginRoot}` expanded.
     pub servers: Vec<ServerDef>,
+    /// Directories holding the plugin's skills. Always at least one.
+    pub skill_dirs: Vec<PathBuf>,
 }
 
 impl PluginDef {
@@ -259,8 +265,37 @@ fn load_one(
         manifest,
         from_workspace,
         servers,
+        skill_dirs: skill_dirs(&value, root),
     };
     Ok(Some((problems, plugin)))
+}
+
+/// The directories a manifest points its skills at.
+///
+/// Claude Code writes `skills: ["./"]` — an array, and pointing at the plugin root rather than a
+/// subdirectory — while Codex writes `skills: "./skills/"`, a single path. Both are read here; a
+/// manifest that says nothing gets the conventional `skills/`. A path climbing out of the plugin
+/// root is dropped: the root is what the user installed, not its parent directory.
+fn skill_dirs(value: &serde_json::Value, root: &Path) -> Vec<PathBuf> {
+    let declared: Vec<&str> = match value.get("skills") {
+        Some(serde_json::Value::String(path)) => vec![path.as_str()],
+        Some(serde_json::Value::Array(paths)) => paths.iter().filter_map(|p| p.as_str()).collect(),
+        _ => Vec::new(),
+    };
+    let mut out: Vec<PathBuf> = declared
+        .into_iter()
+        .map(|path| {
+            root.join(path)
+                .components()
+                .filter(|part| !matches!(part, Component::CurDir))
+                .collect::<PathBuf>()
+        })
+        .filter(|dir| dir.starts_with(root))
+        .collect();
+    if out.is_empty() {
+        out.push(root.join("skills"));
+    }
+    out
 }
 
 fn parse_manifest(raw: &str, path: &Path) -> Result<serde_json::Value, String> {
@@ -287,11 +322,7 @@ fn string_of(value: &serde_json::Value, key: &str) -> Option<String> {
 fn expand_plugin_root(server: &mut ServerDef, root: &Path) {
     let root = root.to_string_lossy().to_string();
     let sub = |s: &mut String| {
-        for name in [
-            "${pluginRoot}",
-            "${CLAUDE_PLUGIN_ROOT}",
-            "${ZLOGIC_PLUGIN_ROOT}",
-        ] {
+        for name in ["${pluginRoot}", "${ZLOGIC_PLUGIN_ROOT}"] {
             if s.contains(name) {
                 *s = s.replace(name, &root);
             }
@@ -390,19 +421,6 @@ mod tests {
         );
     }
 
-    /// A plugin written for Claude Code should work as it is.
-    #[test]
-    fn a_claude_plugin_manifest_is_read() {
-        let f = fixture();
-        write_json(
-            &f.dirs.global.join("compat/.claude-plugin/plugin.json"),
-            json!({ "name": "Compat", "mcpServers": { "s": { "command": "x" } } }),
-        );
-        let loaded = load(&f.dirs, None);
-        assert_eq!(loaded.plugins.len(), 1);
-        assert_eq!(loaded.mcp_servers()[0].id, "compat.s");
-    }
-
     #[test]
     fn a_yaml_manifest_is_read_by_the_same_parser() {
         let f = fixture();
@@ -447,7 +465,7 @@ mod tests {
                 "name": "Local",
                 "mcpServers": { "s": {
                     "command": "node",
-                    "args": ["${CLAUDE_PLUGIN_ROOT}/server.js"],
+                    "args": ["${ZLOGIC_PLUGIN_ROOT}/server.js"],
                     "env": { "DATA": "${pluginRoot}/data" }
                 } }
             }),

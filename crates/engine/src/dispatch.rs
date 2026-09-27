@@ -219,12 +219,20 @@ pub struct Dispatcher {
     delivered: Arc<Mutex<DeliveredKeys>>,
     agents: Arc<Vec<String>>,
     worktrees: Option<Arc<crate::Worktrees>>,
+    /// Kept concrete rather than as the [`zlogic_tools::CheckpointHost`] the turn sees: a host
+    /// that renders a timeline needs `list` and `plan_restore`, which the capture contract does
+    /// not carry.
+    checkpoints: Option<Arc<zlogic_checkpoints::Checkpoints>>,
     prompts: Option<Arc<crate::SystemPrompts>>,
     skills: Option<Arc<crate::SkillLibrary>>,
     extensions: Option<Arc<crate::Extensions>>,
     /// Non-conversational calls such as automatic title refinement.
     auxiliary: Option<Arc<crate::Auxiliary>>,
     dirs: Option<zlogic_config::Dirs>,
+    /// The shell bootstrap resolved, carried so a workspace can rebudget it. Re-resolving here
+    /// would probe the platform again and could land on a different backend than the registry's,
+    /// so the tool, its definition text and the policy dialect would disagree.
+    shell: Option<zlogic_tools::Shell>,
 }
 
 #[derive(Default)]
@@ -276,16 +284,23 @@ impl Dispatcher {
             delivered: Arc::new(Mutex::new(DeliveredKeys::default())),
             agents: Arc::new(Vec::new()),
             worktrees: None,
+            checkpoints: None,
             prompts: None,
             skills: None,
             extensions: None,
             auxiliary: None,
             dirs: None,
+            shell: None,
         }
     }
 
     pub fn with_dirs(mut self, dirs: zlogic_config::Dirs) -> Self {
         self.dirs = Some(dirs);
+        self
+    }
+
+    pub fn with_shell(mut self, shell: zlogic_tools::Shell) -> Self {
+        self.shell = Some(shell);
         self
     }
 
@@ -297,6 +312,18 @@ impl Dispatcher {
     pub fn with_worktrees(mut self, worktrees: Arc<crate::Worktrees>) -> Self {
         self.worktrees = Some(worktrees);
         self
+    }
+
+    /// Wires in the checkpoint store. Without it a turn takes no restore points, which is the
+    /// right behaviour for a host that has nowhere to put them.
+    pub fn with_checkpoints(mut self, checkpoints: Arc<zlogic_checkpoints::Checkpoints>) -> Self {
+        self.checkpoints = Some(checkpoints);
+        self
+    }
+
+    /// The checkpoint store, for a host that lists snapshots and restores one.
+    pub fn checkpoints(&self) -> Option<&Arc<zlogic_checkpoints::Checkpoints>> {
+        self.checkpoints.as_ref()
     }
 
     pub fn with_skills(mut self, skills: Arc<crate::SkillLibrary>) -> Self {
@@ -490,11 +517,71 @@ impl Dispatcher {
         Ok(normalized)
     }
 
+    /// The registry a turn in this workspace runs with: whatever the extensions assembled, or the
+    /// shared base when there are none, with the shell rebudgeted to the workspace's own limits.
+    ///
+    /// A workspace with no extensions is the common case, so the rebudgeting cannot live inside
+    /// `Extensions::tools_for` — a registry built by falling back to the base one would skip it,
+    /// and the config would work in exactly the setups nobody tests.
+    fn workspace_tools(
+        &self,
+        tools: Option<zlogic_tools::ToolRegistry>,
+        root: &Path,
+    ) -> (zlogic_tools::ToolRegistry, Vec<String>) {
+        let mut tools = tools.unwrap_or_else(|| self.services.tools.clone());
+        let warnings = self.apply_workspace_shell(&mut tools, root);
+        (tools, warnings)
+    }
+
+    /// Swaps in a copy of the shell tool carrying this workspace's budgets. Returns the reasons a
+    /// workspace's numbers were not used, so the caller can tell the user instead of leaving them
+    /// to find out when a suite is killed at the default.
+    fn apply_workspace_shell(
+        &self,
+        tools: &mut zlogic_tools::ToolRegistry,
+        root: &Path,
+    ) -> Vec<String> {
+        let Some(shell) = &self.shell else {
+            return Vec::new();
+        };
+        let (overrides, mut warnings) = crate::shell_budgets::load(root);
+        let Some(overrides) = overrides else {
+            return warnings;
+        };
+        let merged = overrides.apply(&self.router.config().tools.shell);
+        if let Err(error) = merged.validate() {
+            warnings.push(format!(
+                "shell budgets in {}/.zlogic/settings.yaml are inconsistent and were not applied: \
+                 {error}",
+                root.display()
+            ));
+            return warnings;
+        }
+        let budgets = zlogic_tools::ShellBudgets::from(&merged);
+        tools.add(Arc::new(shell.with_budgets(budgets)));
+        warnings
+    }
+
+    /// Surfaces a workspace's rejected shell budgets to the user. Silent refusal is the failure
+    /// mode worth avoiding: a suite killed at the default looks like a flaky suite.
+    fn shell_notices(warnings: Vec<String>) -> Vec<zlogic_core::PlanNotice> {
+        warnings
+            .into_iter()
+            .map(|message| zlogic_core::PlanNotice {
+                level: NoticeLevel::Warn,
+                code: "shell_budgets_ignored".into(),
+                message,
+                args: Default::default(),
+            })
+            .collect()
+    }
+
     fn assemble_turn_prompt(
         &self,
         plan: &mut TurnPlan,
         tools: Option<&zlogic_tools::ToolRegistry>,
         workspace_id: WorkspaceId,
+        session_id: SessionId,
         root: &Path,
         exec_cwd: &Path,
         unavailable_mcp: &[String],
@@ -550,6 +637,7 @@ impl Dispatcher {
         let effectful = effective_registry.any_effectful(&names);
         plan.system = prompts.build(crate::PromptRequest {
             workspace_id,
+            session_id: Some(session_id),
             root,
             exec_cwd,
             tools: &names,
@@ -639,7 +727,7 @@ impl Dispatcher {
             // conversation is re-billed at full price — the exact cost this path avoids.
             let mut plan = plan;
             let mut unavailable_mcp: Vec<String> = Vec::new();
-            let tools = match &extensions {
+            let assembled = match &extensions {
                 Some(ext) => {
                     let assembled = ext
                         .tools_for(workspace_id, &root, &services.tools, Some(context_window))
@@ -650,10 +738,14 @@ impl Dispatcher {
                 }
                 None => None,
             };
+            let (tools, shell_warnings) = next_dispatch.workspace_tools(assembled, &root);
+            plan.notices.extend(Self::shell_notices(shell_warnings));
+            let tools = Some(tools);
             next_dispatch.assemble_turn_prompt(
                 &mut plan,
                 tools.as_ref(),
                 workspace_id,
+                session_id,
                 &root,
                 &exec_dir,
                 &unavailable_mcp,
@@ -878,7 +970,7 @@ impl Dispatcher {
             );
             let mut plan = plan;
             let mut unavailable_mcp: Vec<String> = Vec::new();
-            let tools = match &extensions {
+            let assembled = match &extensions {
                 Some(ext) => {
                     let assembled = ext
                         .tools_for(workspace_id, &root, &services.tools, Some(context_window))
@@ -897,11 +989,15 @@ impl Dispatcher {
                 }
                 None => None,
             };
+            let (tools, shell_warnings) = next_dispatch.workspace_tools(assembled, &root);
+            plan.notices.extend(Self::shell_notices(shell_warnings));
+            let tools = Some(tools);
 
             next_dispatch.assemble_turn_prompt(
                 &mut plan,
                 tools.as_ref(),
                 workspace_id,
+                session_id,
                 &root,
                 &exec_dir,
                 &unavailable_mcp,
@@ -917,6 +1013,12 @@ impl Dispatcher {
                 Arc::new(HubSink(hub.clone())) as Arc<dyn EventSink>,
             )
             .with_worktree(worktree)
+            .with_checkpoints(
+                next_dispatch
+                    .checkpoints
+                    .clone()
+                    .map(|store| store as Arc<dyn zlogic_tools::CheckpointHost>),
+            )
             .with_skills(skills)
             .with_tools(tools.clone())
             .with_hooks(hooks);
@@ -1408,7 +1510,7 @@ impl crate::task::ScheduledAgentFactory for Dispatcher {
             }
             resolved_profiles.push((name.clone(), routed, custom_this));
         }
-        let (tools, unavailable_mcp) = match &self.extensions {
+        let (assembled, unavailable_mcp) = match &self.extensions {
             Some(extensions) => {
                 let assembled = extensions
                     .tools_for(workspace_id, &root, &self.services.tools, context_window)
@@ -1417,9 +1519,13 @@ impl crate::task::ScheduledAgentFactory for Dispatcher {
             }
             None => (None, Vec::new()),
         };
+        let (tools, shell_warnings) = self.workspace_tools(assembled, &root);
+        for warning in shell_warnings {
+            tracing::warn!(target: "zlogic::engine", "{warning}");
+        }
         let mut system = Vec::new();
         if let Some(prompts) = &self.prompts {
-            let effective_registry = tools.as_ref().unwrap_or(&self.services.tools);
+            let effective_registry = &tools;
             let mut names = effective_registry.available_names();
             if let Some(allow) = &workspace_tools {
                 names.retain(|name| allow.contains(name));
@@ -1451,6 +1557,7 @@ impl crate::task::ScheduledAgentFactory for Dispatcher {
             let effectful = effective_registry.any_effectful(&names);
             system = prompts.build(crate::PromptRequest {
                 workspace_id,
+                session_id: Some(parent_session_id),
                 root: &root,
                 exec_cwd: cwd.map_or(root.as_path(), std::path::Path::new),
                 tools: &names,
@@ -1534,7 +1641,7 @@ impl crate::task::ScheduledAgentFactory for Dispatcher {
             Arc::new(HubSink(self.hub.clone())) as Arc<dyn EventSink>,
             root,
             0,
-            tools,
+            Some(tools),
             skill_factory,
         ))
     }

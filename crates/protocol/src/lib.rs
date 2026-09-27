@@ -34,7 +34,7 @@ pub use config::{
 pub use error::{ApiError, ApiResult, ErrorCategory, LocalizedMessage, RetryPolicy};
 pub use ids::{
     CallId, EntryId, HolderId, MemoryEventId, MemoryId, ResourceId, RoundId, SessionId,
-    SubmissionId, TurnId, UsageId, WorkspaceId,
+    SubmissionId, TranslationId, TurnId, UsageId, WorkspaceId,
 };
 pub use input::{
     Command, Delivery, MessagePart, SkillLoadSource, Submission, SubmitAck, TaskUpdatePart,
@@ -49,7 +49,7 @@ pub use llm::{
 };
 pub use memory::{
     MemoryAddReq, MemoryCategory, MemoryEditReq, MemoryListReq, MemoryRecord, MemoryRemoveReq,
-    MemoryScope, MemoryStatus, MemoryUndoReq,
+    MemoryScope, MemoryStatus,
 };
 pub use message::{
     ContentPart, Message, RawPolicy, ReasoningPart, Role, Source, TextPart, ToolCall, ToolCallPart,

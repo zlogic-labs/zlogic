@@ -95,7 +95,11 @@ pub struct ToolsConfig {
     /// Git Bash → PowerShell 7 → Windows PowerShell → cmd. Other platforms use bash.
     pub default_shell: ShellPreference,
     pub max_result_chars: usize,
+    /// Blanket ceiling on **any** tool call, on top of whatever the tool itself allows. 0 = off.
+    /// Overrides `shell`'s per-class budgets when set, which is why it is an emergency stop
+    /// rather than the normal way to bound a run.
     pub timeout_secs: u64,
+    pub shell: ShellConfig,
     pub web_search: WebSearchConfig,
 }
 
@@ -105,8 +109,83 @@ impl Default for ToolsConfig {
             default_shell: ShellPreference::Auto,
             max_result_chars: 30_000,
             timeout_secs: 0,
+            shell: ShellConfig::default(),
             web_search: WebSearchConfig::default(),
         }
+    }
+}
+
+/// How long the `shell` tool may run, per kind of command.
+///
+/// The caller never picks these: it says whether it needs the result (`wait`) and the tool matches
+/// the command to a class, because a model asked for a number before it knows how long the work
+/// takes guesses badly in both directions. Per workspace, `<project>/.zlogic/settings.yaml` may
+/// override any single field on top of this global default.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShellConfig {
+    /// A command whose answer is a fact about the repository: status, a diff, a listing.
+    pub quick_secs: u64,
+    /// A test run. Generous on purpose — a suite killed at the quick budget has told nobody
+    /// anything, and re-running it is how one short timeout becomes four.
+    pub test_secs: u64,
+    /// A compile, a type check, an install.
+    pub build_secs: u64,
+    /// Ceiling for `wait: true`, which says the result is required and so opts out of its
+    /// class's budget. Not "no deadline": a command blocked on a port nobody opened would
+    /// otherwise hold the turn until the user gives up on it.
+    pub wait_secs: u64,
+    /// No output at all for this long is a stall rather than slowness, and is reported as one.
+    /// Independent of the budgets above on purpose, because the two call for opposite responses.
+    pub stall_secs: u64,
+    /// How often a running call reports that it is still running. Display cadence only — it
+    /// changes what the console shows, never what the tool does — so it is deliberately not
+    /// offered in the settings UI.
+    pub progress_secs: u64,
+}
+
+impl Default for ShellConfig {
+    fn default() -> Self {
+        Self {
+            quick_secs: 60,
+            test_secs: 600,
+            build_secs: 1_200,
+            wait_secs: 3_600,
+            stall_secs: 600,
+            progress_secs: 30,
+        }
+    }
+}
+
+impl ShellConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("quick_secs", self.quick_secs),
+            ("test_secs", self.test_secs),
+            ("build_secs", self.build_secs),
+            ("wait_secs", self.wait_secs),
+            ("stall_secs", self.stall_secs),
+            ("progress_secs", self.progress_secs),
+        ] {
+            if value == 0 {
+                return Err(format!(
+                    "tools.shell.{field} must be at least 1 second, or the command is killed \
+                     before it can start"
+                ));
+            }
+        }
+        // Not an error — a stall limit above a class budget simply never fires for that class —
+        // but it means a number the user set is doing nothing, and silence about that is how a
+        // setting gets abandoned as broken.
+        if self.stall_secs > self.wait_secs {
+            return Err(format!(
+                "tools.shell.stall_secs ({}) is above tools.shell.wait_secs ({}), so a waiting \
+                 call would never be reported as stuck",
+                self.stall_secs, self.wait_secs
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -170,6 +249,102 @@ impl WorktreeConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.dir.trim().is_empty() {
             return Err("worktree.dir must not be empty".into());
+        }
+        Ok(())
+    }
+}
+
+/// How many restore points to keep, and for how long. The three caps are independent and the
+/// first one reached wins, because each catches something the others cannot: days keep a busy
+/// repository from growing without bound, the count keeps a long day of small edits from keeping a
+/// hundred trees, and the size is the only one that notices a repository holding a 2 GB file.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CheckpointsConfig {
+    /// Off by default and only ever turned on deliberately: a snapshot is a copy of the user's
+    /// code on their disk, so the decision to keep one belongs to them, not to the installer.
+    pub enabled: bool,
+    pub retention_days: u32,
+    pub max_snapshots: u32,
+    pub max_size_gb: u32,
+    /// A file above this is left out of a snapshot rather than copied. 0 = no limit.
+    pub max_file_mb: u64,
+    /// The most files one snapshot may hold. 0 = no limit. Reaching it marks the snapshot
+    /// partial, and a partial snapshot cannot be restored.
+    pub max_files: u32,
+}
+
+impl Default for CheckpointsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            retention_days: 7,
+            max_snapshots: 500,
+            max_size_gb: 2,
+            max_file_mb: 256,
+            max_files: 200_000,
+        }
+    }
+}
+
+impl CheckpointsConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.retention_days == 0 {
+            return Err("checkpoints.retention_days must be at least 1".into());
+        }
+        if self.max_snapshots == 0 {
+            return Err("checkpoints.max_snapshots must be at least 1".into());
+        }
+        Ok(())
+    }
+}
+
+/// How long the things that only accumulate are kept.
+///
+/// The three numbers are independent on purpose: a cache day and a log day cost nothing to keep
+/// and are worthless once stale, while `session_days` is the only one that deletes something the
+/// user wrote. It is called out separately in the settings UI for that reason.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetentionConfig {
+    /// MCP tool lists and the remote object store's read-through copy. Both are regenerable, and
+    /// the cache is written under a per-day folder so this is a directory removal.
+    pub cache_days: u32,
+    /// Log files, which are already filed under a per-day folder.
+    pub logs_days: u32,
+    /// How long a chat session survives without being touched. Older ones are **deleted** — their
+    /// entries, their objects and their temp files — not archived; archive is what the user does
+    /// when they want to keep something. 1 is the floor: a shorter window than a day would delete
+    /// the session someone is in the middle of reading over lunch.
+    pub session_days: u32,
+    /// Off leaves every sweep unrun, session deletion included. The engine still checkpoints its
+    /// WAL, because that is a few seconds of copying rather than a deletion.
+    pub enabled: bool,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            cache_days: 7,
+            logs_days: 30,
+            session_days: 7,
+            enabled: true,
+        }
+    }
+}
+
+impl RetentionConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.cache_days == 0 {
+            return Err("retention.cache_days must be at least 1".into());
+        }
+        if self.logs_days == 0 {
+            return Err("retention.logs_days must be at least 1".into());
+        }
+        if self.session_days == 0 {
+            return Err("retention.session_days must be at least 1".into());
         }
         Ok(())
     }
@@ -493,6 +668,43 @@ fn normalize_currency(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shell_defaults_are_ordered_so_a_stall_can_actually_fire() {
+        let defaults = ShellConfig::default();
+        assert!(
+            defaults.validate().is_ok(),
+            "the shipped defaults are invalid"
+        );
+        assert!(
+            defaults.stall_secs <= defaults.wait_secs,
+            "a default stall limit above the wait ceiling would never be reached"
+        );
+    }
+
+    #[test]
+    fn a_zero_budget_is_refused_rather_than_read_as_unlimited() {
+        let error = ShellConfig {
+            test_secs: 0,
+            ..Default::default()
+        }
+        .validate()
+        .expect_err("a zero test budget must not be accepted");
+        assert!(error.contains("tools.shell.test_secs"), "{error}");
+    }
+
+    #[test]
+    fn a_stall_limit_above_the_wait_ceiling_is_named_as_the_dead_setting_it_is() {
+        let error = ShellConfig {
+            stall_secs: 7_200,
+            wait_secs: 3_600,
+            ..Default::default()
+        }
+        .validate()
+        .expect_err("a stall limit the wait ceiling pre-empts must not be accepted");
+        assert!(error.contains("stall_secs"), "{error}");
+        assert!(error.contains("wait_secs"), "{error}");
+    }
 
     #[test]
     fn a_proxy_needs_a_scheme_and_a_bare_host_and_port() {

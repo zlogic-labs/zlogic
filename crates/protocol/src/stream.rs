@@ -477,7 +477,6 @@ pub enum ToolDisplay {
     /// Sandboxed HTML component. The source lives in the object store and is loaded lazily.
     Widget {
         object: String,
-        title: String,
         height: u16,
         libraries: Vec<String>,
     },

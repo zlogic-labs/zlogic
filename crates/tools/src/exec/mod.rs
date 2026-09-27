@@ -9,7 +9,7 @@ pub mod shell;
 
 use std::sync::Arc;
 
-pub use shell::{Shell, ShellDialect, ShellPreference};
+pub use shell::{Shell, ShellBudgets, ShellDialect, ShellPreference};
 
 use crate::Tool;
 

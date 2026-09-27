@@ -8,6 +8,7 @@ pub mod convert;
 pub mod edit;
 pub mod parser;
 pub mod read_file;
+pub mod sniff;
 pub mod write_file;
 
 use std::sync::Arc;

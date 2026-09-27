@@ -8,13 +8,14 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use serde_json::Value;
+use zlogic_codex::Subscription;
 use zlogic_config::{AppConfig, SESSION};
 use zlogic_core::AuxModel;
 use zlogic_credential::CredentialStore;
 use zlogic_llm::LlmClient;
-use zlogic_llm::factory::{BedrockAuth, from_resolved};
+use zlogic_llm::factory::{Auth, BedrockAuth, from_resolved};
 use zlogic_llm::transport::HttpTransport;
-use zlogic_protocol::config::{ClientSpec, ResolvedModel, Sdk, Tier};
+use zlogic_protocol::config::{ClientSpec, ProviderAuth, ResolvedModel, Sdk, Tier};
 use zlogic_protocol::llm::{ThinkingIntent, ThinkingMode};
 use zlogic_protocol::usage::Purpose;
 
@@ -189,32 +190,67 @@ impl ModelRouter {
     }
 
     fn client_for(&self, model: &ResolvedModel, model_ref: &str) -> Result<Arc<dyn LlmClient>> {
-        build_client(model, model_ref, &*self.keys, self.transport.clone())
+        build_client(
+            model,
+            model_ref,
+            Arc::clone(&self.keys),
+            Arc::clone(&self.transport),
+        )
     }
 }
 
 pub(crate) fn build_client(
     model: &ResolvedModel,
     model_ref: &str,
-    keys: &dyn CredentialStore,
+    keys: Arc<dyn CredentialStore>,
     transport: Arc<dyn HttpTransport>,
 ) -> Result<Arc<dyn LlmClient>> {
-    let api_key = model.credential_refs.iter().find_map(|r| keys.resolve(r));
-    if api_key.is_none() {
-        let credential_ref = model.credential_refs.join(" or ");
-        tracing::error!(
-            target: "zlogic::llm",
-            model = model_ref,
-            credential_ref = %credential_ref,
-            "no credential resolution for model; refusing to send request without a key"
-        );
-        return Err(EngineError::NoCredential {
-            model: model_ref.to_string(),
-            credential_ref,
-        });
-    }
+    let mut auth = match model.auth {
+        ProviderAuth::ApiKey => {
+            let Some(key) = model.credential_refs.iter().find_map(|r| keys.resolve(r)) else {
+                let credential_ref = model.credential_refs.join(" or ");
+                tracing::error!(
+                    target: "zlogic::llm",
+                    model = model_ref,
+                    credential_ref = %credential_ref,
+                    "no credential resolution for model; refusing to send request without a key"
+                );
+                return Err(EngineError::NoCredential {
+                    model: model_ref.to_string(),
+                    credential_ref,
+                });
+            };
+            Auth::key(key)
+        }
+        ProviderAuth::Chatgpt => {
+            let provider_id = model.source.provider_id.clone();
+            if zlogic_codex::store::load(&*keys, &provider_id).is_none() {
+                tracing::error!(
+                    target: "zlogic::llm",
+                    model = model_ref,
+                    provider = %provider_id,
+                    "no ChatGPT subscription is signed in for this provider"
+                );
+                return Err(EngineError::NoSubscription {
+                    provider: provider_id,
+                    model: model_ref.to_string(),
+                });
+            }
+            // The token is fetched — and refreshed — per request, so a session that outlives one
+            // access token keeps working without rebuilding anything.
+            Auth {
+                api_key: None,
+                token: Some(Arc::new(Subscription::new(
+                    provider_id,
+                    zlogic_codex::shared(),
+                    Arc::clone(&keys),
+                ))),
+                bedrock: None,
+            }
+        }
+    };
 
-    let bedrock = if matches!(model.client, ClientSpec::Builtin { sdk: Sdk::Bedrock }) {
+    if matches!(model.client, ClientSpec::Builtin { sdk: Sdk::Bedrock }) {
         let aws = keys.aws().ok_or_else(|| {
             let credential_ref = "AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY".into();
             tracing::error!(
@@ -227,26 +263,25 @@ pub(crate) fn build_client(
                 credential_ref,
             }
         })?;
-        Some(BedrockAuth {
+        auth.bedrock = Some(BedrockAuth {
             region: aws.region,
             credentials: zlogic_llm::bedrock::sigv4::Credentials {
                 access_key_id: aws.access_key_id,
                 secret_access_key: aws.secret_access_key,
                 session_token: aws.session_token,
             },
-        })
-    } else {
-        None
-    };
+        });
+    }
 
-    from_resolved(model, api_key, bedrock, transport).map_err(|e| EngineError::Invalid(e.0))
+    from_resolved(model, auth, transport).map_err(|e| EngineError::Invalid(e.0))
 }
 
 fn builtin_chain(role: &Purpose) -> &'static [&'static str] {
     match role {
         Purpose::Main | Purpose::Agent(_) => &[SESSION],
         Purpose::Title | Purpose::Approval | Purpose::Utility => &[SESSION, "light"],
-        Purpose::Compaction | Purpose::ApprovalDeep => &["main", SESSION],
+        Purpose::Compaction => &[SESSION],
+        Purpose::ApprovalDeep => &[SESSION, "main"],
     }
 }
 

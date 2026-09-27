@@ -2023,6 +2023,8 @@ impl EngineSession {
                 since: Some(now - chrono::Duration::days(30)),
                 until: None,
                 utc_offset_minutes: local_utc_offset_minutes(),
+                // Explicitly asked for, on a command the user just typed — the scan is the point.
+                include_tools: true,
             }))
             .ok()?;
         *self.usage_cache.lock().unwrap() = Some((std::time::Instant::now(), summary.clone()));
@@ -2106,6 +2108,7 @@ fn empty_upsert() -> OpenAiCompatibleProviderReq {
         thinking: None,
         pricing: None,
         tier: None,
+        rate_limit: None,
         create_scope: None,
         expected_revision: None,
     }

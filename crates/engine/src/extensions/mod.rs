@@ -91,8 +91,8 @@ fn budget_warning(
         .collect();
     let message = format!(
         "MCP tool definitions total {how_much}, and you pay that cost **every round**. The biggest consumers: {}. \
-         To tighten: restrict which tools ship in the definition (`\"tools\": [\"only these\"]`), or turn off \
-         servers you do not need right now with `/mcp off <id>`.",
+         To tighten: restrict which tools ship in the definition (`\"tools\": [\"only these\"]`), or turn off the \
+         servers you do not need in this workspace's MCP list.",
         biggest.join(", ")
     );
     let mut args = std::collections::BTreeMap::new();
@@ -278,10 +278,7 @@ impl Extensions {
                     Trust::Changed => "its definition changed and needs confirming again",
                     _ => "it has not been confirmed yet",
                 };
-                format!(
-                    "{} ({why}; the user can run `/mcp trust {}`)",
-                    def.id, def.id
-                )
+                format!("{} ({why}; allow it in this workspace to use it)", def.id)
             })
             .collect();
 
@@ -320,18 +317,11 @@ impl Extensions {
         );
 
         if !loaded.pending.is_empty() {
-            let servers = loaded.pending.join(", ");
-            let message = format!(
-                "Still fetching the tool manifest for {servers}; they are not included this round (they will be next round)"
+            tracing::debug!(
+                target: "zlogic::engine",
+                servers = %loaded.pending.join(", "),
+                "tool manifests still being fetched; they join the tool set on a later turn"
             );
-            tracing::debug!(target: "zlogic::engine", "{message}");
-            let mut args = std::collections::BTreeMap::new();
-            args.insert("servers".to_string(), serde_json::json!(servers));
-            notices.push(PlanNotice::info_with_args(
-                "mcp_tools_pending",
-                message,
-                args,
-            ));
         }
 
         let mut tools = base.clone();
@@ -615,16 +605,15 @@ mod tests {
             "must not wait for its handshake"
         );
 
-        let notice = out
-            .notices
-            .iter()
-            .find(|n| n.code == "mcp_tools_pending")
-            .unwrap_or_else(|| panic!("{:?}", out.notices));
-        assert_eq!(
-            notice.level,
-            zlogic_protocol::stream::NoticeLevel::Info,
-            "still fetching is not a warning"
+        assert!(
+            out.notices.is_empty(),
+            "a manifest still being fetched is not the user's problem: {:?}",
+            out.notices
         );
-        assert!(notice.message.contains("slow"), "{}", notice.message);
+        assert!(
+            out.unavailable.iter().any(|u| u.contains("slow")),
+            "the model is told, the user is not: {:?}",
+            out.unavailable
+        );
     }
 }

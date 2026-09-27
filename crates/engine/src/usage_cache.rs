@@ -37,10 +37,13 @@ pub struct ReportKey {
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
     utc_offset_minutes: i32,
+    /// Whether the expensive half was asked for. Part of the key because a request that wants the
+    /// tool roll-up must not be answered with the cheap one's `None`.
+    include_tools: bool,
 }
 
 impl ReportKey {
-    pub fn of(query: &UsageQuery) -> Self {
+    pub fn of(query: &UsageQuery, include_tools: bool) -> Self {
         Self {
             workspace_id: query.workspace_id,
             session_id: query.session_id,
@@ -50,16 +53,17 @@ impl ReportKey {
             since: query.since,
             until: query.until,
             utc_offset_minutes: query.utc_offset_minutes,
+            include_tools,
         }
     }
 }
 
-/// What the report costs a second to produce: the aggregate for every dimension plus the tool
-/// roll-up.
+/// What the report costs a second to produce: the aggregate for every dimension, plus the tool
+/// roll-up when the caller asked for it.
 #[derive(Clone)]
 pub struct UsageReport {
     pub aggregate: UsageAggregate,
-    pub tools: Vec<ToolUsageAggregate>,
+    pub tools: Option<Vec<ToolUsageAggregate>>,
 }
 
 pub struct ReportCache {
@@ -135,16 +139,19 @@ mod tests {
     use super::*;
 
     fn key(offset_minutes: i32) -> ReportKey {
-        ReportKey::of(&UsageQuery {
-            utc_offset_minutes: offset_minutes,
-            ..UsageQuery::default()
-        })
+        ReportKey::of(
+            &UsageQuery {
+                utc_offset_minutes: offset_minutes,
+                ..UsageQuery::default()
+            },
+            false,
+        )
     }
 
     fn report() -> UsageReport {
         UsageReport {
             aggregate: UsageAggregate::default(),
-            tools: Vec::new(),
+            tools: None,
         }
     }
 

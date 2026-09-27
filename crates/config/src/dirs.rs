@@ -128,6 +128,11 @@ impl Dirs {
         self.config.join("models.yaml")
     }
 
+    /// What a subscription backend said this account may call; a fetched snapshot, not config.
+    pub fn provider_models_file(&self) -> PathBuf {
+        self.data.join("provider-models.json")
+    }
+
     pub fn state_db(&self) -> PathBuf {
         self.state.join("state.db")
     }
@@ -142,6 +147,14 @@ impl Dirs {
 
     pub fn secrets_blob(&self) -> PathBuf {
         self.security_dir().join(".key.enc")
+    }
+
+    /// The secret table used when the keychain is turned off — plaintext, and deliberately a
+    /// different file from [`Dirs::secrets_blob`]. Two stores, two files: turning the keychain on
+    /// and off again must not have one backend read or overwrite the other's data, and a file that
+    /// only ever holds one format needs no format detection.
+    pub fn secrets_plain_file(&self) -> PathBuf {
+        self.security_dir().join(".key.json")
     }
 
     pub fn objects(&self) -> PathBuf {
@@ -236,11 +249,11 @@ mod tests {
 
     #[test]
     fn an_explicit_name_moves_all_four_directories() {
-        let d = Dirs::discover_in(&env_of(&[("HOME", "/home/u")]), None, "mochuno").unwrap();
-        assert_eq!(d.config, PathBuf::from("/home/u/.config/mochuno"));
-        assert_eq!(d.data, PathBuf::from("/home/u/.local/share/mochuno"));
-        assert_eq!(d.state, PathBuf::from("/home/u/.local/state/mochuno"));
-        assert_eq!(d.cache, PathBuf::from("/home/u/.cache/mochuno"));
+        let d = Dirs::discover_in(&env_of(&[("HOME", "/home/u")]), None, "other-app").unwrap();
+        assert_eq!(d.config, PathBuf::from("/home/u/.config/other-app"));
+        assert_eq!(d.data, PathBuf::from("/home/u/.local/share/other-app"));
+        assert_eq!(d.state, PathBuf::from("/home/u/.local/state/other-app"));
+        assert_eq!(d.cache, PathBuf::from("/home/u/.cache/other-app"));
     }
 
     #[test]
@@ -248,15 +261,15 @@ mod tests {
         let d = Dirs::discover_in(
             &env_of(&[
                 ("HOME", "/home/u"),
-                ("MOCHUNO_HOME", "/opt/mochuno"),
+                ("OTHER_APP_HOME", "/opt/other-app"),
                 ("ZLOGIC_HOME", "/opt/zlogic"),
             ]),
             None,
-            "mochuno",
+            "other-app",
         )
         .unwrap();
-        assert_eq!(d.config, PathBuf::from("/opt/mochuno/config"));
-        assert_eq!(d.state, PathBuf::from("/opt/mochuno/state"));
+        assert_eq!(d.config, PathBuf::from("/opt/other-app/config"));
+        assert_eq!(d.state, PathBuf::from("/opt/other-app/state"));
     }
 
     #[test]
@@ -264,7 +277,7 @@ mod tests {
         for app in ["", ".", "..", "../elsewhere", "a/b", r"a\b", "with space"] {
             assert!(check_app_name(app).is_err(), "{app:?} must be rejected");
         }
-        for app in ["zlogic", "mochuno", "my-app_2", "app.v2"] {
+        for app in ["zlogic", "other-app", "my-app_2", "app.v2"] {
             assert!(check_app_name(app).is_ok(), "{app:?} must be accepted");
         }
     }
@@ -344,6 +357,18 @@ mod tests {
             Some(d.security_dir().as_path())
         );
         assert_eq!(d.secrets_blob().parent(), Some(d.security_dir().as_path()));
+    }
+
+    #[test]
+    fn the_two_secret_stores_never_share_a_file() {
+        let d = Dirs::under("/tmp/x");
+        assert!(d.secrets_plain_file().starts_with(&d.security_dir()));
+        assert_ne!(
+            d.secrets_plain_file(),
+            d.secrets_blob(),
+            "turning the keychain on and off must not have one store read the other's file"
+        );
+        assert_ne!(d.secrets_plain_file(), d.master_key_file());
     }
 
     #[test]

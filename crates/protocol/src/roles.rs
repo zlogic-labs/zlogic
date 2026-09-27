@@ -3,7 +3,7 @@
 //!   title:
 //!     thinking: off
 //!   compaction:
-//!     models: ["deepseek:deepseek-v4", main, session]
+//!     models: [session, "deepseek:deepseek-v4", main]
 //!     params: { temperature: 0.3 }
 //! ```
 

@@ -10,27 +10,34 @@ use zlogic_protocol::query::{
     ApiResult, CatalogCheck, ConfigRemoveProviderReq, ConfigUpdateReq, ConfigView,
     CredentialDeleteReq, CredentialSetReq, CredentialState, CredentialVerifyReq,
     CredentialVerifyResult, EntriesReq, ObjectData, ObjectDataReq, ObjectReadReq, ObjectText,
-    OpenAiCompatibleProviderReq, Page, ProviderCatalog, RuntimeTask, RuntimeTaskDeleteReq,
-    RuntimeTaskListReq, RuntimeTaskLog, RuntimeTaskLogReq, RuntimeTaskPage, RuntimeTaskStopReq,
-    SessionListReq, SessionOpenReq, SessionOpened, SessionRenameReq, SessionSearchHit,
-    SessionSearchReq, SessionSummary, TaskJob, TaskJobCreateReq, TaskJobDeleteReq, TaskJobDraft,
-    TaskJobDraftReq, TaskJobListReq, TaskJobRunReq, TaskJobRunsReq, TaskJobSetEnabledReq, ToolInfo,
-    TranscriptEntry, TranscriptReq, TurnItem, TurnState, TurnsReq, UsageSummary, UsageSummaryReq,
+    OpenAiCompatibleProviderReq, Page, ProviderCatalog, ProviderModels, ProviderModelsReq,
+    ProviderSignInBegin, ProviderSignInBeginReq, ProviderSignInCancelReq, ProviderSignInStatus,
+    ProviderSignInStatusReq, RuntimeTask, RuntimeTaskDeleteReq, RuntimeTaskListReq, RuntimeTaskLog,
+    RuntimeTaskLogReq, RuntimeTaskPage, RuntimeTaskStopReq, SessionListReq, SessionOpenReq,
+    SessionOpened, SessionRenameReq, SessionSearchHit, SessionSearchReq, SessionSummary, TaskJob,
+    TaskJobCreateReq, TaskJobDeleteReq, TaskJobDraft, TaskJobDraftReq, TaskJobListReq,
+    TaskJobRunReq, TaskJobRunsReq, TaskJobSetEnabledReq, TextTranslateReq, TextTranslateResp,
+    ToolInfo, TranscriptEntry, TranscriptReq, TranslationDeleteReq, TranslationEntry,
+    TranslationListReq, TurnItem, TurnState, TurnsReq, UsageSummary, UsageSummaryReq,
+    WorkspaceCheckpoint, WorkspaceCheckpointCaptureReq, WorkspaceCheckpointFileDiff,
+    WorkspaceCheckpointFileDiffReq, WorkspaceCheckpointList, WorkspaceCheckpointListReq,
+    WorkspaceCheckpointPlan, WorkspaceCheckpointPlanReq, WorkspaceCheckpointRestore,
+    WorkspaceCheckpointRestoreReq, WorkspaceCheckpointStep, WorkspaceCheckpointStepReq,
     WorkspaceFileBase64, WorkspaceFileCreateReq, WorkspaceFileDeleteReq, WorkspaceFileEntry,
     WorkspaceFileListReq, WorkspaceFileRange, WorkspaceFileRangeReq, WorkspaceFileReadReq,
     WorkspaceFileRenameReq, WorkspaceFileSearchReq, WorkspaceFileText, WorkspaceFileWriteReq,
     WorkspaceGitBranchReq, WorkspaceGitCommitDetail, WorkspaceGitCommitDetailReq,
     WorkspaceGitCommitReq, WorkspaceGitDiff, WorkspaceGitDiffReq,
-    WorkspaceGitGenerateCommitMessageReq, WorkspaceGitInfo, WorkspaceGitOverview,
-    WorkspaceGitOverviewReq, WorkspaceGitStageReq, WorkspaceGitSyncReq, WorkspaceKind,
-    WorkspaceSelector, WorkspaceSummary, WorkspaceUpdateReq,
+    WorkspaceGitGenerateCommitMessageReq, WorkspaceGitInfo, WorkspaceGitInitReq,
+    WorkspaceGitOverview, WorkspaceGitOverviewReq, WorkspaceGitStageReq, WorkspaceGitSyncReq,
+    WorkspaceKind, WorkspaceSelector, WorkspaceSummary, WorkspaceUpdateReq,
 };
 use zlogic_protocol::usage::QuotaStatus;
 use zlogic_protocol::{
     AgentProfile, AgentProfileCreateReq, AgentProfileDeleteReq, AgentProfileListReq,
     AgentProfileListRes, AgentProfileUpdateReq, Command, MemoryAddReq, MemoryEditReq,
-    MemoryListReq, MemoryRecord, MemoryRemoveReq, MemoryUndoReq, SessionId, Submission, SubmitAck,
-    TurnId, WorkspaceId,
+    MemoryListReq, MemoryRecord, MemoryRemoveReq, SessionId, Submission, SubmitAck, TurnId,
+    WorkspaceId,
 };
 
 #[async_trait]
@@ -40,6 +47,19 @@ pub trait AuxiliaryService: Send + Sync {
         req: WorkspaceGitGenerateCommitMessageReq,
     ) -> ApiResult<String>;
     async fn draft_task_job(&self, req: TaskJobDraftReq) -> ApiResult<TaskJobDraft>;
+    async fn text_translate(&self, req: TextTranslateReq) -> ApiResult<TextTranslateResp>;
+}
+
+/// Quick translate's history: what was translated before, and the cache that comes with it.
+///
+/// Split from [`AuxiliaryService`], which is the model path. These three never call a model — they
+/// are the store half of the same feature, and the closed half implements both on one object
+/// because one feature owns them.
+#[async_trait]
+pub trait TranslationService: Send + Sync {
+    async fn translation_list(&self, req: TranslationListReq) -> ApiResult<Vec<TranslationEntry>>;
+    async fn translation_delete(&self, req: TranslationDeleteReq) -> ApiResult<()>;
+    async fn translation_clear(&self) -> ApiResult<()>;
 }
 
 #[async_trait]
@@ -48,7 +68,6 @@ pub trait MemoryService: Send + Sync {
     async fn add(&self, req: MemoryAddReq) -> ApiResult<MemoryRecord>;
     async fn update(&self, req: MemoryEditReq) -> ApiResult<MemoryRecord>;
     async fn remove(&self, req: MemoryRemoveReq) -> ApiResult<MemoryRecord>;
-    async fn undo(&self, req: MemoryUndoReq) -> ApiResult<Option<MemoryRecord>>;
 }
 
 #[async_trait]
@@ -134,6 +153,7 @@ pub trait WorkspaceGitService: Send + Sync {
     async fn git_overview(&self, req: WorkspaceGitOverviewReq) -> ApiResult<WorkspaceGitOverview>;
     async fn git_commit(&self, req: WorkspaceGitCommitReq) -> ApiResult<WorkspaceGitOverview>;
     async fn git_stage(&self, req: WorkspaceGitStageReq) -> ApiResult<WorkspaceGitOverview>;
+    async fn git_init(&self, req: WorkspaceGitInitReq) -> ApiResult<WorkspaceGitOverview>;
     async fn git_sync(&self, req: WorkspaceGitSyncReq) -> ApiResult<WorkspaceGitOverview>;
     async fn git_branch(&self, req: WorkspaceGitBranchReq) -> ApiResult<WorkspaceGitOverview>;
     async fn git_commit_detail(
@@ -141,6 +161,48 @@ pub trait WorkspaceGitService: Send + Sync {
         req: WorkspaceGitCommitDetailReq,
     ) -> ApiResult<WorkspaceGitCommitDetail>;
     async fn git_diff(&self, req: WorkspaceGitDiffReq) -> ApiResult<WorkspaceGitDiff>;
+}
+
+/// The restore-point timeline: what snapshots exist for a workspace, what restoring one would
+/// change, a manual point, and the restore itself.
+///
+/// Split from [`WorkspaceGitService`] because it is a different thing wearing git's clothes — the
+/// snapshots live in zlogic's own data directory, not in the user's repository, and writing one
+/// never touches their `HEAD` or index. A host that cannot render the timeline still wants the
+/// captures, and those do not go through here: they are taken by the turn itself.
+#[async_trait]
+pub trait WorkspaceCheckpointsService: Send + Sync {
+    async fn checkpoint_list(
+        &self,
+        req: WorkspaceCheckpointListReq,
+    ) -> ApiResult<WorkspaceCheckpointList>;
+    /// What restoring `id` would do. Cheap enough to call on expand, expensive enough not to call
+    /// for every row in a list.
+    async fn checkpoint_plan(
+        &self,
+        req: WorkspaceCheckpointPlanReq,
+    ) -> ApiResult<WorkspaceCheckpointPlan>;
+    /// The step that ended at a point, against the point before it. Its own call because it
+    /// needs no working tree: two commits the store already holds are the whole input.
+    async fn checkpoint_step(
+        &self,
+        req: WorkspaceCheckpointStepReq,
+    ) -> ApiResult<WorkspaceCheckpointStep>;
+    /// The patch for one file of a plan. Its own call because it is per row and per file: a plan
+    /// for a thousand changed files must not carry a thousand patches.
+    async fn checkpoint_diff(
+        &self,
+        req: WorkspaceCheckpointFileDiffReq,
+    ) -> ApiResult<WorkspaceCheckpointFileDiff>;
+    /// A point the user asked for by hand.
+    async fn checkpoint_capture(
+        &self,
+        req: WorkspaceCheckpointCaptureReq,
+    ) -> ApiResult<WorkspaceCheckpoint>;
+    async fn checkpoint_restore(
+        &self,
+        req: WorkspaceCheckpointRestoreReq,
+    ) -> ApiResult<WorkspaceCheckpointRestore>;
 }
 
 #[async_trait]
@@ -205,6 +267,18 @@ pub trait CredentialService: Send + Sync {
     async fn set(&self, req: CredentialSetReq) -> ApiResult<CredentialState>;
     async fn delete(&self, req: CredentialDeleteReq) -> ApiResult<CredentialState>;
     async fn verify(&self, req: CredentialVerifyReq) -> ApiResult<CredentialVerifyResult>;
+
+    /// Begin signing a subscription provider in. The host shows the URL (or the code) and polls
+    /// [`CredentialService::sign_in_status`]; nothing here opens a browser.
+    async fn sign_in_begin(&self, req: ProviderSignInBeginReq) -> ApiResult<ProviderSignInBegin>;
+    async fn sign_in_status(&self, req: ProviderSignInStatusReq)
+    -> ApiResult<ProviderSignInStatus>;
+    async fn sign_in_cancel(&self, req: ProviderSignInCancelReq) -> ApiResult<()>;
+
+    /// Ask the subscription backend which models this account may call, and keep the answer.
+    async fn models(&self, req: ProviderModelsReq) -> ApiResult<ProviderModels>;
+    /// Forget a fetched model list, so the provider's built-in one applies again.
+    async fn forget_models(&self, req: ProviderModelsReq) -> ApiResult<()>;
 }
 
 #[async_trait]
@@ -240,4 +314,18 @@ pub trait ExtensionService: Send + Sync {
     async fn mcp_oauth_status(&self, req: McpOAuthStatusReq) -> ApiResult<McpOAuthStatusResult>;
     async fn mcp_oauth_cancel(&self, req: McpOAuthCancelReq) -> ApiResult<()>;
     async fn mcp_logout(&self, req: McpLogoutReq) -> ApiResult<()>;
+}
+
+/// Per-turn environment facts a host adds to the system prompt, keyed by the session's turn.
+///
+/// A capability the model cannot see is a capability it cannot use: a session bound to an Android
+/// virtual device, for instance, is useless to the model unless the prompt names that device and
+/// the adb target it must use. What goes in here is the closed half's business, so the engine only
+/// asks the question and decides where the answer goes — the `<environment>` block, which is
+/// rebuilt every turn and therefore always reflects the binding as it is right now.
+///
+/// Deliberately synchronous: it runs on the turn's own path, so a host implementation must read
+/// state it already holds rather than shell out. A host with nothing to add returns `None`.
+pub trait SessionEnvironmentService: Send + Sync {
+    fn environment(&self, session_id: SessionId) -> Option<String>;
 }

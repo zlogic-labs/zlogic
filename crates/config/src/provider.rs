@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use zlogic_credential::credential_candidates;
+use zlogic_credential::{CredentialRef, credential_candidates, provider_oauth_entry};
 use zlogic_protocol::config::{
-    ClientSpec, GenericOpenAiDialect, ModelCapabilities, NetworkConfig, Pricing, ResolvedModel,
-    Sdk, ThinkingCapability, Tier, Wiring, resolve_client,
+    ClientSpec, GenericOpenAiDialect, ModelCapabilities, ModelRateLimit, NetworkConfig, Pricing,
+    ProviderAuth, ResolvedModel, Sdk, ThinkingCapability, Tier, Wiring, resolve_client,
 };
 use zlogic_protocol::message::Source;
 use zlogic_protocol::usage::QuotaConfig;
@@ -17,6 +17,10 @@ use crate::{ConfigError, Result};
 pub struct ProviderSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sdk: Option<Sdk>,
+    /// Only written when it is not the default: an API key provider is the norm, and spelling it
+    /// out in every generated `models.yaml` block would be noise.
+    #[serde(default, skip_serializing_if = "ProviderAuth::is_api_key")]
+    pub auth: ProviderAuth,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -48,6 +52,7 @@ impl Default for ProviderSettings {
     fn default() -> Self {
         Self {
             sdk: None,
+            auth: ProviderAuth::default(),
             base_url: None,
             guide_url: None,
             generic: None,
@@ -59,6 +64,22 @@ impl Default for ProviderSettings {
             enabled: true,
             credential_ok: None,
         }
+    }
+}
+
+/// Where a provider's credential is looked for, which depends on how it authenticates.
+///
+/// A subscription is not a key: it has one home (its own keychain entry) and no environment
+/// variable, because handing a subscription token around in the environment is not a thing that
+/// should work by accident.
+pub fn credential_refs_for(
+    provider_id: &str,
+    auth: ProviderAuth,
+    auto_detect_env: bool,
+) -> Vec<CredentialRef> {
+    match auth {
+        ProviderAuth::ApiKey => credential_candidates(provider_id, auto_detect_env),
+        ProviderAuth::Chatgpt => vec![CredentialRef::keyring(provider_oauth_entry(provider_id))],
     }
 }
 
@@ -91,6 +112,8 @@ pub struct ModelSettings {
     pub no_think_params: BTreeMap<String, Value>,
     #[serde(default)]
     pub quotas: Vec<QuotaConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<ModelRateLimit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sdk: Option<Sdk>,
 }
@@ -246,6 +269,20 @@ pub fn resolve_model(
         .unwrap_or(&NetworkConfig::default())
         .overlay(model.network.as_ref().unwrap_or(&NetworkConfig::default()));
 
+    /* A hand-edited `rpm: 0` is treated as "unset" rather than obeyed: taken literally it would
+     * block every request, and a model that can never answer is a worse outcome than a limit the
+     * user did not mean to set. */
+    let rate_limit = match model.rate_limit {
+        Some(limit) if limit.rpm == Some(0) => {
+            warnings.push(format!(
+                "{provider_id}:{model_id} has rate_limit.rpm: 0, which would block every request; \
+                 ignored it"
+            ));
+            None
+        }
+        other => other,
+    };
+
     Ok(ResolvedModel {
         source: Source::new(provider_id, model_id),
         wire_model: model
@@ -257,10 +294,11 @@ pub fn resolve_model(
             .clone()
             .unwrap_or_else(|| format!("{provider_id}:{model_id}")),
         client,
+        auth: provider.auth,
         base_url: provider.base_url.clone(),
         wiring: provider.wiring.clone(),
         network,
-        credential_refs: credential_candidates(provider_id, auto_detect_env)
+        credential_refs: credential_refs_for(provider_id, provider.auth, auto_detect_env)
             .iter()
             .map(ToString::to_string)
             .collect(),
@@ -276,6 +314,7 @@ pub fn resolve_model(
         },
         pricing: model.pricing.clone(),
         default_params,
+        rate_limit,
         config_revision,
     })
 }

@@ -371,20 +371,41 @@ error-submit-no-usable-model = This message was not sent: no usable model ({ $er
 error-submit-queued-no-model = No model is currently available, so this message is queued. Configure a model and an API key in settings ({ $error })
 error-submit-queued-turn-failed = This message was queued, but a reply could not be started yet: { $error }
 error-submit-rejected = Submission rejected: { $reason }
-notice-mcp-tools-pending = Still fetching the tool manifest for { $servers }; they are not included this round (they will be next round)
 notice-mcp-server-no-tools = MCP server `{ $server }` connected but did not provide any tools
-notice-mcp-tools-expensive = MCP tool definitions total { $how_much }, and you pay that cost **every round**. The biggest consumers: { $biggest }. To tighten: restrict which tools ship in the definition (`tools`: ["only these"]), or turn off servers you do not need right now with `/mcp off <id>`.
+notice-mcp-tools-expensive = MCP tool definitions total { $how_much }, and you pay that cost **every round**. The biggest consumers: { $biggest }. To tighten: restrict which tools ship in the definition (`tools`: ["only these"]), or turn off the servers you do not need in this workspace's MCP list.
 notice-llm-interrupted-retry = The reply was interrupted mid-generation and is being continued automatically (retried { $n } times so far). What you already saw stays; the model picks up from where it stopped.
 notice-agent-model-unavailable = Sub-agent `{ $name }` could not resolve a model ({ $error }); it will not run in this turn
 notice-session-title-failed = The session title could not be refined: { $error }
 notice-turn-start-failed = A queued message could not start a reply: { $error }. Configure a model and an API key, then try again.
 notice-mcp-server-untrusted =
-    { $count } MCP servers from this project will not start until you confirm them:
+    { $count } MCP servers from this project will not start until you allow them in this workspace:
     { $lines }
-    Confirm one with `/mcp trust <id>`; list all with `/mcp`.
 notice-tasks-still-running = Background tasks started by this turn are still running; you will be notified when they finish:
     { $tasks }
 
 error-submit-internal-part = Task updates, skill loads and skill invocations can only be produced by the runtime
 error-submit-empty = The submission is empty
 error-submit-unknown-model = Unknown model: { $model }
+
+# ── auth subcommand (zlogic auth …) ──
+auth-unknown-command = Unknown auth subcommand: { $command }
+auth-usage-list = Usage: zlogic auth (no arguments)
+auth-usage-login = Usage: zlogic auth login <provider> [--device]
+auth-usage-logout = Usage: zlogic auth logout <provider>
+auth-usage-refresh = Usage: zlogic auth refresh <provider>
+auth-list-title = Providers:
+auth-list-empty = No providers configured yet
+auth-marker-in = configured
+auth-marker-out = not configured
+auth-open-url = Open this URL to continue: { $url }
+auth-open-failed = Could not open a browser ({ $reason }); open the URL above yourself.
+auth-device-code = Open { $url } and enter the code { $code }
+auth-waiting = Waiting for the sign-in to come back…
+auth-signed-in-as = Signed in as { $account } { $plan }
+auth-signed-out = Signed { $provider } out
+auth-sign-in-failed = Sign-in failed: { $message }
+auth-sign-in-expired = The sign-in expired before it was completed
+auth-sign-in-cancelled = Sign-in cancelled
+auth-sign-in-pending = The sign-in never came back
+auth-models-title = Models { $provider } offers:
+auth-models-count = { $count } models available for { $provider }

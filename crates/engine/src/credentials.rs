@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use zlogic_credential::{CredentialRef, CredentialStore, credential_candidates, keyring_entry};
+use zlogic_protocol::config::ProviderAuth;
 use zlogic_protocol::error::ErrorCategory;
 use zlogic_protocol::llm::{
     CacheSpec, LlmError, LlmEvent, LlmRequest, RequestMeta, ThinkingIntent, ThinkingMode,
@@ -12,11 +13,14 @@ use zlogic_protocol::llm::{
 use zlogic_protocol::message::{ContentPart, Message, TextPart};
 use zlogic_protocol::query::{
     ApiError, ApiResult, CredentialDeleteReq, CredentialSetReq, CredentialSource, CredentialState,
-    CredentialVerifyReq, CredentialVerifyResult,
+    CredentialVerifyReq, CredentialVerifyResult, ProviderModels, ProviderModelsReq,
+    ProviderSignInBegin, ProviderSignInBeginReq, ProviderSignInCancelReq, ProviderSignInStatus,
+    ProviderSignInStatusReq,
 };
 use zlogic_protocol::usage::Purpose;
 
 use crate::config::Config;
+use crate::provider_auth::{ProviderSignIn, auth_of};
 use crate::service::{ConfigService, CredentialService};
 use crate::{EngineError, Result};
 
@@ -24,6 +28,7 @@ pub struct Credentials {
     config: Arc<Config>,
     store: Arc<dyn CredentialStore>,
     transport: Arc<dyn zlogic_llm::transport::HttpTransport>,
+    sign_in: Arc<ProviderSignIn>,
 }
 
 impl Credentials {
@@ -32,10 +37,27 @@ impl Credentials {
         store: Arc<dyn CredentialStore>,
         transport: Arc<dyn zlogic_llm::transport::HttpTransport>,
     ) -> Self {
+        Self::with_codex(config, store, transport, zlogic_codex::shared())
+    }
+
+    /// With a client the caller owns, so a sign-in can be pointed somewhere other than the real
+    /// issuer.
+    pub fn with_codex(
+        config: Arc<Config>,
+        store: Arc<dyn CredentialStore>,
+        transport: Arc<dyn zlogic_llm::transport::HttpTransport>,
+        codex: Arc<zlogic_codex::Codex>,
+    ) -> Self {
+        let sign_in = Arc::new(ProviderSignIn::with_codex(
+            Arc::clone(&config),
+            Arc::clone(&store),
+            codex,
+        ));
         Self {
             config,
             store,
             transport,
+            sign_in,
         }
     }
 
@@ -44,13 +66,37 @@ impl Credentials {
     async fn provider_ids(&self) -> Result<(Vec<String>, bool)> {
         let config = self.config.snapshot().await;
         let mut ids: BTreeSet<String> = config.providers.keys().cloned().collect();
-        let catalog = zlogic_config::builtin_catalog().map_err(EngineError::from)?;
+        let catalog = zlogic_config::builtin_catalog_with_local().map_err(EngineError::from)?;
         ids.extend(catalog.providers.keys().cloned());
         ids.extend(Self::SEARCH_BACKENDS.map(str::to_string));
         Ok((ids.into_iter().collect(), config.auto_detect_env))
     }
 
-    fn state_for(&self, provider_id: &str, auto_detect_env: bool) -> CredentialState {
+    async fn state_for(&self, provider_id: &str, auto_detect_env: bool) -> CredentialState {
+        let auth = self.auth_of(provider_id).await;
+        let keyring_source = if self.store.keyring_is_local_file() {
+            CredentialSource::File
+        } else {
+            CredentialSource::Keyring
+        };
+        if auth == ProviderAuth::Chatgpt {
+            let tokens = zlogic_codex::store::load(&*self.store, provider_id);
+            return CredentialState {
+                provider_id: provider_id.to_string(),
+                present: tokens.is_some(),
+                source: if tokens.is_some() {
+                    keyring_source
+                } else {
+                    CredentialSource::Missing
+                },
+                hint: tokens.as_ref().and_then(|t| t.label()),
+                candidates: vec![
+                    CredentialRef::keyring(crate::provider_auth::oauth_entry(provider_id))
+                        .to_string(),
+                ],
+            };
+        }
+
         let candidates = credential_candidates(provider_id, auto_detect_env);
         let found = candidates.iter().find_map(|reference| {
             self.store
@@ -62,7 +108,7 @@ impl Credentials {
             present: found.is_some(),
             source: match found.as_ref().map(|(reference, _)| *reference) {
                 Some(CredentialRef::Env(_)) => CredentialSource::Env,
-                Some(CredentialRef::Keyring(_)) => CredentialSource::Keyring,
+                Some(CredentialRef::Keyring(_)) => keyring_source,
                 None => CredentialSource::Missing,
             },
             hint: found.map(|(_, value)| mask(&value)),
@@ -73,16 +119,28 @@ impl Credentials {
         }
     }
 
+    async fn auth_of(&self, provider_id: &str) -> ProviderAuth {
+        let cfg = self.config.snapshot().await;
+        auth_of(&cfg, provider_id).unwrap_or_default()
+    }
+
     async fn list_inner(&self) -> Result<Vec<CredentialState>> {
         let (ids, auto_detect_env) = self.provider_ids().await?;
-        Ok(ids
-            .iter()
-            .map(|provider_id| self.state_for(provider_id, auto_detect_env))
-            .collect())
+        let mut states = Vec::with_capacity(ids.len());
+        for provider_id in ids {
+            states.push(self.state_for(&provider_id, auto_detect_env).await);
+        }
+        Ok(states)
     }
 
     async fn set_inner(&self, req: CredentialSetReq) -> Result<CredentialState> {
         let provider_id = normalized_provider_id(&req.provider_id)?;
+        if self.auth_of(&provider_id).await == ProviderAuth::Chatgpt {
+            return Err(EngineError::Invalid(format!(
+                "provider {provider_id} signs in with a ChatGPT subscription rather than an API key; \
+                 run `zlogic auth login {provider_id}`"
+            )));
+        }
         let secret = req.value.trim();
         if secret.is_empty() {
             return Err(EngineError::Invalid(
@@ -95,17 +153,23 @@ impl Credentials {
             .map_err(|error| EngineError::Invalid(error.to_string()))?;
         self.config.reload().await.map_err(api_to_engine)?;
         let auto_detect_env = self.config.snapshot().await.auto_detect_env;
-        Ok(self.state_for(&provider_id, auto_detect_env))
+        Ok(self.state_for(&provider_id, auto_detect_env).await)
     }
 
     async fn delete_inner(&self, req: CredentialDeleteReq) -> Result<CredentialState> {
         let provider_id = normalized_provider_id(&req.provider_id)?;
-        self.store
-            .delete_keyring(&keyring_entry(&provider_id))
-            .map_err(|error| EngineError::Invalid(error.to_string()))?;
+        if self.auth_of(&provider_id).await == ProviderAuth::Chatgpt {
+            // Signing out of a client is not revoking the plan, so only the token is dropped.
+            self.sign_in.logout(&provider_id).await?;
+            self.sign_in.forget_models(&provider_id).await?;
+        } else {
+            self.store
+                .delete_keyring(&keyring_entry(&provider_id))
+                .map_err(|error| EngineError::Invalid(error.to_string()))?;
+        }
         self.config.reload().await.map_err(api_to_engine)?;
         let auto_detect_env = self.config.snapshot().await.auto_detect_env;
-        Ok(self.state_for(&provider_id, auto_detect_env))
+        Ok(self.state_for(&provider_id, auto_detect_env).await)
     }
 
     async fn verify_inner(&self, req: CredentialVerifyReq) -> ApiResult<CredentialVerifyResult> {
@@ -124,8 +188,12 @@ impl Credentials {
             .await
             .resolve(&model_ref)
             .map_err(EngineError::from)?;
-        let client =
-            crate::router::build_client(&model, &model_ref, &*self.store, self.transport.clone())?;
+        let client = crate::router::build_client(
+            &model,
+            &model_ref,
+            Arc::clone(&self.store),
+            Arc::clone(&self.transport),
+        )?;
 
         tracing::info!(
             target: "zlogic::engine",
@@ -241,6 +309,32 @@ impl CredentialService for Credentials {
 
     async fn verify(&self, req: CredentialVerifyReq) -> ApiResult<CredentialVerifyResult> {
         self.verify_inner(req).await
+    }
+
+    async fn sign_in_begin(&self, req: ProviderSignInBeginReq) -> ApiResult<ProviderSignInBegin> {
+        self.sign_in.begin(req).await
+    }
+
+    async fn sign_in_status(
+        &self,
+        req: ProviderSignInStatusReq,
+    ) -> ApiResult<ProviderSignInStatus> {
+        self.sign_in.status(req).await
+    }
+
+    async fn sign_in_cancel(&self, req: ProviderSignInCancelReq) -> ApiResult<()> {
+        self.sign_in.cancel(req)
+    }
+
+    async fn models(&self, req: ProviderModelsReq) -> ApiResult<ProviderModels> {
+        self.sign_in.models(req).await
+    }
+
+    async fn forget_models(&self, req: ProviderModelsReq) -> ApiResult<()> {
+        self.sign_in
+            .forget_models(req.provider_id.trim())
+            .await
+            .map_err(ApiError::from)
     }
 }
 

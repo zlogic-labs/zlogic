@@ -288,10 +288,10 @@ mod tests {
             "这条消息没有发送：没有可用的模型（no key）。请配置模型并设置 API key 后重新发送。"
         );
         assert!(
-            en.wire(&with_key("notice.mcp_tools_pending"))
-                .contains("Still fetching the tool manifest"),
+            en.wire(&with_key("notice.mcp_tools_expensive"))
+                .contains("every round"),
             "{}",
-            en.wire(&with_key("notice.mcp_tools_pending"))
+            en.wire(&with_key("notice.mcp_tools_expensive"))
         );
         assert_eq!(en.wire(&with_key("error.some_future_code")), "FALLBACK");
     }

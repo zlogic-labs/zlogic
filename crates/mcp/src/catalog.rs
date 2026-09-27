@@ -135,7 +135,8 @@ pub struct CatalogDirs {
     pub global_file: PathBuf,
     /// `<data>/extensions/mcp/*.json` — one file per installed server.
     pub global_dir: PathBuf,
-    /// `<cache>/mcp` — tool lists. Deleting it costs one reconnection per server, nothing else.
+    /// `<cache>/mcp` — tool lists, one subdirectory per day. Deleting a day costs one reconnection
+    /// per server, nothing else.
     pub cache: PathBuf,
 }
 
@@ -146,6 +147,41 @@ impl CatalogDirs {
             global_dir: dirs.data.join("extensions").join("mcp"),
             cache: dirs.cache.join("mcp"),
         }
+    }
+
+    /// Where today's tool lists are written.
+    ///
+    /// The per-day split is what makes retention a directory removal instead of a walk over every
+    /// file, and it is also what the read path walks backwards through: a list written yesterday
+    /// is still found today, so midnight does not cost a reconnection per server.
+    pub fn day_cache(&self, now: chrono::DateTime<chrono::Utc>) -> PathBuf {
+        self.cache.join(now.format("%Y-%m-%d").to_string())
+    }
+
+    /// Every day directory, newest first, with today first whether or not it exists yet — so a
+    /// caller can use this for both reading and writing. Each one appears once: today is already on
+    /// disk by the time the second read happens, and a duplicate would double every count taken
+    /// over this list.
+    pub fn day_caches(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<PathBuf> {
+        let today = self.day_cache(now);
+        let Ok(entries) = std::fs::read_dir(&self.cache) else {
+            return vec![today];
+        };
+        let mut days: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_day_folder)
+            })
+            .collect();
+        // Descending, so the most recent previous day is tried first and today sorts into place.
+        days.sort_by(|a, b| b.cmp(a));
+        days.retain(|path| *path != today);
+        days.insert(0, today);
+        days
     }
 
     /// The definition files inside a workspace, in load order.
@@ -700,10 +736,10 @@ fn cache_partition(def: &ServerDef, workspace_root: &Path) -> Option<String> {
     Some(format!("workspace-{digest:x}"))
 }
 
-fn cache_path(dirs: &CatalogDirs, def: &ServerDef, workspace_root: &Path) -> Option<PathBuf> {
+fn cache_path(dir: &Path, def: &ServerDef, workspace_root: &Path) -> Option<PathBuf> {
     let scope = cache_scope(def, workspace_root)?;
     let partition = cache_partition(def, workspace_root)?;
-    Some(dirs.cache.join(format!(
+    Some(dir.join(format!(
         "{}-v{}-{}-{}-{}.tools.json",
         file_stem(&def.id),
         TOOL_CACHE_VERSION,
@@ -713,22 +749,34 @@ fn cache_path(dirs: &CatalogDirs, def: &ServerDef, workspace_root: &Path) -> Opt
     )))
 }
 
+/// A `YYYY-MM-DD` folder. Anything else under the cache root is left alone: the retention sweep
+/// only ever removes a directory whose name it can read as a date.
+pub(crate) fn is_day_folder(name: &str) -> bool {
+    chrono::NaiveDate::parse_from_str(name, "%Y-%m-%d").is_ok()
+}
+
 fn read_cache(dirs: &CatalogDirs, def: &ServerDef, workspace_root: &Path) -> Option<CachedList> {
-    {
-        let raw = std::fs::read_to_string(cache_path(dirs, def, workspace_root)?).ok()?;
-        let file: CacheFile = match serde_json::from_str(&raw) {
-            Ok(f) => f,
+    let now = chrono::Utc::now();
+    for dir in dirs.day_caches(now) {
+        let Some(path) = cache_path(&dir, def, workspace_root) else {
+            return None;
+        };
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        return Some(match serde_json::from_str::<CacheFile>(&raw) {
+            Ok(file) => CachedList {
+                tools: file.tools.into_iter().map(Arc::new).collect(),
+                fetched_at: file.fetched_at,
+            },
             Err(e) => {
                 // Corrupt cache is not an error the user should see: it re-fetches.
                 tracing::debug!(target: "zlogic::mcp", server = %def.id, "unusable tool cache: {e}");
                 return None;
             }
-        };
-        Some(CachedList {
-            tools: file.tools.into_iter().map(Arc::new).collect(),
-            fetched_at: file.fetched_at,
-        })
+        });
     }
+    None
 }
 
 /// Writes a server's tool list into the cache.
@@ -745,8 +793,9 @@ pub fn write_tool_cache(
     tools: &[ToolSpec],
     now: chrono::DateTime<chrono::Utc>,
 ) -> std::io::Result<()> {
-    std::fs::create_dir_all(&dirs.cache)?;
-    let path = cache_path(dirs, def, workspace_root).ok_or_else(|| {
+    let dir = dirs.day_cache(now);
+    std::fs::create_dir_all(&dir)?;
+    let path = cache_path(&dir, def, workspace_root).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("could not resolve cache scope for MCP server `{}`", def.id),
@@ -775,19 +824,20 @@ pub fn write_tool_cache(
 }
 
 /// Removes lists for earlier fingerprints of the same server, so editing a definition repeatedly
-/// does not leave a file behind each time.
+/// does not leave a file behind each time. Every day directory is swept, not just today's: the
+/// folders the user has not reached yet must not resurrect a stale list if a clock goes backwards.
 fn prune_old_cache(dirs: &CatalogDirs, def: &ServerDef, workspace_root: &Path, keep: &Path) {
-    {
-        let Some(partition) = cache_partition(def, workspace_root) else {
-            return;
-        };
-        let prefix = format!(
-            "{}-v{}-{}-",
-            file_stem(&def.id),
-            TOOL_CACHE_VERSION,
-            partition
-        );
-        for path in json_files(&dirs.cache) {
+    let Some(partition) = cache_partition(def, workspace_root) else {
+        return;
+    };
+    let prefix = format!(
+        "{}-v{}-{}-",
+        file_stem(&def.id),
+        TOOL_CACHE_VERSION,
+        partition
+    );
+    for dir in dirs.day_caches(chrono::Utc::now()) {
+        for path in json_files(&dir) {
             let is_same_server = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -1145,7 +1195,15 @@ mod tests {
             let mut loaded = cat.load(&f.workspace, vec![]);
             cat.refresh(&mut loaded, &f.workspace).await;
         }
-        assert_eq!(json_files(&f.dirs.cache).len(), 1);
+        assert_eq!(
+            f.dirs
+                .day_caches(chrono::Utc::now())
+                .iter()
+                .map(|dir| json_files(dir).len())
+                .sum::<usize>(),
+            1,
+            "one file, in one day folder — the earlier fingerprints are gone"
+        );
     }
 
     /// A server that will not start must not empty a tool set that was working.

@@ -16,6 +16,8 @@ use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::Event;
 use zip::ZipArchive;
 
+use super::sniff::{self, Content};
+
 /// Spreadsheet and delimited formats `read_file` converts to rows.
 const TABLE_EXTENSIONS: &[&str] = &["xlsx", "xls", "xlsb", "ods", "csv", "tsv", "tab"];
 
@@ -58,7 +60,7 @@ pub(crate) enum Kind {
 }
 
 /// A plain-text file after decoding.
-pub(crate) struct DecodedText {
+pub struct DecodedText {
     pub text: String,
     /// True when the bytes were re-encoded (UTF-16 BOM or GB18030) rather than already UTF-8.
     /// Such text is NOT byte-exact with the file — an `edit` on it will not round-trip.
@@ -68,19 +70,27 @@ pub(crate) struct DecodedText {
 }
 
 /// Chooses the read strategy from the file's extension and its first bytes.
-/// The extension drives the choice (the contract is "read by suffix"), and the magic bytes
-/// verify the image case: a `.png` that is really a text file is read as text rather than
-/// attached as media and then refused by the wire gate's declared-vs-actual MIME check.
+/// The extension drives the choice (the contract is "read by suffix"), and the bytes verify
+/// the media case: a `.png` that is really a text file is read as text rather than attached as
+/// media and then refused by the wire gate's declared-vs-actual MIME check — and a video saved
+/// as `.dat` is captured rather than refused as binary.
 pub(crate) fn classify(path: &Path, raw: &[u8]) -> Kind {
     let ext = extension(path);
-    if let Some(mime) = detect_image_mime(raw) {
-        return Kind::Image(mime);
+    match sniff::sniff(raw) {
+        // Checked before the suffix, so a mislabelled image still reads as an image and a
+        // mislabelled video still previews. A signature is worth more than a name.
+        Content::Binary(mime) if mime.starts_with("image/") => return Kind::Image(mime),
+        Content::Binary(mime) if mime.starts_with("audio/") || mime.starts_with("video/") => {
+            return Kind::Media(mime);
+        }
+        _ => {}
     }
     match ext.as_str() {
         e if TABLE_EXTENSIONS.contains(&e) => Kind::Table,
         "docx" => Kind::Docx,
         // Audio / video: captured whole for the UI preview, never decoded to text. Checked
-        // after the image-magic path so a misnamed image still reads as an image.
+        // after the magic path so a video whose bytes say so is captured even under a name
+        // that says nothing.
         e if MEDIA_EXTENSIONS.contains(&e) => Kind::Media(
             crate::ToolDisplay::guess_mime(&path.to_string_lossy())
                 .unwrap_or("application/octet-stream"),
@@ -102,7 +112,7 @@ pub(crate) fn classify(path: &Path, raw: &[u8]) -> Kind {
 /// 3. GB18030 — covers GBK/GB2312, the common legacy encoding for Chinese text files. A NUL
 ///    byte marks real binary (no readable text encoding emits one), where a lucky GB18030
 ///    decode would be mojibake, not a file.
-pub(crate) fn decode_text(raw: &[u8]) -> Option<DecodedText> {
+pub fn decode_text(raw: &[u8]) -> Option<DecodedText> {
     if let Ok(text) = std::str::from_utf8(raw) {
         return Some(DecodedText {
             text: text.to_owned(),
@@ -138,22 +148,6 @@ fn decode_utf16(
         converted: true,
         encoding: name,
     })
-}
-
-/// The visual MIME of `raw`, from its magic bytes. `None` when the bytes are not a
-/// PNG/JPEG/GIF/WebP image.
-pub(crate) fn detect_image_mime(raw: &[u8]) -> Option<&'static str> {
-    if raw.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if raw.starts_with(b"\xff\xd8\xff") {
-        Some("image/jpeg")
-    } else if raw.starts_with(b"GIF87a") || raw.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if raw.len() >= 12 && &raw[..4] == b"RIFF" && &raw[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else {
-        None
-    }
 }
 
 /// One sheet of a table file: the header row plus the data rows below it.

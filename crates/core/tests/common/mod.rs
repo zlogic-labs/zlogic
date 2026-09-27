@@ -154,6 +154,7 @@ pub fn model() -> ResolvedModel {
         wiring: Default::default(),
         network: Default::default(),
         credential_refs: Vec::new(),
+        auth: Default::default(),
         context_window: 100_000,
         max_output_tokens: None,
         compaction_threshold: None,
@@ -166,6 +167,7 @@ pub fn model() -> ResolvedModel {
             currency: "USD".into(),
         }),
         default_params: Default::default(),
+        rate_limit: None,
         config_revision: 1,
     }
 }

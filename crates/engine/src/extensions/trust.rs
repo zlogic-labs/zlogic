@@ -78,7 +78,7 @@ pub fn withheld_message(
     }
     let count = withheld.len();
     let message = format!(
-        "{count} MCP servers from this project will not start until you confirm them:\n{}\nConfirm one with `/mcp trust <id>`; list all with `/mcp`.",
+        "{count} MCP servers from this project will not start until you allow them in this workspace:\n{}",
         lines.join("\n")
     );
     let mut args = std::collections::BTreeMap::new();
@@ -240,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn the_notice_carries_the_disclosure_and_the_way_to_approve() {
+    fn the_notice_carries_the_disclosure_and_where_to_allow_it() {
         let never = def(
             "a",
             Origin::Workspace,
@@ -257,8 +257,8 @@ mod tests {
         assert!(message.contains("not confirmed yet"), "{message}");
         assert!(message.contains("no longer applies"), "{message}");
         assert!(
-            message.contains("/mcp trust"),
-            "must spell out how to confirm: {message}"
+            message.contains("this workspace"),
+            "must say what has to happen for them to run: {message}"
         );
         assert!(message.contains("⚠"), "{message}");
     }

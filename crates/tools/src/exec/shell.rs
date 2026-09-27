@@ -1,16 +1,28 @@
 //! `shell` — run one command and report what it printed.
-//! # Wait for the exit, or ask for the background
-//! A call waits for the process to exit, and kills it at its timeout (30 s by default, one minute
-//! at most). Two flags cover everything that does not fit in that box:
-//! - `wait: true` — the result is required before the turn can continue. The call runs to
-//!   completion, however many minutes that takes; `timeout_ms` becomes an optional hard stop.
+//! # The caller does not pick the deadline
+//! A call waits for the process to exit, and the budget it waits under comes from the command
+//! itself: a quick check gets a minute, a test run ten, a build twenty. Asking the model for a
+//! number before it knows how long the work takes produces bad numbers in both directions — too
+//! short and it re-runs a suite that was about to finish, too long and one call holds the turn
+//! for an hour. So it says *whether* it needs the result instead, and the tool works out the rest.
+//! Two flags cover everything outside that:
+//! - `wait: true` — the result is required before the turn can continue. The class budget does not
+//!   apply; only a stall, a cancellation, or a very generous backstop ends it.
 //! - `background: true` — the work outlives the call. The already-running child is handed to the
 //!   process-wide task runtime, which never re-runs it.
+//!
 //! Neither happens on its own. A recognised server/watcher is refused unless it is asked for as
 //! background work (waiting for `npm run dev` to exit would hang forever), and a slow command is
 //! killed at its ceiling rather than quietly turned into a task: a call whose outcome flips
 //! between "here is your result" and "here is a task id" cannot be relied on by the model calling
 //! it.
+//! # Silence is a different fact from slowness
+//! A command that has printed nothing for ten minutes is not slow, it is stuck — waiting on a
+//! port, a lock, or input that will never arrive. That deserves a different verdict from "this
+//! exceeded its budget", because the two call for opposite responses: one wants a longer run, the
+//! other wants a narrower command. So they are reported separately. Meanwhile the console is never
+//! left blank: a call that is still running says how long it has been going and how long since its
+//! last output, which is what separates "slow" from "wedged" for the person watching it.
 //! # Output is bounded in memory but complete on disk
 //! Streams are held in a [`HeadTail`] buffer, which keeps a bounded head and a **larger tail**.
 //! The tail is where it matters: a failing test's assertion, a compiler's error summary and an
@@ -31,6 +43,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::AsyncReadExt;
+use zlogic_proctree::{Console, Tree};
 use zlogic_protocol::llm::ToolDefinition;
 use zlogic_protocol::stream::OutputStream;
 
@@ -39,33 +52,44 @@ use crate::{
     ToolMeta, ToolRisk, parse_args,
 };
 
-const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+/// How long a command of each class may run before it is killed and reported.
+/// The point of a per-class budget is that the common case needs no decision from the caller: a
+/// test run gets ten minutes whether or not anyone thought to ask for ten minutes, so the failure
+/// this replaces — a suite killed at thirty seconds and re-run four times — cannot happen. The
+/// numbers are deliberately generous at the top: a budget that is too long costs one slow turn,
+/// while one that is too short costs the whole test run plus every retry after it.
+const QUICK_BUDGET: Duration = Duration::from_secs(60);
+const TEST_BUDGET: Duration = Duration::from_secs(10 * 60);
+const BUILD_BUDGET: Duration = Duration::from_secs(20 * 60);
 
-/// Ceiling for a call that is **not** willing to wait for a result.
-/// Past this the caller has to say which it wants: `wait: true` to have the result in this call,
-/// or `background: true` to stop waiting. A silent promotion to a background task used to make
-/// that decision on the caller's behalf, which is what made an ordinary call's outcome
-/// unpredictable.
-const MAX_TIMEOUT_MS: u64 = 60_000;
+/// Backstop for `wait: true`, which otherwise has no class budget.
+/// The flag says the result is required, and killing the work at an arbitrary point hands back
+/// the same failure the caller was trying to avoid. But "no deadline at all" means a command
+/// waiting on a port nobody opened holds the turn until the user gives up on it, so this exists
+/// to bound the damage rather than to be a budget anyone plans around.
+const WAIT_BACKSTOP: Duration = Duration::from_secs(60 * 60);
 
-/// Largest `timeout_ms` a waiting call may ask for.
-/// `wait: true` **without** `timeout_ms` has no deadline at all: the flag exists because the
-/// result is required, and killing the work at some arbitrary minute hands back the same failure
-/// the caller was trying to avoid. This bound only applies to a caller that wants a hard stop.
-const WAIT_MAX_TIMEOUT_MS: u64 = 30 * 60_000;
+/// No output at all for this long means the command is stuck, not slow.
+///
+/// Independent of the wall clock on purpose. A build that is compiling for nine minutes and prints
+/// `Compiling…` throughout is working; a process that has said nothing for ten minutes is waiting
+/// for something that is never going to arrive. Sharing one deadline cannot tell those apart, and
+/// guessing wrong in the direction of "still working" is what produces the wedge this detects.
+const STALL_LIMIT: Duration = Duration::from_secs(10 * 60);
+
+/// How often a running call reports that it is still running.
+/// A blank console is indistinguishable from a hang, so the wait is narrated. The line goes to the
+/// UI and not to the model: it is true at every moment and worth nothing in context, whereas the
+/// stall verdict below is a fact the model has to act on. Checked on the [`CHILD_EXIT_POLL`] tick
+/// rather than on a timer of its own, so the real cadence is the poll rounded up to the interval.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How often a call that is still reading output checks whether its child has already exited.
 /// A wrapper that spawns something long-lived and returns leaves pipes that only its descendant
-/// holds. Reading them would never reach EOF, and with `wait: true` there is no deadline to end
-/// that wait: the call would sit there until the user stopped the turn. Once the direct child is
-/// gone and the streams have gone quiet, this call has everything it is going to get.
+/// holds. Reading them would never reach EOF, and the loop below can otherwise wait on a stream
+/// that will never close. Once the direct child is gone and the streams have gone quiet, this
+/// call has everything it is going to get.
 const CHILD_EXIT_POLL: Duration = Duration::from_secs(1);
-
-/// How long a terminated process gets before it is killed outright.
-/// Only meaningful on Unix, where a graceful SIGTERM phase precedes SIGKILL. On Windows
-/// `start_kill()` is already a hard TerminateProcess, so there is no grace period to bound.
-#[cfg(unix)]
-const SIGKILL_GRACE: Duration = Duration::from_secs(2);
 
 /// Per-stream head and tail budgets, in characters.
 /// `stderr` gets less than `stdout` because it is usually the short, high-signal channel; both
@@ -84,10 +108,10 @@ struct Args {
     description: Option<String>,
     /// Defaults to the working directory.
     path: Option<String>,
-    timeout_ms: Option<u64>,
     #[serde(default)]
     background: bool,
-    /// Wait for the process to exit however long it takes, instead of killing it at the timeout.
+    /// Wait for the process to exit however long it takes, instead of killing it at the budget
+    /// its class would get.
     #[serde(default)]
     wait: bool,
 }
@@ -125,6 +149,55 @@ struct ShellBackend {
 #[derive(Debug, Clone)]
 pub struct Shell {
     backend: ShellBackend,
+    /// How long each class of command is allowed to run.
+    budgets: ShellBudgets,
+}
+
+/// The time limits [`Shell`] applies.
+///
+/// Public because it is configuration, not an internal detail: the engine reads `tools.shell` from
+/// the global config and from a workspace's `.zlogic/settings.yaml` and hands the merged result
+/// back through [`Shell::with_budgets`]. Kept as its own type rather than read from the config
+/// inside the tool so that the tool never has to know where configuration comes from, and so a
+/// test can reach the kill paths with millisecond limits.
+#[derive(Debug, Clone, Copy)]
+pub struct ShellBudgets {
+    pub quick: Duration,
+    pub test: Duration,
+    pub build: Duration,
+    /// Ceiling for `wait: true`, which has no class budget of its own.
+    pub waiting: Duration,
+    /// No output for this long is a stall, whatever the wall clock says.
+    pub stall: Duration,
+    /// How often a running call narrates itself to the UI.
+    pub progress: Duration,
+}
+
+impl Default for ShellBudgets {
+    fn default() -> Self {
+        Self {
+            quick: QUICK_BUDGET,
+            test: TEST_BUDGET,
+            build: BUILD_BUDGET,
+            waiting: WAIT_BACKSTOP,
+            stall: STALL_LIMIT,
+            progress: PROGRESS_INTERVAL,
+        }
+    }
+}
+
+impl From<&zlogic_protocol::settings::ShellConfig> for ShellBudgets {
+    fn from(cfg: &zlogic_protocol::settings::ShellConfig) -> Self {
+        let s = Duration::from_secs;
+        Self {
+            quick: s(cfg.quick_secs),
+            test: s(cfg.test_secs),
+            build: s(cfg.build_secs),
+            waiting: s(cfg.wait_secs),
+            stall: s(cfg.stall_secs),
+            progress: s(cfg.progress_secs),
+        }
+    }
 }
 
 impl Default for Shell {
@@ -179,7 +252,10 @@ impl Shell {
                 ShellDialect::Posix,
             )?,
         };
-        Ok(Self { backend })
+        Ok(Self {
+            backend,
+            budgets: ShellBudgets::default(),
+        })
     }
 
     pub fn dialect(&self) -> ShellDialect {
@@ -207,7 +283,26 @@ impl Shell {
             syntax: "POSIX shell",
             dialect: ShellDialect::Posix,
         };
-        Self { backend }
+        Self {
+            backend,
+            budgets: ShellBudgets::default(),
+        }
+    }
+
+    /// The same shell under different time limits.
+    ///
+    /// Takes `&self` rather than being built from a preference so the backend is not re-probed:
+    /// a workspace that changes one budget must not be able to end up launching a different shell
+    /// than the one its definition, its policy dialect and its sibling tools all refer to.
+    pub fn with_budgets(&self, budgets: ShellBudgets) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            budgets,
+        }
+    }
+
+    pub fn budgets(&self) -> ShellBudgets {
+        self.budgets
     }
 }
 
@@ -381,25 +476,33 @@ impl Tool for Shell {
     }
 
     fn definition(&self) -> ToolDefinition {
+        let budgets = self.budgets;
         ToolDefinition {
             name: "shell".into(),
             description: format!(
                 "Run a {syntax} command with {backend}. Returns its exit status, stdout and \
-                 stderr. The call waits for the command to exit. If the result is something you \
-                 must have before you can continue — a test suite, a type check, a slow build — \
-                 pass `wait: true` and leave `timeout_ms` out: the call then runs to completion, \
-                 however long that takes. Without `wait`, a command still running after {default}s \
-                 is killed (the ceiling is {max}s). Pass `background: true` for work that outlives \
-                 the call — servers, watchers, a build you want to run while you do something \
-                 else: it returns a task id immediately and the process keeps running. Commands \
-                 that never exit are refused unless `background: true` is given. When a background \
-                 task comes from a command that terminates (compile, test), the turn waits up to \
-                 the configured budget for it before ending, so the result can land in the same \
-                 reply; servers and watchers are never waited on. Filter large output at the \
-                 source. Prefer the file tools for filesystem changes because they report the \
-                 changed paths.",
-                default = DEFAULT_TIMEOUT_MS / 1000,
-                max = MAX_TIMEOUT_MS / 1000,
+                 stderr. The call waits for the command to exit, and the time it is allowed to \
+                 take comes from the command itself — up to {quick} for a quick check, {test} for \
+                 a test run, {build} for a build or install — so a test suite is not cut off at \
+                 the same budget as `git status`. There is no timeout argument: you say whether \
+                 you need the result, and the tool decides how long that takes. Pass `wait: true` \
+                 when the result is something you must have before you can continue and the \
+                 budget might not be enough; the call then runs until the command exits, until it \
+                 goes silent for {stall}, or until the conversation is cancelled. Pass \
+                 `background: true` for work that outlives the call — servers, watchers, a build \
+                 you want to run while you do something else: it returns a task id immediately and \
+                 the process keeps running. Commands that never exit are refused unless \
+                 `background: true` is given. A running call reports its progress, and a command \
+                 that stops producing output is reported as stuck rather than as slow. When a \
+                 background task comes from a command that terminates (compile, test), the turn \
+                 waits up to the configured budget for it before ending, so the result can land \
+                 in the same reply; servers and watchers are never waited on. Filter large output \
+                 at the source. Prefer the file tools for filesystem changes because they report \
+                 the changed paths.",
+                quick = elapsed(budgets.quick),
+                test = elapsed(budgets.test),
+                build = elapsed(budgets.build),
+                stall = elapsed(budgets.stall),
                 syntax = self.backend.syntax,
                 backend = self.backend.label,
             ),
@@ -417,21 +520,13 @@ impl Tool for Shell {
                     },
                     "description": { "type": "string", "description": "One sentence shown to the user when asking for permission" },
                     "path": { "type": "string", "description": "Directory to run in; defaults to the working directory" },
-                    "timeout_ms": {
-                        "type": "integer", "minimum": 1000, "maximum": WAIT_MAX_TIMEOUT_MS,
-                        "description": format!(
-                            "Optional hard stop in milliseconds; a waiting call without it runs to \
-                             completion. Default {DEFAULT_TIMEOUT_MS}, maximum {MAX_TIMEOUT_MS} \
-                             unless wait is true."
-                        )
-                    },
                     "wait": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Run until the process exits, however long it takes, and \
-                                        return its result in this call. For anything whose result \
-                                        you need — tests, type checks, builds. Leave timeout_ms \
-                                        out unless you want a hard stop"
+                        "description": "Run until the process exits rather than at the budget its \
+                                        command would get, and return its result in this call. For \
+                                        anything whose result you need and whose runtime you cannot \
+                                        predict — a long test suite, a cold build"
                     },
                     "background": {
                         "type": "boolean",
@@ -465,8 +560,9 @@ impl Tool for Shell {
             ));
         }
         // A command that never exits is refused rather than started, whatever else was asked for:
-        // with `wait` it would hang the call forever, and without it the call would be killed at
-        // its timeout having reported nothing useful. Background is the one answer that works.
+        // with `wait` it would hold the call for the backstop, and without it the call would be
+        // killed at its budget having reported nothing useful. Background is the one answer that
+        // works.
         if let Some(hint) = looks_long_running(&command)
             && !a.background
         {
@@ -489,41 +585,23 @@ impl Tool for Shell {
             Some(p) => ctx.resolve_path(p).path,
             None => ctx.exec_cwd.clone(),
         };
-        // Past the ceiling the caller has to choose, not be silently clamped: answering a request
-        // for ten minutes with a one-minute kill answers a different question. `wait: true` is
-        // what raises the ceiling.
-        let cap = if a.wait {
-            WAIT_MAX_TIMEOUT_MS
+        let class = classify(&command);
+        // `wait: true` replaces the class budget rather than adding to it. The class is what says
+        // how long this kind of work takes; a caller that knows it needs the result anyway is
+        // saying the estimate does not apply here, and the backstop bounds the mistake.
+        let budget = if a.wait {
+            self.budgets.waiting
         } else {
-            MAX_TIMEOUT_MS
+            class.budget(self.budgets)
         };
-        if let Some(ms) = a.timeout_ms
-            && ms > cap
-        {
-            return Ok(ToolExecResult::failed(if a.wait {
-                format!(
-                    "timeout_ms is capped at {cap}. Leave it out and the command runs to \
-                     completion."
-                )
-            } else {
-                format!(
-                    "timeout_ms is capped at {cap} unless `wait: true` is passed. If this command's \
-                     result is what you need, pass `wait: true` and leave `timeout_ms` out — it \
-                     then runs to completion, however long that takes. If the work outlives this \
-                     call, pass `background: true`."
-                )
-            }));
-        }
-        // `Some` is a hard stop. `None` — only reachable with `wait: true` and no `timeout_ms` —
-        // means the call ends when the command does, or when it is cancelled.
-        let deadline = if a.wait && a.timeout_ms.is_none() {
-            None
-        } else {
-            Some(Duration::from_millis(
-                a.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(cap),
-            ))
-        };
-        let timeout = deadline.unwrap_or(Duration::from_millis(DEFAULT_TIMEOUT_MS));
+        let stall_limit = self.budgets.stall;
+        let progress_interval = self.budgets.progress;
+        ctx.progress(&format!(
+            "running · {label} · up to {budget}\n",
+            label = class.label(),
+            budget = elapsed(budget),
+        ));
+        let deadline = tokio::time::Instant::now() + budget;
 
         let mut process = tokio::process::Command::new(&self.backend.program);
         process
@@ -536,20 +614,15 @@ impl Tool for Shell {
             .envs(child_env(&ctx.runtime_paths))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(false);
-        // cmd.exe / pwsh / powershell / bash are console apps: from a GUI host (desktop) a plain
-        // spawn would open a console window for every shell call. CREATE_NO_WINDOW runs them
-        // headless — output still flows through the pipes above.
-        #[cfg(windows)]
-        process.creation_flags(0x0800_0000);
-        // A shell wrapper commonly launches the real server/test process as a child. Giving the
-        // command its own group lets cancellation stop that whole tree instead of orphaning the
-        // descendant with our stdout/stderr pipes still open.
-        #[cfg(unix)]
-        process.process_group(0);
+            .stderr(Stdio::piped());
 
-        let mut child = match process.spawn() {
+        // cmd.exe / pwsh / powershell / bash are console apps: from a GUI host (desktop) a plain
+        // spawn would open a console window for every shell call, so the console is suppressed.
+        // A shell wrapper also commonly launches the real server/test process as a child, which
+        // is why this is a `Tree` and not a bare `Child`: the wrapper, its descendants, and — on
+        // Windows, where the job object is closed by the kernel when zlogic exits — anything
+        // either of them goes on to spawn all die with this call.
+        let mut child = match Tree::spawn(process, Console::Hidden) {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolExecResult::failed(format!(
@@ -560,8 +633,8 @@ impl Tool for Shell {
             }
         };
 
-        let mut stdout = child.stdout.take().expect("stdout was piped");
-        let mut stderr = child.stderr.take().expect("stderr was piped");
+        let mut stdout = child.take_stdout().expect("stdout was piped");
+        let mut stderr = child.take_stderr().expect("stderr was piped");
         if a.background {
             return adopt_process(self, ctx, command, cwd, child, stdout, stderr).await;
         }
@@ -576,10 +649,20 @@ impl Tool for Shell {
         let mut err_buf = [0u8; 8192];
         let mut out_open = true;
         let mut err_open = true;
-        // One deadline, or none. `None` only happens for a waiting call that gave no `timeout_ms`:
-        // it ends when the command does, or when the turn is cancelled.
-        let deadline = deadline.map(|after| tokio::time::Instant::now() + after);
+        // Deliberately *not* the instant `deadline` was derived from: the budget covers the spawn
+        // (a spawn that never returns must still end the call), but the stall clock and the
+        // reported runtime start here, because before this point the command had no chance to say
+        // anything and calling that silence would be wrong.
+        let started = tokio::time::Instant::now();
         let mut ending: Option<Ending> = None;
+        // When the last byte of output arrived. Reset on every chunk from either stream, because
+        // the question the stall timer asks is "has this said anything lately", not "has it ever
+        // said anything" — a test suite that reports each case is visibly alive even in a long
+        // quiet stretch between them.
+        let mut last_output = started;
+        // When the last progress line went out. The UI needs to be told the call is alive well
+        // before the stall limit, not at it.
+        let mut last_progress = started;
         // Set when the loop stopped because the child was gone while its pipes were not: a
         // descendant is still holding them, and anything it prints from here is not this call's
         // output. Reported rather than silently dropped.
@@ -596,6 +679,7 @@ impl Tool for Shell {
                         ctx.emit(OutputStream::Stdout, &chunk);
                         transcript.push_str(&chunk);
                         out.push(&chunk);
+                        last_output = tokio::time::Instant::now();
                     }
                 },
                 n = stderr.read(&mut err_buf), if err_open => match n {
@@ -605,40 +689,73 @@ impl Tool for Shell {
                         ctx.emit(OutputStream::Stderr, &chunk);
                         transcript.push_str(&chunk);
                         err.push(&chunk);
+                        last_output = tokio::time::Instant::now();
                     }
                 },
                 // Terminate, then kill. A process that ignores the signal must not be left
                 // running: by the time this returns it is dead, and the model's recourse is
-                // `wait: true`, a larger timeout_ms, or handing the job to the background.
-                _ = tokio::time::sleep_until(
-                    deadline.unwrap_or_else(tokio::time::Instant::now)
-                ), if deadline.is_some() => {
+                // `wait: true` or handing the job to the background.
+                _ = tokio::time::sleep_until(deadline) => {
                     ending = Some(Ending::TimedOut);
-                    terminate(&mut child).await;
+                    child.terminate().await;
+                    break;
+                }
+                // Nothing at all for the stall limit. Separate from the wall clock because the
+                // two mean opposite things to whoever reads the result: a command that ran out of
+                // budget is slow and wants a longer run, and one that has been silent for ten
+                // minutes is waiting for something that is never coming — a port, a lock, input
+                // this call cannot give it — and wants a narrower command instead. Reporting the
+                // second as the first sends the model off to re-run the thing that is already
+                // wedged.
+                _ = tokio::time::sleep_until(last_output + stall_limit) => {
+                    ending = Some(Ending::Stalled);
+                    child.terminate().await;
                     break;
                 }
                 // Cancellation reaches the child, not just the loop. Output already collected is
                 // kept and reported: a killed build's first error is still the answer.
                 _ = ctx.cancel.cancelled() => {
                     ending = Some(Ending::Cancelled);
-                    terminate(&mut child).await;
+                    child.terminate().await;
                     break;
                 }
-                // Nothing arrived for a second: if the child is already gone, the pipes it left
-                // behind belong to a descendant and will never reach EOF (see [`CHILD_EXIT_POLL`]).
+                // Ticks every second. Carries the two things that are checked rather than
+                // awaited — the child-exit poll, which cannot be a deadline because the condition
+                // it guards against has no time bound, and the progress line.
                 _ = tokio::time::sleep(CHILD_EXIT_POLL) => {
+                    let now = tokio::time::Instant::now();
                     if matches!(child.try_wait(), Ok(Some(_))) {
                         detached_output = true;
                         break;
+                    }
+                    if now.duration_since(last_progress) >= progress_interval {
+                        last_progress = now;
+                        // How long it has been going, and how long since it last said anything.
+                        // The second number is the one that matters: a gap that keeps growing is
+                        // what a person watching a blank console cannot see for themselves.
+                        ctx.progress(&format!(
+                            "still running · {} elapsed · {} since the last output\n",
+                            elapsed(now.duration_since(started)),
+                            elapsed(now.duration_since(last_output)),
+                        ));
                     }
                 }
             }
         }
 
         let status = child.wait().await;
+        let ran_for = tokio::time::Instant::now().duration_since(started);
         let (status_line, failed) = match (&ending, &status) {
             (Some(Ending::TimedOut), _) => (
-                format!("timed out after {}ms and was killed", timeout.as_millis()),
+                format!("ran out of time after {} and was killed", elapsed(budget)),
+                true,
+            ),
+            (Some(Ending::Stalled), _) => (
+                format!(
+                    "printed nothing for {} and was killed — it was waiting for something, not \
+                     working",
+                    elapsed(ran_for)
+                ),
                 true,
             ),
             (Some(Ending::Cancelled), _) => ("interrupted".to_string(), true),
@@ -656,9 +773,10 @@ impl Tool for Shell {
         };
 
         let mut body = format!(
-            "command: {}\ncwd: {}\nstatus: {status_line}\n",
+            "command: {}\ncwd: {}\nstatus: {status_line}\nran for: {}\n",
             summarize_command(&command),
-            cwd.display()
+            cwd.display(),
+            elapsed(ran_for),
         );
         let omitted = out.omitted() + err.omitted();
         if omitted > 0 {
@@ -677,15 +795,22 @@ impl Tool for Shell {
                 err.render()
             ));
         }
-        if matches!(ending, Some(Ending::TimedOut)) {
-            body.push_str(&format!("\n{}", timeout_guidance(a.wait)));
+        match &ending {
+            Some(Ending::TimedOut) => {
+                body.push_str(&format!("\n{}", timeout_guidance(a.wait, class)));
+            }
+            Some(Ending::Stalled) => {
+                body.push_str(&format!("\n{}", stall_guidance(class)));
+            }
+            _ => {}
         }
         if detached_output {
             body.push_str(
                 "\n--- output may be incomplete ---\n\
                  - The command exited, but a process it started still holds its output stream, so \
                  this call stopped reading rather than wait for an EOF that will never come.\n\
-                 - Anything printed after this point is not in the result above.",
+                 - That leftover process was stopped along with the rest of the command's tree; \
+                 anything printed after this point is not in the result above.",
             );
         }
         if let Some(guidance) = not_found_guidance(
@@ -703,7 +828,10 @@ impl Tool for Shell {
 
         let mut result = if matches!(ending, Some(Ending::Cancelled)) {
             ToolExecResult::cancelled(body)
-        } else if matches!(ending, Some(Ending::TimedOut)) {
+        } else if matches!(ending, Some(Ending::TimedOut) | Some(Ending::Stalled)) {
+            // Both are `Timeout`: a call that ran out of room and one that wedged are the same
+            // fact to an audit — it did not finish. The distinction the model acts on is in the
+            // body, and it is a large one.
             ToolExecResult::timeout(body)
         } else if failed {
             // A non-zero exit reaches the model as an error, so it does not build on a failed
@@ -730,6 +858,8 @@ impl Tool for Shell {
 
 enum Ending {
     TimedOut,
+    /// Alive, but silent past the point where silence means it is waiting rather than working.
+    Stalled,
     Cancelled,
 }
 
@@ -739,12 +869,12 @@ async fn adopt_process(
     ctx: &ToolCtx,
     command: String,
     cwd: PathBuf,
-    mut child: tokio::process::Child,
+    mut child: Tree,
     stdout: tokio::process::ChildStdout,
     stderr: tokio::process::ChildStderr,
 ) -> Result<ToolExecResult> {
     let Some(tasks) = &ctx.tasks else {
-        terminate(&mut child).await;
+        child.terminate().await;
         return Ok(ToolExecResult::failed(
             "background was requested, but this deployment has no background task runtime",
         ));
@@ -803,33 +933,6 @@ fn summarize_command(command: &str) -> String {
         summary.push_str(&format!(" … ({total} characters total)"));
     }
     summary
-}
-
-/// Asks the child to stop, then makes it.
-async fn terminate(child: &mut tokio::process::Child) {
-    // `start_kill` is SIGKILL on Unix in tokio's API, so the polite signal has to be sent
-    // directly. Without a graceful phase a shell wrapper dies while its own children keep
-    // running, and the output they were about to produce is lost.
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        // SIGTERM (15) via `kill`: sending a signal ourselves would mean a `libc` dependency for
-        // one call, and `kill` is present on every platform where `bash -c` is.
-        let _ = tokio::process::Command::new("kill")
-            .arg("-TERM")
-            .arg("--")
-            .arg(format!("-{pid}"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-        if tokio::time::timeout(SIGKILL_GRACE, child.wait())
-            .await
-            .is_ok()
-        {
-            return;
-        }
-    }
-    let _ = child.start_kill();
 }
 
 /// Bounded accumulator that keeps the head and a larger tail while counting everything.
@@ -1023,31 +1126,197 @@ fn words(command: &str) -> impl Iterator<Item = &str> {
     command.split_whitespace()
 }
 
+/// How much room a command needs, inferred from what it is rather than from what the caller
+/// thinks it costs.
+///
+/// This is the whole reason `timeout_ms` is gone. The caller knows whether it needs the result and
+/// has no way to know how long the work takes, so a number it supplies is a guess in both
+/// directions — and both directions are expensive. Too short and a test suite is killed at thirty
+/// seconds, four times, having never run; too long and one call holds the turn for an hour. The
+/// class is the same judgement [`looks_long_running`] already makes, extended from "will this ever
+/// exit" to "how long does it take when it does".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandClass {
+    /// Something whose answer is a fact about the repository: status, a diff, a file listing.
+    Quick,
+    /// A test run. Slow by nature and worthless if cut off — a killed suite has told nobody
+    /// anything, which is exactly why the retry loop it used to cause was so expensive.
+    Test,
+    /// A compile, a type check, an install. Longer than a test run and, unlike one, usually says
+    /// something while it works.
+    Build,
+}
+
+impl CommandClass {
+    fn budget(self, budgets: ShellBudgets) -> Duration {
+        match self {
+            Self::Quick => budgets.quick,
+            Self::Test => budgets.test,
+            Self::Build => budgets.build,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Quick => "a quick command",
+            Self::Test => "a test run",
+            Self::Build => "a build or install",
+        }
+    }
+}
+
+fn classify(command: &str) -> CommandClass {
+    let c = command.to_ascii_lowercase();
+    // Test before build: `cargo test` compiles on its way to running, and the run is the part
+    // that has to finish. `gradle test` likewise.
+    if is_any(
+        &c,
+        &[
+            "cargo test",
+            "cargo nextest",
+            "go test",
+            "npm test",
+            "npm run test",
+            "pnpm test",
+            "yarn test",
+            "bun test",
+            "vitest",
+            "jest",
+            "pytest",
+            "phpunit",
+            "rspec",
+            "mvn test",
+            "gradle test",
+            "dotnet test",
+            "playwright test",
+            "cypress run",
+        ],
+    ) {
+        return CommandClass::Test;
+    }
+    if is_any(
+        &c,
+        &[
+            "cargo build",
+            "cargo check",
+            "cargo clippy",
+            "go build",
+            "npm run build",
+            "pnpm build",
+            "yarn build",
+            "vite build",
+            "next build",
+            "nuxt build",
+            "tsc",
+            "webpack",
+            "rollup",
+            "esbuild",
+            "make",
+            "cmake",
+            "gradle build",
+            "gradlew",
+            "mvn package",
+            "mvn compile",
+            "dotnet build",
+            "pip install",
+            "npm install",
+            "npm ci",
+            "pnpm install",
+            "yarn install",
+            "cargo install",
+            "uv pip",
+            "poetry install",
+            "bundle install",
+        ],
+    ) {
+        return CommandClass::Build;
+    }
+    CommandClass::Quick
+}
+
+fn is_any(command: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|n| command.contains(n))
+}
+
+/// A duration as a person would say it out loud: `45s`, `10m`, `1h 5m`.
+/// Millisecond counts in a result read as a machine talking, and the reader is trying to work out
+/// whether to wait longer or give up — which is a question about minutes.
+fn elapsed(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 fn is_shell_backgrounded(command: &str) -> bool {
     let command = command.trim_end();
     command.ends_with('&') && !command.ends_with("&&")
 }
 
-/// What to do when a non-waiting call was killed at its deadline.
-/// Leads with the two things that actually help — `background` for something meant to keep
-/// running, `wait` **without** a `timeout_ms` for a result that cannot be given up on. The
-/// deadline itself is deliberately not the subject here: a call that needs its result should not
-/// be choosing a number at all.
-fn timeout_guidance(waiting: bool) -> String {
+/// What to do when a call was killed at its budget.
+/// The advice is split by what the reader knows, which is not the same as what went wrong: whether
+/// they said `wait: true` decides whether there is anything left to change. A non-waiting call has
+/// a budget it never chose, and the one move that reliably helps is asking for the result.
+fn timeout_guidance(waiting: bool, class: CommandClass) -> String {
     let mut s = String::from("--- what to do about the timeout ---\n");
+    let first = if waiting {
+        format!(
+            "- This ran for the full backstop that `wait: true` allows. The command is {}; if it \
+             legitimately needs longer than that, run it with background: true and read the \
+             result when its notification arrives.\n",
+            class.label()
+        )
+    } else {
+        format!(
+            "- This is {}'s budget, which shell chose from the command. If its result is what you \
+             need, pass `wait: true` next time and it runs to completion instead.\n",
+            class.label()
+        )
+    };
+    s.push_str(&first);
     s.push_str(
         "- If it was meant to keep running, retry with background: true so it gets a task id, \
          durable output, and can be stopped.\n",
     );
-    s.push_str(if waiting {
-        "- This was the hard stop this call asked for. Leave `timeout_ms` out next time and the \
-         command runs to completion.\n"
-    } else {
-        "- If its result is what you need, retry with `wait: true` and no `timeout_ms`: tests, \
-         builds and installs should always be run that way. It then runs to completion, however \
-         long that takes.\n"
-    });
+    s.push_str(
+        "- Do not simply re-run it unchanged: the same command under the same budget will \
+                be killed the same way.\n",
+    );
     s.push_str("- If it was waiting for input, it will never get any here.");
+    s
+}
+
+/// What to do when a call was killed for printing nothing.
+///
+/// Deliberately does not say "try again with a longer timeout". A process that has said nothing
+/// for ten minutes is not slow, it is blocked, and giving the block more time is the one move
+/// guaranteed not to help. The leads are the things that actually unblock it: something the
+/// command is waiting for that this call cannot provide, or a smaller piece of the work that does
+/// finish.
+fn stall_guidance(class: CommandClass) -> String {
+    let mut s = String::from("--- what to do about the stall ---\n");
+    s.push_str(
+        "- It was alive and silent, not slow. Something it needs is never arriving: a port, a \
+         lock, a file another process holds, or input on stdin (which is empty here, so a \
+         command that reads stdin sees EOF and stops).\n",
+    );
+    s.push_str(&format!(
+        "- Do not re-run it unchanged, and do not give it more time. It is {} and it is blocked, \
+         so a longer run ends the same way.\n",
+        class.label()
+    ));
+    s.push_str(
+        "- Narrow the work until it produces output: one test file, one package, one failing \
+         case. If the block is on a resource, start that resource first and then run this.\n",
+    );
+    s.push_str(
+        "- If it is legitimately quiet for a long time and you still need the result, pass \
+         background: true and let it finish while you do something else.",
+    );
     s
 }
 
@@ -1187,7 +1456,7 @@ mod tests {
             _request: ProcessRequest,
             mut process: SpawnedProcess,
         ) -> std::result::Result<TaskId, String> {
-            terminate(&mut process.child).await;
+            (&mut process.child).terminate().await;
             Ok(self.task_id)
         }
 
@@ -1248,6 +1517,28 @@ mod tests {
         json!({ "command": command }).to_string()
     }
 
+    /// Every limit short enough for a test to sit through, so the kill paths are reachable
+    /// without a ten-minute test. The *relationships* are what production encodes — a test run
+    /// outlasting a quick check, a stall outlasting both — and those are preserved here.
+    fn instant_budgets() -> ShellBudgets {
+        ShellBudgets {
+            quick: Duration::from_millis(400),
+            // Wide against the stall limit below, because on Windows the spawn itself costs tens
+            // of milliseconds (assigning the child to a job object walks the machine's threads)
+            // and that latency is charged to the budget but not to the stall clock. A narrow gap
+            // would let a slow spawn decide which of the two fires first.
+            test: Duration::from_millis(2000),
+            build: Duration::from_millis(800),
+            waiting: Duration::from_millis(700),
+            stall: Duration::from_millis(500),
+            progress: Duration::from_millis(200),
+        }
+    }
+
+    fn impatient() -> Shell {
+        Shell::default().with_budgets(instant_budgets())
+    }
+
     #[test]
     fn command_summaries_are_single_line_and_bounded() {
         let command = format!("zlogic start\n{}", "x".repeat(1_000));
@@ -1282,11 +1573,13 @@ mod tests {
             definition.parameters["properties"]["wait"]["type"],
             "boolean"
         );
-        // The schema offers the waiting ceiling; code enforces the smaller one for a call that
-        // is not willing to wait, and says so rather than clamping.
-        assert_eq!(
-            definition.parameters["properties"]["timeout_ms"]["maximum"],
-            json!(WAIT_MAX_TIMEOUT_MS)
+        // No timeout argument at all. A number the model picks is a guess in both directions, and
+        // both are expensive; the schema must not offer one.
+        assert!(
+            definition.parameters["properties"]
+                .get("timeout_ms")
+                .is_none(),
+            "the caller chooses whether it needs the result, not how long that takes"
         );
     }
 
@@ -1472,47 +1765,72 @@ mod tests {
         );
     }
 
-    /// The timeout kills the process and says what to do instead.
+    /// The budget kills the process and says what to do instead.
     #[tokio::test]
-    async fn a_slow_command_times_out_and_is_killed() {
+    async fn a_slow_command_runs_out_of_time_and_is_killed() {
         let (_d, ctx) = setup();
-        let out = Shell::default()
-            .execute(
-                &ctx,
-                &json!({ "command": "sleep 30", "timeout_ms": 1000 }).to_string(),
-            )
-            .await
-            .unwrap();
+        let out = impatient().execute(&ctx, &args("sleep 30")).await.unwrap();
         assert_eq!(out.status, ToolExecStatus::Timeout);
         let text = out.model_text();
-        assert!(text.contains("timed out"), "{text}");
+        assert!(text.contains("ran out of time"), "{text}");
         assert!(
-            text.contains("timeout_ms"),
+            text.contains("wait: true"),
             "it must say how to proceed: {text}"
         );
     }
 
-    /// Past the ceiling the caller has to choose. Silently clamping a request for ten minutes
-    /// into a one-minute kill answers a different question than the one that was asked.
+    /// A command that prints nothing is reported as *stuck*, not as slow — the two call for
+    /// opposite responses, and conflating them is what sends the model off to re-run the thing
+    /// that is already wedged.
     #[tokio::test]
-    async fn a_timeout_above_the_ceiling_is_refused_not_clamped() {
+    async fn a_silent_command_is_reported_as_stuck_rather_than_slow() {
         let (_d, ctx) = setup();
+        // A test-class command — so its budget is longer than the 500ms stall limit and silence,
+        // not the clock, is what ends it. The `sleep` is the whole command; the rest is there to
+        // be classified.
+        let out = impatient()
+            .execute(&ctx, &args("sleep 30 # cargo test"))
+            .await
+            .unwrap();
+        assert_eq!(out.status, ToolExecStatus::Timeout);
+        let text = out.model_text();
+        assert!(text.contains("printed nothing"), "{text}");
+        assert!(text.contains("what to do about the stall"), "{text}");
+        assert!(
+            !text.contains("wait: true"),
+            "a stall is not fixed by waiting longer: {text}"
+        );
+    }
+
+    /// Output resets the stall clock. A test suite that reports each case is visibly alive, and a
+    /// shared deadline would call a long quiet stretch between two results a hang.
+    #[tokio::test]
+    async fn output_keeps_a_command_alive_past_the_stall_limit() {
+        let (_d, ctx) = setup();
+        // Prints every ~0.5s for three seconds against a 1.5s stall limit. Under a single shared
+        // deadline this is a kill; under a stall clock it is a command that keeps talking. The
+        // wall clock is generous so only the stall rule can end it, and the gaps are wide enough
+        // that a slow process spawn cannot be mistaken for silence.
+        let budgets = ShellBudgets {
+            quick: Duration::from_secs(30),
+            stall: Duration::from_millis(1500),
+            ..instant_budgets()
+        };
         let out = Shell::default()
+            .with_budgets(budgets)
             .execute(
                 &ctx,
-                &json!({ "command": "echo x", "timeout_ms": 600_000 }).to_string(),
+                &args("for i in 1 2 3 4 5 6; do echo tick $i; sleep 0.5; done"),
             )
             .await
             .unwrap();
-        assert_eq!(out.status, ToolExecStatus::Failed);
-        let text = out.model_text();
-        assert!(text.contains("wait: true"), "{text}");
-        assert!(text.contains("background: true"), "{text}");
+        assert_eq!(out.status, ToolExecStatus::Success, "{}", out.model_text());
+        assert!(out.model_text().contains("tick 5"), "{}", out.model_text());
     }
 
     /// The point of `wait`: a result the turn cannot go on without, however long it takes. It is
-    /// never handed to the task runtime, and the ceiling that applies to a non-waiting call does
-    /// not apply here.
+    /// never handed to the task runtime, and the class budget that applies to a non-waiting call
+    /// does not apply here.
     #[cfg(unix)]
     #[tokio::test]
     async fn wait_runs_to_completion_and_creates_no_task() {
@@ -1520,13 +1838,12 @@ mod tests {
         let task_id = TaskId::new();
         ctx.tasks = Some(Arc::new(AdoptingHost { task_id }));
 
-        let out = Shell::default()
+        let out = impatient()
             .execute(
                 &ctx,
                 &json!({
-                    "command": "sleep 2; echo done",
-                    "wait": true,
-                    "timeout_ms": 600_000
+                    "command": "sleep 0.2; echo done",
+                    "wait": true
                 })
                 .to_string(),
             )
@@ -1541,25 +1858,29 @@ mod tests {
         );
     }
 
-    /// `wait` with a `timeout_ms` is still a hard stop: waiting for a result is not the same as
-    /// promising to wait forever.
-    #[cfg(unix)]
+    /// `wait: true` is not a promise to wait forever: the backstop still ends it, and the result
+    /// says the backstop is what ran out rather than pretending the caller asked for a deadline.
     #[tokio::test]
-    async fn wait_with_a_timeout_still_kills_a_command_that_overruns_it() {
+    async fn wait_still_has_a_backstop() {
         let (_d, ctx) = setup();
+        // Prints often enough to never trip the stall limit, so only the backstop can end this.
+        let budgets = ShellBudgets {
+            stall: Duration::from_secs(30),
+            ..instant_budgets()
+        };
         let out = Shell::default()
+            .with_budgets(budgets)
             .execute(
                 &ctx,
-                &json!({ "command": "sleep 30", "wait": true, "timeout_ms": 1000 }).to_string(),
+                &json!({ "command": "while true; do echo tick; sleep 0.2; done", "wait": true })
+                    .to_string(),
             )
             .await
             .unwrap();
         assert_eq!(out.status, ToolExecStatus::Timeout);
-        assert!(
-            out.model_text().contains("timed out"),
-            "{}",
-            out.model_text()
-        );
+        let text = out.model_text();
+        assert!(text.contains("ran out of time"), "{text}");
+        assert!(text.contains("backstop"), "{text}");
     }
 
     /// Cancelling stops the child and still reports what it printed first.
@@ -1654,6 +1975,130 @@ mod tests {
         assert!(!is_shell_backgrounded("npm run dev && zlogic x"));
         // `&&` is not backgrounding.
         assert!(looks_long_running("npm run dev && zlogic x").is_some());
+    }
+
+    /// The budget is inferred, so getting a class wrong is the whole mechanism failing. These are
+    /// the commands whose misclassification this design was built to stop: a test suite cut off at
+    /// a quick command's budget, and a build killed for taking as long as a build takes.
+    #[test]
+    fn the_class_decides_the_budget_and_test_outranks_build() {
+        for c in [
+            "cargo test",
+            "cargo test --workspace",
+            "cargo nextest run",
+            "npm test",
+            "pnpm test -- --run",
+            "bunx vitest run src/x.test.ts",
+            "pytest -q",
+            "go test ./...",
+            "dotnet test",
+            "phpunit",
+            "mvn test",
+            "gradle test",
+            "playwright test",
+            // Compiles on the way to running, and the run is the part that has to finish.
+            "gradle test --tests Foo",
+        ] {
+            assert_eq!(classify(c), CommandClass::Test, "{c}");
+        }
+        for c in [
+            "cargo build --release",
+            "cargo check",
+            "cargo clippy --all-targets",
+            "npm run build",
+            "pnpm build",
+            "vite build",
+            "next build",
+            "npx tsc --noEmit",
+            "make",
+            "cmake --build .",
+            "go build ./...",
+            "pip install -r requirements.txt",
+            "npm ci",
+            "cargo install ripgrep",
+        ] {
+            assert_eq!(classify(c), CommandClass::Build, "{c}");
+        }
+        for c in [
+            "git status",
+            "ls -la",
+            "grep -r foo src",
+            "cat Cargo.toml",
+            "python script.py",
+            "tail -n 100 log.txt",
+            // A file that happens to be named `test` is not a test run: the needles are whole
+            // commands, not a bare `test`.
+            "ls test",
+        ] {
+            assert_eq!(classify(c), CommandClass::Quick, "{c}");
+        }
+        // The ordering that makes the last case work, stated directly: `vitest` contains neither
+        // `vite build` nor `npm run build`, but `npm run build && npm test` is both.
+        assert_eq!(
+            classify("npm run build && npm test"),
+            CommandClass::Test,
+            "a command that builds and then tests needs the test budget"
+        );
+    }
+
+    /// A stalled command and a slow one need different advice, and the stall advice must not be
+    /// the one that says "wait longer".
+    #[test]
+    fn the_two_deadlines_give_opposite_advice() {
+        let slow = timeout_guidance(false, CommandClass::Test);
+        assert!(slow.contains("wait: true"), "{slow}");
+
+        let stuck = stall_guidance(CommandClass::Test);
+        assert!(!stuck.contains("wait: true"), "{stuck}");
+        assert!(stuck.contains("Do not re-run it unchanged"), "{stuck}");
+    }
+
+    /// The running call says so, and says how long it has been quiet. A blank console and a
+    /// wedged process look identical from the outside; the elapsed-since-output number is the
+    /// only thing that tells them apart.
+    #[tokio::test]
+    async fn a_running_call_narrates_its_own_progress() {
+        #[derive(Default)]
+        struct Recorder(std::sync::Mutex<Vec<(OutputStream, String)>>);
+        impl OutputSink for Recorder {
+            fn emit(&self, stream: OutputStream, chunk: &str) {
+                self.0.lock().unwrap().push((stream, chunk.to_string()));
+            }
+        }
+        let sink = Arc::new(Recorder::default());
+        let (_d, mut ctx) = setup();
+        ctx.output = Some(sink.clone());
+
+        // Prints once, then goes quiet for longer than the progress interval but less than the
+        // stall limit — a working command, not a stuck one. The interval has to clear
+        // `CHILD_EXIT_POLL`, because that is the only tick the loop makes: a 200ms interval with
+        // a one-second poll would never fire.
+        let budgets = ShellBudgets {
+            quick: Duration::from_secs(30),
+            stall: Duration::from_secs(30),
+            progress: Duration::from_millis(300),
+            ..instant_budgets()
+        };
+        Shell::default()
+            .with_budgets(budgets)
+            .execute(&ctx, &args("echo started; sleep 1.4"))
+            .await
+            .unwrap();
+
+        let seen = sink.0.lock().unwrap().clone();
+        let progress: Vec<&String> = seen
+            .iter()
+            .filter(|(s, c)| *s == OutputStream::Progress && c.contains("still running"))
+            .map(|(_, c)| c)
+            .collect();
+        assert!(
+            !progress.is_empty(),
+            "a quiet console must be narrated: {seen:?}"
+        );
+        assert!(
+            progress.iter().any(|c| c.contains("since the last output")),
+            "and the gap is the number that matters: {progress:?}"
+        );
     }
 
     /// The point of the buffer: a huge stream stays bounded and the tail survives.

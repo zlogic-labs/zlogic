@@ -351,20 +351,41 @@ error-submit-no-usable-model = 这条消息没有发送：没有可用的模型�
 error-submit-queued-no-model = 暂时没有可用的模型，这条消息已排队等待。请先在设置里配置模型和 API key（{ $error }）
 error-submit-queued-turn-failed = 这条消息已排队，但暂时无法开始回复：{ $error }
 error-submit-rejected = 提交被拒绝：{ $reason }
-notice-mcp-tools-pending = 还在取 { $servers } 的工具清单，这一轮先没带上（下一轮就有了）
 notice-mcp-server-no-tools = MCP server `{ $server }` 连上了，但没有提供任何工具
-notice-mcp-tools-expensive = MCP 工具定义{ $how_much }，而且**每一轮都要付一次**。占得最多的：{ $biggest }。收窄的办法：在定义里把 `tools` 限制到「只要这几个」，或者 `/mcp off <id>` 关掉暂时不用的。
+notice-mcp-tools-expensive = MCP 工具定义{ $how_much }，而且**每一轮都要付一次**。占得最多的：{ $biggest }。收窄的办法：在定义里把 `tools` 限制到「只要这几个」，或者在这个工作区的 MCP 列表里关掉暂时不用的。
 notice-llm-interrupted-retry = 回答在生成过程中被打断，正在自动续写（本次已重试 { $n } 次）。已显示的部分会保留，模型将从断点继续。
 notice-agent-model-unavailable = 子代理 `{ $name }` 无法解析到可用模型（{ $error }），本轮不会运行
 notice-session-title-failed = 会话标题未能生成：{ $error }
 notice-turn-start-failed = 排队中的消息暂时无法开始回复：{ $error }。请先配置模型并设置 API key。
 notice-mcp-server-untrusted =
-    { $count } 个 MCP server 来自本项目，在你确认之前不会启动：
+    { $count } 个 MCP server 来自本项目，在这个工作区允许之前不会启动：
     { $lines }
-    确认某一个：`/mcp trust <id>`；看全部：`/mcp`。
 notice-tasks-still-running = 本 turn 启动的后台任务仍在运行，完成时会收到通知：
     { $tasks }
 
 error-submit-internal-part = 任务更新、技能加载和技能调用只能由运行时产生
 error-submit-empty = 提交内容为空
 error-submit-unknown-model = 未知模型：{ $model }
+
+# ── auth 子命令（zlogic auth …）──
+auth-unknown-command = 不认识的 auth 子命令：{ $command }
+auth-usage-list = 用法：zlogic auth（不接参数）
+auth-usage-login = 用法：zlogic auth login <provider> [--device]
+auth-usage-logout = 用法：zlogic auth logout <provider>
+auth-usage-refresh = 用法：zlogic auth refresh <provider>
+auth-list-title = Provider 一览：
+auth-list-empty = 尚未配置任何 provider
+auth-marker-in = 已配置
+auth-marker-out = 未配置
+auth-open-url = 打开下面的链接继续：{ $url }
+auth-open-failed = 无法打开浏览器（{ $reason }），请手动打开上面的链接。
+auth-device-code = 打开 { $url } 并输入验证码 { $code }
+auth-waiting = 等待登录结果…
+auth-signed-in-as = 已登录：{ $account } { $plan }
+auth-signed-out = 已退出 { $provider }
+auth-sign-in-failed = 登录失败：{ $message }
+auth-sign-in-expired = 登录超时，未完成授权
+auth-sign-in-cancelled = 登录已取消
+auth-sign-in-pending = 登录没有返回结果
+auth-models-title = { $provider } 可用的模型：
+auth-models-count = { $provider } 共 { $count } 个模型

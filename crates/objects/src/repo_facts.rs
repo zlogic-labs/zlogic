@@ -17,11 +17,16 @@ impl RepoFacts {
             return Self::default();
         };
         let head = repo.head().ok();
-        let branch = head
-            .as_ref()
-            .filter(|h| h.is_branch())
-            .and_then(|h| h.shorthand())
-            .map(str::to_string);
+        let branch = match head.as_ref() {
+            Some(head) if head.is_branch() => head.shorthand().map(str::to_string),
+            Some(_) => None,
+            // A repository with no commits has no `HEAD` object to read, but it is on a branch all
+            // the same — and git treats that branch as real: `git switch -c other` moves onto it.
+            // Reporting no branch here is what let a branch creation look like it had worked: the
+            // panel had no name to show and nothing to compare the typed one against, while
+            // `git switch -c <the name it already has>` exits 0 having changed nothing at all.
+            None => unborn_branch(&repo),
+        };
         let sha = head
             .as_ref()
             .and_then(|h| h.target())
@@ -58,6 +63,17 @@ impl RepoFacts {
         }
         repo.commondir().parent().map(Path::to_path_buf)
     }
+}
+
+/// The branch a repository is on before it has any commits: `HEAD` is a symbolic ref to a branch
+/// that does not exist yet, so `Repository::head` has nothing to resolve and the name has to come
+/// from the ref itself.
+fn unborn_branch(repo: &Repository) -> Option<String> {
+    repo.find_reference("HEAD")
+        .ok()?
+        .symbolic_target()
+        .and_then(|target| target.strip_prefix("refs/heads/"))
+        .map(str::to_string)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -136,6 +152,13 @@ mod tests {
         let facts = RepoFacts::discover(dir.path());
         assert!(facts.is_repo);
         assert!(facts.head.is_none());
+        // No commit yet, but HEAD names a branch all the same — and `git switch -c <that name>`
+        // succeeds without moving, which is only knowable if the name is reported.
+        let unborn = facts
+            .branch
+            .clone()
+            .expect("an unborn HEAD still names a branch");
+        assert_eq!(facts.branch_key(), Some(unborn.clone()));
 
         std::fs::write(dir.path().join("a.txt"), "x").unwrap();
         let mut index = repo.index().unwrap();

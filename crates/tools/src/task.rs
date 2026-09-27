@@ -8,7 +8,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::process::{Child, ChildStderr, ChildStdout};
+use tokio::process::{ChildStderr, ChildStdout};
+use zlogic_proctree::Tree;
 use zlogic_protocol::llm::ToolDefinition;
 use zlogic_protocol::{CallId, SessionId, TurnId};
 use zlogic_task::{ExecutorSpec, ProcessSpec, TaskId, TaskResult, TaskRun, TaskState};
@@ -20,7 +21,8 @@ use crate::{
 
 /// A shell process that has already passed policy and been spawned by the shell tool.
 /// Moving the live handles into TaskHost is what lets `background: true` hand the already-running
-/// child over without killing and re-running it.
+/// child over without killing and re-running it. The [`Tree`] travels with them, so the job keeps
+/// owning its process tree for as long as the task runs and the tree dies with the task.
 pub struct ProcessRequest {
     pub spec: ProcessSpec,
     pub parent_session_id: SessionId,
@@ -35,19 +37,19 @@ pub struct ProcessRequest {
 }
 
 pub struct SpawnedProcess {
-    pub child: Child,
+    pub child: Tree,
     pub stdout: ChildStdout,
     pub stderr: ChildStderr,
 }
 
-/// One run as `task_get` reports it: the task row plus the output window that belongs to it.
-/// The window is read from the runtime's spool rather than stored on the row, so a *running*
-/// process task reports what it has printed so far — which is the question `task_get` is usually
-/// asked ("is it still going, and how far did it get").
+/// One run as `task_get` reports it: the task row plus the tail of the output that belongs to it.
+/// The tail is read from the runtime's spool rather than stored on the row, so a *running* process
+/// task reports what it has printed so far — which is the question `task_get` is usually asked
+/// ("is it still going, and what is it doing").
 pub struct TaskReport {
     pub task: TaskRun,
-    /// Head+tail of a process task's output; `None` for an agent run (its transcript is the child
-    /// session) and for one that has printed nothing yet.
+    /// Tail of a process task's output — enough to see what it is doing right now; `None` for an
+    /// agent run (its transcript is the child session) and for one that has printed nothing yet.
     pub output: Option<String>,
 }
 
@@ -120,10 +122,10 @@ impl Tool for TaskGet {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "task_get".into(),
-            description: "Read one background task: its state, what it is running, and the \
-                          output it has produced so far (head and tail). Not a way to wait — a \
-                          completion notification arrives on its own, and polling this is not a \
-                          substitute for it."
+            description: "Read one background task: its state, what it is running, and the tail of \
+                          the output it has produced so far. Not a way to wait — a completion \
+                          notification arrives on its own, and polling this is not a substitute for \
+                          it."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -234,7 +236,7 @@ fn describe(report: &TaskReport) -> String {
     }
     let mut body = lines.join("\n");
     match &report.output {
-        Some(output) => body.push_str(&format!("\n\n--- output (head and tail) ---\n{output}")),
+        Some(output) => body.push_str(&format!("\n\n--- output (tail) ---\n{output}")),
         None if matches!(task.executor, ExecutorSpec::Process(_)) => {
             body.push_str("\n\n--- output (empty so far) ---");
         }

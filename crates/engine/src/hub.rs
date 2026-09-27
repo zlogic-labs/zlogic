@@ -116,6 +116,21 @@ impl Default for TaskStream {
     }
 }
 
+/// Whether a sub-agent's event is worth copying into its ancestors' channels.
+///
+/// Only the interactions a sub-agent is blocked on: the user watching the parent session is the one
+/// who has to answer them, so they must arrive without the parent polling. Everything else a
+/// sub-agent emits — provider chunks, tool output, log lines — is read from the child's own
+/// transcript, which is what an opened sub-agent chat renders. Forwarding those costs a
+/// serialization per event over IPC for every ancestor, and pushes the ancestor's own live turn out
+/// of its bounded replay window (`TURN_REPLAY_CAPACITY`), whose loss is silent.
+fn reaches_ancestors(payload: &StreamPayload) -> bool {
+    matches!(
+        payload,
+        StreamPayload::InteractionRequired { .. } | StreamPayload::InteractionResolved { .. }
+    )
+}
+
 fn approx_bytes(delta: &TaskOutputDelta) -> usize {
     const FRAMING: usize = 64;
     delta.task_id.len() + delta.chunk.len() + FRAMING
@@ -390,7 +405,7 @@ impl EventHub {
                 .insert(event.session_id.clone(), parent.clone());
         }
         Self::push(&mut turns, &event.session_id, &event);
-        if !event.agent.is_root() {
+        if !event.agent.is_root() && reaches_ancestors(&event.payload) {
             let parents = self.parents.lock().unwrap_or_else(PoisonError::into_inner);
             let mut ancestor = event.agent.parent_agent_id.clone();
             while let Some(session) = ancestor {
@@ -482,6 +497,7 @@ impl Default for EventHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zlogic_protocol::interaction::{Form, InteractionBody, InteractionDecision};
     use zlogic_protocol::stream::{
         AgentRef, InitPhase, ModelRef, NoticeLevel, StateChange, StreamPayload, TurnStats,
         TurnStatus,
@@ -575,6 +591,26 @@ mod tests {
     }
 
     fn child_event(session: &str, parent: &str, name: &str) -> StreamEvent {
+        let mut event = agent_event(session, parent, name);
+        event.payload = StreamPayload::Notice {
+            level: NoticeLevel::Info,
+            code: "c".into(),
+            message: zlogic_protocol::LocalizedMessage::new("notice.c", "m"),
+        };
+        event
+    }
+
+    /// A sub-agent event the ancestors are meant to see: the interactions it is blocked on.
+    fn child_interaction(session: &str, parent: &str, name: &str) -> StreamEvent {
+        let mut event = agent_event(session, parent, name);
+        event.payload = StreamPayload::InteractionRequired {
+            interaction_id: format!("i-{session}"),
+            body: InteractionBody::Form(Form::new("confirm", Vec::new())),
+        };
+        event
+    }
+
+    fn agent_event(session: &str, parent: &str, name: &str) -> StreamEvent {
         StreamEvent {
             seq: 1,
             session_id: session.into(),
@@ -605,12 +641,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_sub_agent_event_reaches_the_parent_channel() {
+    async fn a_sub_agents_interaction_reaches_the_parent_channel() {
         let hub = EventHub::new();
         let mut parent = hub.subscribe_turns("parent");
         let mut child_own = hub.subscribe_turns("child");
 
-        let ev = child_event("child", "parent", "researcher");
+        let ev = child_interaction("child", "parent", "researcher");
         hub.emit(ev.clone());
 
         let seen = parent.recv().await.unwrap();
@@ -623,15 +659,32 @@ mod tests {
         assert_eq!(child_own.recv().await.unwrap().payload, ev.payload);
     }
 
+    /// Everything else a sub-agent emits is read from its own transcript, so copying it into the
+    /// ancestors would only cost a serialization per event and crowd their replay windows.
     #[tokio::test]
-    async fn nested_sub_agent_events_reach_every_ancestor() {
+    async fn a_sub_agents_ordinary_events_stay_in_its_own_channel() {
+        let hub = EventHub::new();
+        let mut parent = hub.subscribe_turns("parent");
+        let mut child_own = hub.subscribe_turns("child");
+
+        hub.emit(child_event("child", "parent", "researcher"));
+
+        assert_eq!(child_own.recv().await.unwrap().session_id, "child");
+        assert!(
+            parent.try_recv().is_err(),
+            "a log / chunk event must not be forwarded to the parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_sub_agents_interactions_reach_every_ancestor() {
         let hub = EventHub::new();
         let mut root = hub.subscribe_turns("root");
         let mut middle = hub.subscribe_turns("middle");
         let mut leaf_own = hub.subscribe_turns("leaf");
 
-        hub.emit(child_event("middle", "root", "mid"));
-        let ev = child_event("leaf", "middle", "leafy");
+        hub.emit(child_interaction("middle", "root", "mid"));
+        let ev = child_interaction("leaf", "middle", "leafy");
         hub.emit(ev.clone());
 
         assert_eq!(root.recv().await.unwrap().session_id, "middle");
@@ -645,26 +698,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_forwarded_child_turn_start_does_not_claim_the_parent_active_turn() {
+    async fn a_forwarded_child_interaction_does_not_claim_the_parent_active_turn() {
         let hub = EventHub::new();
         hub.emit(turn_start("parent", "turn-parent"));
 
-        let mut child = child_event("child", "parent", "researcher");
-        child.payload = StreamPayload::TurnStart {
-            model: ModelRef {
-                provider_id: "test".into(),
-                model_id: "test".into(),
-                display_name: "test".into(),
-            },
-            resumed: false,
-            proactive: false,
-        };
-        hub.emit(child);
-        let mut child_end = child_event("child", "parent", "researcher");
-        child_end.payload = StreamPayload::TurnEnd {
-            status: TurnStatus::Completed,
-            reason: None,
-            stats: TurnStats::default(),
+        hub.emit(child_interaction("child", "parent", "researcher"));
+        let mut child_end = child_interaction("child", "parent", "researcher");
+        child_end.payload = StreamPayload::InteractionResolved {
+            interaction_id: "i-child".into(),
+            decision: InteractionDecision::Deny { reason: None },
         };
         hub.emit(child_end);
 
@@ -674,7 +716,7 @@ mod tests {
         assert!(
             matches!(
                 &attached.replay[2].event.payload,
-                StreamPayload::TurnEnd { .. }
+                StreamPayload::InteractionResolved { .. }
             ),
             "a sub-agent's interaction must also replay through the parent channel"
         );

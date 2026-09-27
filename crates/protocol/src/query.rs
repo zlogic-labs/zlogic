@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ProviderConfig;
 pub use crate::error::{ApiError, ApiResult};
-use crate::ids::{RoundId, SessionId, TurnId, WorkspaceId};
+use crate::ids::{RoundId, SessionId, TranslationId, TurnId, WorkspaceId};
 use crate::interaction::{InteractionBody, InteractionDecision};
 use crate::llm::Effort;
 use crate::stream::{ToolDisplay, ToolStatus, TurnStats, TurnStatus};
@@ -45,6 +45,7 @@ pub enum WorkspaceKind {
     Coding,
     Chat,
     Custom,
+    MobileAndroid,
 }
 
 pub fn chat_workspace_tools() -> Vec<String> {
@@ -66,11 +67,17 @@ impl WorkspaceKind {
         }
     }
 
+    pub fn from_record(tools: Option<&[String]>, persisted: Self) -> Self {
+        match persisted {
+            Self::MobileAndroid | Self::Chat | Self::Custom => persisted,
+            Self::Coding => Self::of_tools(tools),
+        }
+    }
+
     pub fn preset_tools(self) -> Option<Vec<String>> {
         match self {
-            Self::Coding => None,
+            Self::Coding | Self::Custom | Self::MobileAndroid => None,
             Self::Chat => Some(chat_workspace_tools()),
-            Self::Custom => None,
         }
     }
 }
@@ -106,6 +113,13 @@ pub struct WorkspaceGitInfo {
     pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detached_head: Option<String>,
+    /// `branch` names a branch git has not created a ref for yet, because the repository has no
+    /// commits. Distinct from both "on a branch" and "detached", and the only way to tell: a
+    /// branch with no head sha is a branch that does not exist as far as `git branch` is concerned,
+    /// so it is missing from every list and `git switch -c <its own name>` succeeds having done
+    /// nothing.
+    #[serde(default)]
+    pub unborn: bool,
     pub staged: u32,
     pub unstaged: u32,
     pub untracked: u32,
@@ -182,6 +196,16 @@ pub struct WorkspaceFileRangeReq {
     pub length: Option<u64>,
 }
 
+/// A byte range of a workspace file.
+///
+/// The payload is raw bytes, not base64. The one caller that moves these across a process
+/// boundary (the desktop's file server) writes them straight to a socket, so a base64 field
+/// would put a 1.33x string in memory for the length of the transfer and then be decoded back
+/// into the very bytes it just encoded. Range reads are the path large media takes, so that
+/// overhead lands exactly where it hurts most.
+///
+/// The JSON-RPC surface is the exception: it only ever asks for a zero-length read to learn
+/// `total`, which is why `data` is `[]` there rather than a megabyte-long number array.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct WorkspaceFileRange {
@@ -189,7 +213,7 @@ pub struct WorkspaceFileRange {
     pub start: u64,
     pub bytes: u64,
     pub total: u64,
-    pub data_base64: String,
+    pub data: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -301,6 +325,15 @@ pub struct WorkspaceGitGenerateCommitMessageReq {
     pub session_id: SessionId,
 }
 
+/// Turn the workspace root into a git repository. The offer to do this comes from the surfaces
+/// that need one — checkpoints refuse to work without it — so it takes no branch or message: it
+/// is `git init` and nothing else, leaving the first commit to the user.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceGitInitReq {
+    pub workspace: WorkspaceSelector,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -387,6 +420,14 @@ pub struct GitFileChange {
     pub path: String,
     pub change: GitChangeKind,
     pub staged: bool,
+    /// A nested repository recorded as a gitlink whose recorded commit is still the one it points
+    /// at, so the only thing that moved is uncommitted work *inside* it. Git reports this
+    /// identically to a gitlink that advanced, but the two need opposite answers: the first cannot
+    /// be staged at all (`git add` on a submodule records a new `HEAD`, never its dirty tree), and
+    /// the second is an ordinary staged bump. A client that cannot tell them apart offers a button
+    /// that exits 0 and changes nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub submodule_dirty: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -424,6 +465,288 @@ pub struct WorkspaceGitOverview {
     pub commits: Vec<GitCommitSummary>,
 }
 
+// ── checkpoints ──
+
+/// One restore point, as the timeline renders it. A mirror of the store's own record with the
+/// fields a host does not need removed, so the wire shape can stay stable while the store moves.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpoint {
+    pub id: String,
+    /// Unix seconds, formatted on the client: a host may want a relative label and a different
+    /// timezone from the same timestamp.
+    pub at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<String>,
+    pub trigger: CheckpointTriggerKind,
+    /// The tool that was about to run, for a before-tool point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// One line saying what that call was about to do — the command, the path. This is the text a
+    /// user scans for when asking which command went wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The user's own words for a manual point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// A snapshot missing files over the size or count budget. Kept in the timeline, refused by
+    /// restore, and marked in the UI.
+    pub partial: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum CheckpointTriggerKind {
+    TurnStart,
+    TurnEnd,
+    BeforeTool,
+    Manual,
+    BeforeRestore,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpointListReq {
+    pub workspace: WorkspaceSelector,
+    /// Continue after this snapshot id — the last row of the previous page. `None` starts at the
+    /// newest. Paging by id rather than by offset is what keeps a snapshot taken mid-scroll from
+    /// making the next page repeat or skip a row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    /// How many rows this page may hold. `None` means "the card's worth", which is a small
+    /// number; the timeline dialog asks for more and keeps asking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// The branch the panel is showing, so the response can say how many snapshots live on other
+    /// branches without the client having every row to count them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpointList {
+    pub checkpoints: Vec<WorkspaceCheckpoint>,
+    /// Unix seconds, so a client can label ages without a second round trip.
+    pub now: i64,
+    /// Whether another page follows, and how many snapshots the repository has in total.
+    #[serde(default)]
+    pub has_more: bool,
+    #[serde(default)]
+    pub total: usize,
+    /// Snapshots not on `branch` — the card's "N on other branches" line, exact even when the
+    /// client only holds the first page.
+    #[serde(default)]
+    pub other_branches: usize,
+    /// Whether the user has turned checkpoints on at all. This is the switch the panel shows, so
+    /// it is reported next to the list rather than inferred from an empty `checkpoints`.
+    pub enabled: bool,
+    /// False when the workspace is not a git repository, or the store is off. The timeline shows
+    /// why it is empty rather than hiding the section.
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub retention_days: u32,
+    /// The directory snapshots are written under, and the one this workspace's snapshots live in.
+    /// Both are reported because the user is being asked to agree to a copy of their code sitting
+    /// on disk: where it is has to be answerable without reading the source.
+    pub store_dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpointPlanReq {
+    pub workspace: WorkspaceSelector,
+    pub id: String,
+    /// The session the plan is for. It decides which files a restore may delete: anything the
+    /// session found already on disk is off limits.
+    pub session: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpointFileDiffReq {
+    pub workspace: WorkspaceSelector,
+    /// The checkpoint the file belongs to, and the side of the comparison.
+    pub checkpoint: String,
+    /// A path as the plan's rows spell it: relative to the repository root, `/`-separated.
+    pub path: String,
+    /// Which side of the checkpoint to measure against. The step is the default, and the only one
+    /// an expanded row needs; the workspace view is what the restore confirmation reads.
+    #[serde(default)]
+    pub compare: CheckpointCompare,
+}
+
+/// Which two trees a file's patch sits between. The step is the browsing view — what the agent
+/// did to get from the previous point to this one — and the workspace is the restore view, only
+/// needed once someone is about to press the button.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointCompare {
+    #[default]
+    Previous,
+    Workspace,
+}
+
+/// One file of a checkpoint, as a unified patch in the direction the caller asked for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpointFileDiff {
+    pub path: String,
+    pub unified: String,
+    pub binary: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CheckpointLineStats {
+    pub insertions: u32,
+    pub deletions: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum CheckpointFileChange {
+    Create,
+    Overwrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpointFile {
+    pub path: String,
+    pub change: CheckpointFileChange,
+    /// Absent for a binary file, or a diff too large to count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<CheckpointLineStats>,
+}
+
+/// The browsing view of a timeline row: what changed between this point and the one before it.
+///
+/// Its own call, and separate from the plan on purpose. The answer is a diff between two commits
+/// the store already holds, so it costs nothing on disk — while the plan has to walk the working
+/// tree, because it answers "what would restoring change *right now*". Putting both in one
+/// response would make reading a row cost a workspace walk, which is the price nobody should pay
+/// to look at three filenames.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpointStepReq {
+    pub workspace: WorkspaceSelector,
+    pub checkpoint: String,
+}
+
+/// The browsing half of a plan: what changed between one point in the timeline and the one before
+/// it. `writes`/`deletes` above answer the restore question and are only read once someone is
+/// about to restore; these answer "what happened here", which is what the row is for.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpointStep {
+    /// The point this one is compared against, absent for the first point in a store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    /// Capped at what a dialog can render; `files_total` is the real number.
+    pub writes: Vec<WorkspaceCheckpointFile>,
+    pub files_total: usize,
+    pub deletes: Vec<String>,
+    pub deletions_total: usize,
+    pub drift: CheckpointLineStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpointPlan {
+    pub checkpoint: WorkspaceCheckpoint,
+    /// False when `HEAD` has moved since the snapshot. A restore is refused unless the user
+    /// overrides, and the dialog says which branch it came from.
+    pub head_matches: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_head: Option<String>,
+    pub writes: Vec<WorkspaceCheckpointFile>,
+    /// How many files a restore would write. `writes` is capped for rendering; this is the truth,
+    /// and the confirmation counts with it.
+    pub writes_total: usize,
+    pub deletes: Vec<String>,
+    /// How many files a restore would remove, capped the same way.
+    pub deletes_total: usize,
+    pub unchanged: usize,
+    pub drift: CheckpointLineStats,
+    /// False when a partial snapshot, or a snapshot the retention sweep has already dropped.
+    pub restorable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpointRestoreReq {
+    pub workspace: WorkspaceSelector,
+    /// The checkpoint to go back to. Not a plan: the store recomputes what restoring would do from
+    /// the snapshot and the tree as they are *now*, so nothing the client said about the past can
+    /// authorise a write — and a request carrying two hundred rows to say "this one" was a waste
+    /// of both ends.
+    pub checkpoint: String,
+    /// The session that is doing the restoring. It decides which files a restore may delete:
+    /// anything that session found already on disk is off limits.
+    pub session: String,
+    /// Remove the files the tree gained after the snapshot. Off by default: "undo" and "delete
+    /// what I made since" are different requests.
+    #[serde(default)]
+    pub delete_new: bool,
+    /// Restore although `HEAD` has moved.
+    #[serde(default)]
+    pub cross_head: bool,
+    /// One path instead of the whole tree, relative to the repository root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpointRestore {
+    pub written: usize,
+    pub deleted: usize,
+    pub failed: Vec<CheckpointRestoreFailure>,
+    /// The guard snapshot taken immediately before the write, so the timeline can offer the way
+    /// back out of a restore that turned out to be the wrong one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<WorkspaceCheckpoint>,
+}
+
+/// A restore writes file by file and a locked file does not stop the others, so the result
+/// carries what did not happen. Path and reason are separate fields rather than one formatted
+/// string: a path may contain the separator a client would otherwise split on, and a count with
+/// no names is not something the user can act on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CheckpointRestoreFailure {
+    pub path: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpointCaptureReq {
+    pub workspace: WorkspaceSelector,
+    /// A free-form label the user typed, kept in the timeline so "before the refactor" can be
+    /// found again. Absent for an untitled point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The session the point belongs to. A manual point made with no turn running still gets one,
+    /// so it is grouped with the work it was made for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -456,6 +779,11 @@ pub struct RuntimeTask {
     pub job_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The sub-agent's profile name (agent tasks only). `title` is the task's own first line,
+    /// which says nothing about *who* is running — a runtime list that can only name the prompt
+    /// cannot answer "which sub-agent is still going".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -469,6 +797,11 @@ pub struct RuntimeTask {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RuntimeTaskListReq {
     pub workspace_id: WorkspaceId,
+    /// Narrow the page to one conversation: only runs whose completion wakes this session
+    /// (`task.notification_session_id`). A session's own runtime rail asks this question; the
+    /// task centre asks the workspace-wide one and leaves it unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
     #[serde(default)]
     pub stopped_offset: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -641,6 +974,81 @@ pub struct TaskJobDraft {
     pub concurrency_policy: TaskJobConcurrencyPolicy,
 }
 
+/// Translate one piece of text outside the conversation.
+///
+/// Same no-turn auxiliary path as [`WorkspaceGitGenerateCommitMessageReq`]: no transcript, no
+/// global system prompt, no tools, no visible turn. `to` is the target language **as the model
+/// should name it** ("English", "简体中文") — naming it is the entire instruction. The source
+/// language is deliberately not a field: it is detected, so a saved "quick translate" is one
+/// choice (the target) rather than two.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TextTranslateReq {
+    /// Usage is accounted against a hidden task session in this workspace, as the task draft does.
+    pub workspace_id: WorkspaceId,
+    pub text: String,
+    pub to: String,
+    /// The target's language tag, when the caller knows it. Nothing in the prompt uses it: it is
+    /// what history and its cache match on, so "English" the name can change wording without
+    /// splitting the history of the same language in two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_code: Option<String>,
+    /// Model to translate with; absent means the utility route (the session model, then the light
+    /// tier), which is what a short call like this should get by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ref: Option<String>,
+}
+
+/// One translation, as answered.
+///
+/// `cached` is the honest half: the same text into the same language was translated before, so the
+/// stored answer came back and no model was called. The UI says so rather than presenting a
+/// remembered result as a fresh one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TextTranslateResp {
+    pub translation_id: TranslationId,
+    pub text: String,
+    pub cached: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A remembered translation, for the history list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TranslationEntry {
+    pub translation_id: TranslationId,
+    pub workspace_id: WorkspaceId,
+    /// The target as the prompt named it, and the tag the cache matches on.
+    pub target: String,
+    pub target_code: String,
+    pub source_text: String,
+    pub result_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ref: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TranslationListReq {
+    /// How many of the most recent to return. Absent means [`DEFAULT_TRANSLATION_PAGE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// How much history a list call returns when the caller does not say.
+pub const DEFAULT_TRANSLATION_PAGE: u32 = 50;
+
+/// The most a list call may return, so a hand-written request cannot ask for everything.
+pub const MAX_TRANSLATION_PAGE: u32 = 500;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TranslationDeleteReq {
+    pub translation_id: TranslationId,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct TaskJobSetEnabledReq {
@@ -668,6 +1076,8 @@ const fn default_true() -> bool {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct WorkspaceUpdateReq {
     pub workspace_id: WorkspaceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<WorkspaceKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1042,7 +1452,6 @@ pub struct TurnAnswer {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct TurnWidget {
     pub object_id: String,
-    pub title: String,
     pub height: u32,
     pub libraries: Vec<String>,
 }
@@ -1054,6 +1463,30 @@ pub struct TurnCompaction {
     pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_tokens: Option<u64>,
+}
+
+/// A background-task notification that **opened** this turn.
+///
+/// Only the ones that arrive before anything else in the turn count: a task finishing while the
+/// model is already replying is injected mid-turn, and the turn was not woken by it. Carried on
+/// the row because a collapsed history line is otherwise an answer with no question in front of
+/// it — the turn has no user message, and without this the conversation looks like it continued
+/// on its own for no reason.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TurnWake {
+    pub task_id: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1074,6 +1507,8 @@ pub struct TurnItem {
     pub compaction: Option<TurnCompaction>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub widgets: Vec<TurnWidget>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wakes: Vec<TurnWake>,
 }
 
 /// - `user` → `kind='user'`
@@ -1256,6 +1691,11 @@ pub struct UsageSummaryReq {
     pub until: Option<DateTime<Utc>>,
     #[serde(default)]
     pub utc_offset_minutes: i32,
+    /// The per-tool roll-up costs a scan over every tool result in the range — seconds on a
+    /// library, and a question only the usage page asks. Off by default, so the panels that poll
+    /// the summary for their token counts are not paying for it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_tools: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1292,7 +1732,11 @@ pub struct UsageSummary {
     pub by_cost_source: Vec<UsageGroup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_turn: Option<UsageGroup>,
-    pub by_tool: Vec<ToolUsageGroup>,
+    /// `None` when the request did not ask for it, which is different from an empty list: the tool
+    /// roll-up is a scan of every tool result in the range, and the caller has to be able to say
+    /// "not looked at" rather than "looked at, found nothing".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by_tool: Option<Vec<ToolUsageGroup>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1333,7 +1777,10 @@ pub struct SettingsView {
     pub cost: crate::settings::CostConfig,
     pub limits: crate::settings::LimitsConfig,
     pub network: crate::settings::NetworkSettings,
+    pub retention: crate::settings::RetentionConfig,
+    pub checkpoints: crate::settings::CheckpointsConfig,
     pub auto_detect_env: bool,
+    pub keychain: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1369,7 +1816,20 @@ pub struct ConfigUpdateReq {
     pub network: Option<crate::settings::NetworkSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
+    pub retention: Option<crate::settings::RetentionConfig>,
+    /// The section is replaced whole, and the engine pushes the result into the live snapshot
+    /// store — so this is also how the panel's switch takes effect without a restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub checkpoints: Option<crate::settings::CheckpointsConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub auto_detect_env: Option<bool>,
+    /// `None` leaves the switch alone. Setting it also re-points the vault at the other backend for
+    /// the rest of this process, so a change takes effect without a restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub keychain: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub llm_roles: Option<std::collections::BTreeMap<String, crate::roles::RoleSettings>>,
@@ -1437,6 +1897,9 @@ pub struct OpenAiCompatibleProviderReq {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub tier: Option<crate::config::Tier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub rate_limit: Option<crate::config::ModelRateLimit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub create_scope: Option<ConfigCreateScope>,
@@ -1547,9 +2010,104 @@ pub struct CredentialVerifyResult {
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum CredentialSource {
+    /// The OS credential store, or the encrypted vault that stands in front of it.
     Keyring,
+    /// The local secret file, used when the keychain is turned off. A different label on purpose:
+    /// the value there is stored unencrypted, and calling that "Keychain" would misdescribe it.
+    File,
     Env,
     Missing,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum ProviderSignInMethod {
+    /// The browser callback on the loopback port.
+    Browser,
+    /// A code the user types at the issuer: the flow that works without a browser.
+    Device,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ProviderSignInBeginReq {
+    pub provider_id: String,
+    #[serde(default = "browser_sign_in")]
+    pub method: ProviderSignInMethod,
+}
+
+fn browser_sign_in() -> ProviderSignInMethod {
+    ProviderSignInMethod::Browser
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ProviderSignInBegin {
+    pub flow_id: String,
+    pub provider_id: String,
+    pub method: ProviderSignInMethod,
+    pub authorization_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ProviderSignInStatusReq {
+    pub flow_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ProviderSignInCancelReq {
+    pub flow_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum ProviderSignInState {
+    Pending,
+    Succeeded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<String>,
+    },
+    Failed {
+        message: String,
+    },
+    Expired,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ProviderSignInStatus {
+    pub flow_id: String,
+    pub provider_id: String,
+    pub state: ProviderSignInState,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ProviderModelsReq {
+    pub provider_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ProviderModels {
+    pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<DateTime<Utc>>,
+    pub models: Vec<crate::config::ModelConfig>,
 }
 
 fn is_false(b: &bool) -> bool {

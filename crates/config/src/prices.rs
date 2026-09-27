@@ -62,6 +62,7 @@ pub fn source_provider_id(our_id: &str) -> Option<&'static str> {
         "openrouter" => "openrouter",
         "xai" => "xai",
         "groq" => "groq",
+        "opencode-go" => "opencode-go",
         _ => return None,
     })
 }

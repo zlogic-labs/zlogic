@@ -207,11 +207,7 @@ impl Resolver {
         // split the pool.
         if matches!(
             name,
-            "workspaceRoot"
-                | "workspaceFolder"
-                | "projectDir"
-                | "CLAUDE_PROJECT_DIR"
-                | "ZLOGIC_PROJECT_DIR"
+            "workspaceRoot" | "workspaceFolder" | "projectDir" | "ZLOGIC_PROJECT_DIR"
         ) {
             let root = self.workspace_root.to_string_lossy().to_string();
             return Ok(Expanded {

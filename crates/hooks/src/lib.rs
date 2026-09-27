@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
+use zlogic_proctree::{Console, Tree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -321,10 +322,7 @@ async fn run_command(
     #[cfg(windows)]
     let mut command = {
         let mut command = tokio::process::Command::new("powershell");
-        command
-            .args(["-NoProfile", "-NonInteractive", "-Command", &rule.command])
-            // Headless: hooks run from a GUI host and must not pop a console window.
-            .creation_flags(0x0800_0000);
+        command.args(["-NoProfile", "-NonInteractive", "-Command", &rule.command]);
         command
     };
     #[cfg(not(windows))]
@@ -340,12 +338,13 @@ async fn run_command(
         .env("ZLOGIC_HOOK_EVENT", request.event.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
+        .stderr(Stdio::piped());
+    // A hook is very often a shell line that launches the real program, so it is spawned as a
+    // `Tree`: a hook that times out or is cancelled takes its whole tree with it rather than
+    // leaving the program it launched running with nobody waiting on it.
+    let mut child = Tree::spawn(command, Console::Hidden)
         .map_err(|error| format!("hook {} could not start: {error}", request.event))?;
-    if let Some(mut stdin) = child.stdin.take() {
+    if let Some(mut stdin) = child.take_stdin() {
         let mut body = serde_json::to_vec(request)
             .map_err(|error| format!("hook {} request failed: {error}", request.event))?;
         body.push(b'\n');

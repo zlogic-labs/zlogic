@@ -191,6 +191,22 @@ providers:
       gpt-4o: {}
 ```
 
+### 用 ChatGPT 订阅登录
+
+订阅不是 API key，所以是登录而不是粘贴：
+
+```sh
+zlogic auth                    # 哪些 provider 已登录
+zlogic auth login codex        # 打开浏览器；加 --device 则打印验证码，适合无界面机器
+zlogic auth refresh codex      # 向服务端确认这个订阅能用哪些模型
+zlogic auth logout codex
+```
+
+登录把 OAuth token 存进钥匙串的 `codex_oauth` 条目；access token 每次请求都会按需刷新，所以一次会话
+不会因为 token 过期而中断。`login` 与 `refresh` 还会把服务端允许的模型列表记下来 —— 服务端的答案优先于
+内置清单。这个 provider 的模型走 Codex 后端（`chatgpt.com/backend-api/codex`），不会发往
+`api.openai.com`。
+
 当前 provider 列表见 [Provider 与模型 · 内置 provider](https://zlogic.run/docs/zh/08-providers-and-models.html#内置-provider)，
 密钥存放方式见 [密钥管理 · 系统钥匙串](https://zlogic.run/docs/zh/09-key-management.html#系统钥匙串-持久化)。
 

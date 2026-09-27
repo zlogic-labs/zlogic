@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use zlogic_core::SharedStore;
@@ -19,6 +21,12 @@ use crate::{EngineError, Result};
 /// never the work itself.
 const SLOW_WORKSPACE_GET_MS: u64 = 100;
 
+/// How long a `Path::is_dir` answer stays good for [`Workspaces::exists`].
+/// The UI polls every few seconds and a stale answer only costs one poll cycle of lag, while an
+/// answer per poll is a metadata syscall per workspace per tick — and on a spinning disk that
+/// syscall can block for seconds behind whatever else the drive is doing.
+const EXISTS_TTL: Duration = Duration::from_secs(10);
+
 pub struct Workspaces {
     store: SharedStore,
     hub: Option<Arc<EventHub>>,
@@ -28,6 +36,10 @@ pub struct Workspaces {
     /// same answer on each of those calls is a syscall on a hot path for a value that cannot
     /// change while the process lives.
     managed_base: Option<PathBuf>,
+    /// `(answer, taken_at)` per workspace root, so a poll storm does not turn into a syscall
+    /// storm. Keyed by the stored path so a rebind is a different key and cannot read stale.
+    /// Only [`Workspaces::exists_cached`] reads or writes it; an acted-on read asks the disk.
+    exists: Mutex<HashMap<PathBuf, (bool, Instant)>>,
 }
 
 impl Workspaces {
@@ -37,6 +49,7 @@ impl Workspaces {
             hub: None,
             chat_dir: None,
             managed_base: None,
+            exists: Mutex::new(HashMap::new()),
         }
     }
 
@@ -99,6 +112,51 @@ impl Workspaces {
             .is_some_and(|base| record.as_path().starts_with(base))
     }
 
+    /// Whether a stored root is still a directory, right now.
+    ///
+    /// The direct answer, for the paths a person acted on — opening, renaming, rebinding a
+    /// workspace. Those are one-shot, so the syscall is free, and "the folder just went away" has
+    /// to be visible on the very next answer rather than a poll cycle later.
+    fn exists(&self, record: &zlogic_store::WorkspaceRecord) -> bool {
+        record.as_path().is_dir()
+    }
+
+    /// [`Workspaces::exists`] for the polling path, answered from [`EXISTS_TTL`]-fresh memory and
+    /// off the runtime worker on a miss.
+    ///
+    /// Every `session_list` and `session_open` reads a workspace, and the UI polls both every few
+    /// seconds, so this runs far more often than anything else that touches the filesystem. A miss
+    /// is a `Path::is_dir`, and on a busy drive that syscall can block for seconds — which must
+    /// not happen on a worker thread, because a blocked worker cannot schedule anything else and
+    /// a slow stat would read as a stalled engine. The field it feeds only drives a passive
+    /// "folder missing" badge, so a tick of staleness costs nothing.
+    async fn exists_cached(&self, record: &zlogic_store::WorkspaceRecord) -> bool {
+        let key = record.as_path().to_path_buf();
+        if let Some(fresh) = self.fresh_exists(&key) {
+            return fresh;
+        }
+        let answer = tokio::task::spawn_blocking({
+            let key = key.clone();
+            move || key.is_dir()
+        })
+        .await
+        .unwrap_or(false);
+        self.remember_exists(key, answer);
+        answer
+    }
+
+    fn fresh_exists(&self, key: &Path) -> Option<bool> {
+        let cache = self.exists.lock().ok()?;
+        let (answer, taken) = cache.get(key)?;
+        (taken.elapsed() < EXISTS_TTL).then_some(*answer)
+    }
+
+    fn remember_exists(&self, key: PathBuf, answer: bool) {
+        if let Ok(mut cache) = self.exists.lock() {
+            cache.insert(key, (answer, Instant::now()));
+        }
+    }
+
     fn lookup_existing(&self, sel: &WorkspaceSelector) -> Result<zlogic_store::WorkspaceRecord> {
         match sel {
             WorkspaceSelector::Id { workspace_id } => self
@@ -123,6 +181,7 @@ impl Workspaces {
         sel: &WorkspaceSelector,
         name: Option<&str>,
         tools: Option<&[String]>,
+        kind: WorkspaceKind,
     ) -> Result<(zlogic_store::WorkspaceRecord, bool)> {
         match sel {
             WorkspaceSelector::Id { workspace_id } => {
@@ -139,7 +198,7 @@ impl Workspaces {
                 }
                 Ok(self
                     .store
-                    .with(|db| db.workspaces().resolve_with(root, name, tools))?)
+                    .with(|db| db.workspaces().resolve_with_kind(root, name, tools, kind))?)
             }
         }
     }
@@ -220,7 +279,12 @@ impl Workspaces {
         let session_count = self
             .store
             .with(|db| db.workspaces().session_count(record.workspace_id))?;
-        Ok(summary(record, session_count, self.is_managed(record)))
+        Ok(summary(
+            record,
+            session_count,
+            self.is_managed(record),
+            self.exists(record),
+        ))
     }
 }
 
@@ -239,9 +303,10 @@ impl WorkspaceService for Workspaces {
                  the tool allowlist",
             ));
         }
-        let tools = kind.and_then(WorkspaceKind::preset_tools);
+        let kind = kind.unwrap_or(WorkspaceKind::Coding);
+        let tools = kind.preset_tools();
         let (record, _created) = self
-            .lookup(&sel, name.as_deref(), tools.as_deref())
+            .lookup(&sel, name.as_deref(), tools.as_deref(), kind)
             .map_err(ApiError::from)?;
 
         self.report_init(record.workspace_id, record.as_path());
@@ -262,11 +327,21 @@ impl WorkspaceService for Workspaces {
             .store
             .with(|db| db.workspaces().list(include_hidden))
             .map_err(EngineError::from)?;
-        records
-            .iter()
-            .map(|r| self.summarise(r))
-            .collect::<Result<_>>()
-            .map_err(ApiError::from)
+        let mut out = Vec::with_capacity(records.len());
+        for record in &records {
+            let session_count = self
+                .store
+                .with(|db| db.workspaces().session_count(record.workspace_id))
+                .map_err(EngineError::from)
+                .map_err(ApiError::from)?;
+            out.push(summary(
+                record,
+                session_count,
+                self.is_managed(record),
+                self.exists_cached(record).await,
+            ));
+        }
+        Ok(out)
     }
 
     async fn update(&self, req: WorkspaceUpdateReq) -> ApiResult<WorkspaceSummary> {
@@ -286,6 +361,11 @@ impl WorkspaceService for Workspaces {
             };
             self.store
                 .with(|db| db.workspaces().set_tools(req.workspace_id, tools))
+                .map_err(EngineError::from)?;
+        }
+        if let Some(kind) = req.kind {
+            self.store
+                .with(|db| db.workspaces().set_kind(req.workspace_id, kind))
                 .map_err(EngineError::from)?;
         }
         let record = self
@@ -375,7 +455,7 @@ impl WorkspaceService for Workspaces {
         // Timed in stages on purpose: this call is the first step of every `session_list` poll and
         // every `session_open`, so when a list turns out slow this is where it becomes visible
         // whether the connection pool was queueing (`store_ms`), the filesystem stalled
-        // (`managed_ms`), or the work here was trivial and the wall clock went elsewhere
+        // (`exists_ms`), or the work here was trivial and the wall clock went elsewhere
         // (`total_ms` far above the three stages: the calling thread was starved or descheduled).
         let started = std::time::Instant::now();
         let (record, session_count) = self
@@ -405,13 +485,18 @@ impl WorkspaceService for Workspaces {
         let stored = std::time::Instant::now();
 
         let managed = self.is_managed(&record);
+
+        // A cache hit is a map lookup; a miss is a `Path::is_dir`, which on a busy or spinning
+        // drive can block for seconds. Either way it must not run on a runtime worker: a blocked
+        // worker cannot schedule anything else, so a slow stat would read as a stalled engine.
+        let exists = self.exists_cached(&record).await;
         let resolved = std::time::Instant::now();
 
-        let summary = summary(&record, session_count, managed);
+        let summary = summary(&record, session_count, managed, exists);
         let finished = std::time::Instant::now();
 
         let store_ms = stored.duration_since(started).as_millis() as u64;
-        let managed_ms = resolved.duration_since(stored).as_millis() as u64;
+        let exists_ms = resolved.duration_since(stored).as_millis() as u64;
         let summary_ms = finished.duration_since(resolved).as_millis() as u64;
         let total_ms = finished.duration_since(started).as_millis() as u64;
 
@@ -420,7 +505,7 @@ impl WorkspaceService for Workspaces {
                 target: "zlogic::engine",
                 workspace = %record.workspace_id,
                 store_ms,
-                managed_ms,
+                exists_ms,
                 summary_ms,
                 total_ms,
                 "workspaces.get slow"
@@ -469,13 +554,14 @@ fn summary(
     record: &zlogic_store::WorkspaceRecord,
     session_count: u32,
     managed: bool,
+    exists: bool,
 ) -> WorkspaceSummary {
-    let kind = WorkspaceKind::of_tools(record.tools.as_deref());
+    let kind = WorkspaceKind::from_record(record.tools.as_deref(), record.kind);
     WorkspaceSummary {
         workspace_id: record.workspace_id,
         root: record.path.clone(),
         name: record.name.clone(),
-        exists: record.exists(),
+        exists,
         pinned: record.pinned,
         sort_order: record.sort_order,
         last_opened_at: record.last_opened_at,
@@ -912,6 +998,7 @@ mod tests {
             pinned: None,
             sort_order: None,
             hidden: Some(true),
+            kind: None,
             tools: None,
         })
         .await
@@ -961,6 +1048,7 @@ mod tests {
                 pinned: None,
                 sort_order: None,
                 hidden: Some(true),
+                kind: None,
                 tools: None,
             })
             .await
@@ -1005,6 +1093,7 @@ mod tests {
                 pinned: Some(true),
                 sort_order: Some(3),
                 hidden: None,
+                kind: None,
                 tools: None,
             })
             .await
@@ -1026,6 +1115,7 @@ mod tests {
                 pinned: Some(true),
                 sort_order: None,
                 hidden: None,
+                kind: None,
                 tools: None,
             })
             .await
@@ -1174,6 +1264,7 @@ mod tests {
             pinned: None,
             sort_order: None,
             hidden: None,
+            kind: None,
             tools: Some(WorkspaceToolsUpdate::All),
         })
         .await

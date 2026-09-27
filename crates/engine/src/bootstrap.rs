@@ -15,8 +15,8 @@ use zlogic_credential::{CredentialStore, SystemCredentialStore, credential_candi
 use zlogic_objects::{FileObjectStore, ObjectStore};
 use zlogic_store::Db;
 use zlogic_tools::{
-    MemoryUpdate, SearchKeySource, SearchProvider, Shell, ShellPreference as ToolShellPreference,
-    ToolRegistry, WebSearchSettings,
+    MemoryUpdate, SearchKeySource, SearchProvider, Shell, ShellBudgets,
+    ShellPreference as ToolShellPreference, ToolRegistry, WebSearchSettings,
 };
 
 use crate::hub::EventHub;
@@ -83,9 +83,15 @@ pub struct ProWiring {
     pub extension_service: Option<Arc<dyn crate::service::ExtensionService>>,
     pub objects: Option<Arc<dyn crate::service::ObjectService>>,
     pub auxiliary: Option<Arc<dyn crate::service::AuxiliaryService>>,
+    /// Quick translate's history. Absent when the host does not keep one, in which case the RPCs
+    /// answer "not wired" rather than an empty list that looks like an empty history.
+    pub translations: Option<Arc<dyn crate::service::TranslationService>>,
     pub files: Option<Arc<dyn crate::service::WorkspaceFilesService>>,
     pub git: Option<Arc<dyn crate::service::WorkspaceGitService>>,
     pub agent_profiles: Option<Arc<dyn crate::service::AgentProfileService>>,
+    /// Per-turn environment lines the host adds to the system prompt — what this session is bound
+    /// to, which the model cannot discover for itself. `None` for a host that has nothing to say.
+    pub session_environment: Option<Arc<dyn crate::service::SessionEnvironmentService>>,
 }
 
 pub type ProFactory = Box<dyn FnOnce(ProHosts) -> ProWiring + Send>;
@@ -203,7 +209,15 @@ impl Engine {
             Err(e) => vec![format!("failed to load env.yaml: {e}")],
         };
 
-        zlogic_credential::init_secret_vault(dirs.master_key_file(), dirs.secrets_blob());
+        // Before the vault is registered, so the process never touches the OS credential store on
+        // a machine that turned it off. Both hosts reach the same directory here, so the switch is
+        // read from wherever this process found `dirs`.
+        zlogic_credential::set_keychain_enabled(zlogic_config::keychain_enabled(&dirs));
+
+        zlogic_credential::init_secret_vault(
+            zlogic_credential::EncryptedPaths::new(dirs.master_key_file(), dirs.secrets_blob()),
+            dirs.secrets_plain_file(),
+        );
 
         let credential_store: Arc<dyn CredentialStore> = Arc::new(SystemCredentialStore);
         let config = AppConfig::load(&dirs, |reference| credential_store.is_available(reference))
@@ -282,6 +296,21 @@ impl Engine {
 
         let worktrees = Arc::new(Worktrees::new(store.clone(), config.worktree.dir.clone()));
 
+        // Checkpoints live in zlogic's own data directory, one bare repository per repository the
+        // user works in. Nothing is written to the user's repository, and the store is created
+        // lazily on the first snapshot rather than at boot.
+        let checkpoints = zlogic_checkpoints::Checkpoints::new(
+            dirs.data.join("checkpoints"),
+            zlogic_checkpoints::Config {
+                enabled: config.checkpoints.enabled,
+                retention_days: config.checkpoints.retention_days,
+                max_snapshots: config.checkpoints.max_snapshots as usize,
+                max_bytes: u64::from(config.checkpoints.max_size_gb) * 1024 * 1024 * 1024,
+                max_file_bytes: config.checkpoints.max_file_mb * 1024 * 1024,
+                max_files: config.checkpoints.max_files as usize,
+            },
+        );
+
         let transport: Arc<dyn zlogic_llm::transport::HttpTransport> = Arc::new(
             zlogic_llm::transport::ReqwestTransport::with_network(&config.network),
         );
@@ -292,13 +321,18 @@ impl Engine {
             credential_store.clone(),
         ));
         let auxiliary = Arc::new(Auxiliary::new(store.clone(), router.clone(), hub.clone()));
-        let (mut tools, shell_dialect, mut tool_warnings) = tool_registry(
+        let BuiltinTools {
+            mut tools,
+            shell,
+            warnings: mut tool_warnings,
+        } = tool_registry(
             &config,
             Some(Arc::new(CredentialSearchKeys {
                 store: credential_store.clone(),
                 auto_detect_env: config.auto_detect_env,
             })),
         );
+        let shell_dialect = shell.as_ref().map(Shell::dialect);
         warnings.append(&mut tool_warnings);
         let memories = Arc::new(Memories::new(store.clone(), objects.clone()));
         tools.add(Arc::new(MemoryUpdate::new(memories.clone())));
@@ -341,6 +375,10 @@ impl Engine {
             .as_ref()
             .and_then(|pro| pro.auxiliary.clone())
             .unwrap_or_else(|| Arc::new(crate::not_wired::NotWired));
+        let translation_service: Arc<dyn crate::service::TranslationService> = pro
+            .as_ref()
+            .and_then(|pro| pro.translations.clone())
+            .unwrap_or_else(|| Arc::new(crate::not_wired::NotWired));
         // The registry keeps serving `WorkspaceService`: the file and Git halves are separate
         // services, so a build without a closed half simply has none.
         let files_service: Arc<dyn crate::service::WorkspaceFilesService> = pro
@@ -357,6 +395,10 @@ impl Engine {
             .as_ref()
             .and_then(|pro| pro.agent_profiles.clone())
             .unwrap_or_else(|| Arc::new(crate::not_wired::NotWired));
+        // No default: a host that says nothing must produce no line at all rather than a
+        // placeholder the model would have to interpret.
+        let session_environment: Option<Arc<dyn crate::service::SessionEnvironmentService>> =
+            pro.as_ref().and_then(|pro| pro.session_environment.clone());
 
         let tool_catalog = Arc::new(crate::ToolCatalog::new(tools.clone()));
 
@@ -402,30 +444,35 @@ impl Engine {
 
         let prompts = Arc::new(
             crate::SystemPrompts::new(dirs.clone(), config.clone(), shell_dialect)
-                .with_math_rendering(opts.renders_math),
+                .with_math_rendering(opts.renders_math)
+                .with_session_environment(session_environment.clone()),
         );
 
-        let dispatcher = Arc::new(
-            Dispatcher::new(
-                store.clone(),
-                hub.clone(),
-                router.clone(),
-                Arc::new(SessionLocks::new(store.clone(), opts.host)),
-                services,
-                workspaces.clone(),
-                interactions.clone(),
-            )
-            .with_dirs(dirs.clone())
-            .with_worktrees(worktrees.clone())
-            .with_extensions(extensions.clone())
-            // Auxiliary calls are isolated from the turn, prompt, transcript and tool pipeline.
-            .with_auxiliary(auxiliary.clone())
-            .with_prompts(prompts.clone())
-            .with_skills(skills.clone())
-            // `general` is always available; `agent:<name>` role entries add named profiles whose
-            // model/thinking settings are resolved at the start of each turn.
-            .with_agents(agent_profile_names(&config)),
-        );
+        let session_locks = Arc::new(SessionLocks::new(store.clone(), opts.host));
+        let mut dispatcher = Dispatcher::new(
+            store.clone(),
+            hub.clone(),
+            router.clone(),
+            session_locks.clone(),
+            services,
+            workspaces.clone(),
+            interactions.clone(),
+        )
+        .with_dirs(dirs.clone())
+        .with_worktrees(worktrees.clone())
+        .with_checkpoints(checkpoints.clone())
+        .with_extensions(extensions.clone())
+        // Auxiliary calls are isolated from the turn, prompt, transcript and tool pipeline.
+        .with_auxiliary(auxiliary.clone())
+        .with_prompts(prompts.clone())
+        .with_skills(skills.clone())
+        // `general` is always available; `agent:<name>` role entries add named profiles whose
+        // model/thinking settings are resolved at the start of each turn.
+        .with_agents(agent_profile_names(&config));
+        if let Some(shell) = shell {
+            dispatcher = dispatcher.with_shell(shell);
+        }
+        let dispatcher = Arc::new(dispatcher);
         let task_waker: Arc<dyn crate::task::TaskWake> = dispatcher.clone();
         tasks.bind_waker(Arc::downgrade(&task_waker));
         drop(task_waker);
@@ -486,6 +533,7 @@ impl Engine {
             )
             .with_bypass_flag(bypass_cell)
             .with_router(router.clone())
+            .with_checkpoints(checkpoints.clone())
             .with_transport(transport.clone()),
         );
         let credential_service = Arc::new(Credentials::new(
@@ -499,7 +547,13 @@ impl Engine {
             .with_workspaces(workspaces.clone())
             .with_workspace_files(files_service)
             .with_workspace_git(git_service)
+            .with_checkpoints(Arc::new(crate::checkpoints::CheckpointTimeline::new(
+                checkpoints.clone(),
+                workspaces.clone(),
+                session_locks.clone(),
+            )))
             .with_auxiliary(auxiliary_service)
+            .with_translations(translation_service)
             .with_memories(memories)
             .with_agent_profiles(agent_profile_service)
             .with_sessions(sessions)
@@ -518,6 +572,14 @@ impl Engine {
                 objects.clone(),
                 chrono::Duration::hours(24),
                 std::time::Duration::from_secs(30),
+            );
+            // A little later than the object sweep: both claim the same database, and this one
+            // wants the write lock for a truncate rather than for a row.
+            let _ = crate::retention::spawn_detached(
+                store.clone(),
+                dirs.clone(),
+                config.retention.clone(),
+                std::time::Duration::from_secs(45),
             );
         }
 
@@ -561,17 +623,22 @@ fn agent_profile_names(config: &AppConfig) -> Vec<String> {
     names
 }
 
+/// What [`tool_registry`] resolved. The shell is returned whole, not just as its dialect, because
+/// the Dispatcher has to rebudget it per workspace and re-resolving would probe the platform a
+/// second time for a backend that might come out different.
+pub(crate) struct BuiltinTools {
+    pub tools: ToolRegistry,
+    pub shell: Option<Shell>,
+    pub warnings: Vec<String>,
+}
+
 pub(crate) fn tool_registry(
     config: &AppConfig,
     search_keys: Option<Arc<dyn SearchKeySource>>,
-) -> (
-    ToolRegistry,
-    Option<zlogic_tools::ShellDialect>,
-    Vec<String>,
-) {
+) -> BuiltinTools {
     let mut registry = ToolRegistry::with_builtins();
     let mut warnings = Vec::new();
-    let mut shell_dialect = None;
+    let mut shell = None;
 
     // The generic built-in registry has a platform-shaped shell so tests and lightweight hosts can
     // construct it without configuration. Production replaces it with the backend resolved from
@@ -579,14 +646,15 @@ pub(crate) fn tool_registry(
     // same Shell value.
     registry.remove("shell");
     match Shell::resolve(shell_preference(config.tools.default_shell)) {
-        Ok(shell) => {
-            shell_dialect = Some(shell.dialect());
+        Ok(resolved) => {
             tracing::info!(
                 target: "zlogic::engine",
-                backend = shell.backend_name(),
+                backend = resolved.backend_name(),
                 "selected the default shell"
             );
-            registry.add(Arc::new(shell));
+            let resolved = resolved.with_budgets(ShellBudgets::from(&config.tools.shell));
+            registry.add(Arc::new(resolved.clone()));
+            shell = Some(resolved);
         }
         Err(reason) => {
             warnings.push(format!(
@@ -633,7 +701,11 @@ pub(crate) fn tool_registry(
     }
 
     registry.add(Arc::new(zlogic_tools::WebSearch::new(settings)));
-    (registry, shell_dialect, warnings)
+    BuiltinTools {
+        tools: registry,
+        shell,
+        warnings,
+    }
 }
 
 fn shell_preference(preference: zlogic_config::ShellPreference) -> ToolShellPreference {
@@ -710,8 +782,8 @@ mod tests {
             config.tools.web_search.provider.is_none(),
             "this test is precisely about \"no named backend, the key decides\""
         );
-        let (registry, _, _) = tool_registry(&config, Some(Arc::new(OnlyParallel)));
-        let definition = registry.get("web_search").unwrap().definition();
+        let builtins = tool_registry(&config, Some(Arc::new(OnlyParallel)));
+        let definition = builtins.tools.get("web_search").unwrap().definition();
         assert!(
             definition.description.contains("parallel"),
             "the key source was not wired up: {}",
@@ -919,15 +991,16 @@ mod tests {
             config.tools.default_shell = zlogic_config::ShellPreference::Bash;
         }
 
-        let (registry, dialect, warnings) = tool_registry(&config, None);
+        let builtins = tool_registry(&config, None);
+        let warnings = &builtins.warnings;
         assert!(
             warnings
                 .iter()
                 .all(|w| !w.contains("shell tool is not enabled")),
             "{warnings:?}"
         );
-        assert!(dialect.is_some());
-        let definition = registry.get("shell").unwrap().definition();
+        assert!(builtins.shell.is_some());
+        let definition = builtins.tools.get("shell").unwrap().definition();
         #[cfg(windows)]
         assert!(definition.description.contains("Command Prompt"));
         #[cfg(not(windows))]
