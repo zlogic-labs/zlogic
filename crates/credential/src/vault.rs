@@ -490,6 +490,18 @@ mod tests {
     use super::*;
     use crate::CredentialStore;
 
+    /// Point the vault at the encrypted store for the rest of this binary.
+    ///
+    /// The switch is process-wide and macOS defaults it off, because an unsigned build would put
+    /// up a Keychain dialog for every entry. A test that reaches the vault through
+    /// [`SecretVault::new`] would then take the plaintext path, whose path is the placeholder
+    /// `unused-plain-store` — it asserts against a store it never meant to build. Every test in
+    /// this module is about the encrypted store, so they all say so instead of inheriting a
+    /// platform default that decides whether they test anything at all.
+    fn encrypted_store() {
+        KEYCHAIN.store(true, Ordering::Relaxed);
+    }
+
     fn test_key() -> [u8; MASTER_KEY_LEN] {
         let mut key = [0u8; MASTER_KEY_LEN];
         for (i, b) in key.iter_mut().enumerate() {
@@ -550,6 +562,7 @@ mod tests {
 
     #[test]
     fn vault_set_get_delete_roundtrip() {
+        encrypted_store();
         let tmp = tempfile::tempdir().unwrap();
         let vault = SecretVault::new(
             tmp.path().join("security/.master"),
@@ -573,6 +586,7 @@ mod tests {
 
     #[test]
     fn blob_is_encrypted_on_disk() {
+        encrypted_store();
         let tmp = tempfile::tempdir().unwrap();
         let blob_path = tmp.path().join("security/.key.enc");
         let vault = SecretVault::new(tmp.path().join("security/.master"), blob_path.clone());
@@ -596,6 +610,7 @@ mod tests {
 
     #[test]
     fn blob_persists_across_vault_instances() {
+        encrypted_store();
         let tmp = tempfile::tempdir().unwrap();
         let master_path = tmp.path().join("security/.master");
         let blob_path = tmp.path().join("security/.key.enc");
@@ -609,6 +624,7 @@ mod tests {
 
     #[test]
     fn missing_blob_reads_as_empty() {
+        encrypted_store();
         let tmp = tempfile::tempdir().unwrap();
         let vault = SecretVault::new(
             tmp.path().join("security/.master"),
