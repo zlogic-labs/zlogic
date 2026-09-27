@@ -1456,7 +1456,7 @@ mod tests {
             _request: ProcessRequest,
             mut process: SpawnedProcess,
         ) -> std::result::Result<TaskId, String> {
-            terminate(&mut process.child).await;
+            (&mut process.child).terminate().await;
             Ok(self.task_id)
         }
 

@@ -2407,15 +2407,13 @@ mod tests {
         let (_spool, objects, manager) = manager(store.clone());
         let hub = Arc::new(crate::hub::EventHub::new());
         manager.bind_hub(Arc::downgrade(&hub));
-        let mut child = Tree::spawn(
-            tokio::process::Command::new("/bin/sh")
-                .args(["-c", "printf hello; printf error >&2"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()),
-            Console::Hidden,
-        )
-        .unwrap();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "printf hello; printf error >&2"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = Tree::spawn(command, Console::Hidden).unwrap();
         let stdout = child.take_stdout().unwrap();
         let stderr = child.take_stderr().unwrap();
 

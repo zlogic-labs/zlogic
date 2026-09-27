@@ -886,6 +886,7 @@ mod tests {
             db.conn()
                 .execute_batch(
                     "DROP INDEX IF EXISTS idx_entry_interaction;
+                     ALTER TABLE workspaces DROP COLUMN kind;
                      PRAGMA user_version = 20;",
                 )
                 .unwrap();
@@ -982,7 +983,8 @@ mod tests {
                  DROP INDEX IF EXISTS idx_entry_object_kind;
                  ALTER TABLE entry_object DROP COLUMN kind;
                  ALTER TABLE entry_object DROP COLUMN label;
-                 ALTER TABLE entry_object DROP COLUMN meta;",
+                 ALTER TABLE entry_object DROP COLUMN meta;
+                 ALTER TABLE workspaces DROP COLUMN kind;",
             )
             .unwrap();
             conn.pragma_update(None, "user_version", 3i64).unwrap();

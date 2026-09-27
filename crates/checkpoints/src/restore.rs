@@ -540,7 +540,7 @@ fn restore_one(repo: &Repository, tree: &Tree<'_>, root: &Path, path: &str) -> R
         .persist(&target)
         .map_err(|error| error.to_string())?;
     #[cfg(unix)]
-    if entry.filemode() & 0o170000 == 0o100755 {
+    if entry.filemode() == 0o100755 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
             .map_err(|error| error.to_string())?;
