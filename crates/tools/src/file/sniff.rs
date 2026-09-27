@@ -209,7 +209,9 @@ fn binary_mime(head: &[u8]) -> Option<&'static str> {
     if head.starts_with(b"%PDF-") {
         return Some("application/pdf");
     }
-    if head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") || head.starts_with(b"PK\x07\x08")
+    if head.starts_with(b"PK\x03\x04")
+        || head.starts_with(b"PK\x05\x06")
+        || head.starts_with(b"PK\x07\x08")
     {
         return Some("application/zip");
     }

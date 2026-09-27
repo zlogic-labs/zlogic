@@ -1160,10 +1160,7 @@ async fn turn_items_carry_the_cards_rendered_in_that_turn() {
             .iter()
             .map(|w| w.object_id.as_str())
             .collect::<Vec<_>>(),
-        [
-            first.to_string().as_str(),
-            second.to_string().as_str(),
-        ]
+        [first.to_string().as_str(), second.to_string().as_str(),]
     );
     assert_eq!(one.widgets[0].height, 360);
     assert_eq!(one.widgets[0].libraries, vec!["chart".to_string()]);

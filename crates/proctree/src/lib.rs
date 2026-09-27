@@ -22,9 +22,9 @@
 use std::process::{ExitStatus, Output};
 use std::time::Duration;
 
-use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 #[cfg(windows)]
 use process_wrap::tokio::{CreationFlags, JobObject};
 use tokio::io::{AsyncRead, AsyncReadExt};

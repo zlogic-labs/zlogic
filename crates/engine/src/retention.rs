@@ -527,7 +527,10 @@ mod tests {
             session_cache_dir(root, Some(id)),
             root.join(".zlogic").join("cache").join(id.to_string())
         );
-        assert_eq!(session_cache_dir(root, None), root.join(".zlogic").join("cache"));
+        assert_eq!(
+            session_cache_dir(root, None),
+            root.join(".zlogic").join("cache")
+        );
     }
 
     #[test]
@@ -536,7 +539,11 @@ mod tests {
         // the millisecond clock, so a short prefix collapses every session opened in one millisecond.
         let ids: Vec<SessionId> = (0..64).map(|_| SessionId::new()).collect();
         let names: HashSet<String> = ids.iter().map(|id| id.to_string()).collect();
-        assert_eq!(names.len(), ids.len(), "two sessions shared a scratch folder");
+        assert_eq!(
+            names.len(),
+            ids.len(),
+            "two sessions shared a scratch folder"
+        );
     }
 
     struct SessionFixture {

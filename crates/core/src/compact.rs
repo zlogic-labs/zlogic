@@ -638,11 +638,7 @@ impl Core {
             // What survives, projected for the **conversation's** model rather than the
             // summariser's: this is the payload the next request carries, so it is what the
             // post-condition is measured against.
-            let tail: Vec<EntryRecord> = all
-                .iter()
-                .filter(|e| e.turn_seq > to)
-                .cloned()
-                .collect();
+            let tail: Vec<EntryRecord> = all.iter().filter(|e| e.turn_seq > to).cloned().collect();
             let tail_chars = model_facing_chars(
                 &context::build_context(&tail, &plan.model.source, &loader, &object_loader)?
                     .messages,
@@ -1376,6 +1372,9 @@ mod tests {
         // The window the post-condition compares against: prefix + this tail + the summary.
         let remaining = remaining_after_compaction(0, chars, Some(1_628), 4_186);
         assert_eq!(remaining, (chars / 4) as u64 + 1_628);
-        assert!(remaining < 100_000, "a 8k-character tail must fit a 100k window");
+        assert!(
+            remaining < 100_000,
+            "a 8k-character tail must fit a 100k window"
+        );
     }
 }

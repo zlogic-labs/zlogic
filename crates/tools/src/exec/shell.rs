@@ -43,9 +43,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::AsyncReadExt;
+use zlogic_proctree::{Console, Tree};
 use zlogic_protocol::llm::ToolDefinition;
 use zlogic_protocol::stream::OutputStream;
-use zlogic_proctree::{Console, Tree};
 
 use crate::{
     ObjectRole, ProcessRequest, Recovery, Result, SpawnedProcess, Tool, ToolCtx, ToolExecResult,

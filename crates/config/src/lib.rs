@@ -844,7 +844,9 @@ fn parse_dropping_unusable_keys<T: serde::de::DeserializeOwned>(
                 break;
             }
         }
-        let Some((pruned, label)) = removed else { break };
+        let Some((pruned, label)) = removed else {
+            break;
+        };
         document = pruned;
         dropped.push(label);
     }
@@ -862,7 +864,9 @@ fn collect_key_paths(
     prefix: &mut Vec<serde_yaml_ng::Value>,
     out: &mut Vec<Vec<serde_yaml_ng::Value>>,
 ) {
-    let Some(mapping) = value.as_mapping() else { return };
+    let Some(mapping) = value.as_mapping() else {
+        return;
+    };
     for key in mapping.keys() {
         prefix.push(key.clone());
         out.push(prefix.clone());
@@ -1504,7 +1508,11 @@ providers:
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Dirs::under(tmp.path());
         dirs.ensure().unwrap();
-        write(&dirs.config, "config.yaml", "providers: [this is not a map\n");
+        write(
+            &dirs.config,
+            "config.yaml",
+            "providers: [this is not a map\n",
+        );
         assert!(matches!(load(&dirs, &[]), Err(ConfigError::Parse { .. })));
     }
 

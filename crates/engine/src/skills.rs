@@ -479,7 +479,10 @@ mod tests {
         let skills = discover(&dirs, &tmp.path().join("repo"), None);
         assert_eq!(skills.found[0].description, "the model reads this");
         assert_eq!(
-            skills.found[0].descriptions.get("zh-CN").map(String::as_str),
+            skills.found[0]
+                .descriptions
+                .get("zh-CN")
+                .map(String::as_str),
             Some("界面读这一句")
         );
     }
@@ -489,8 +492,16 @@ mod tests {
         let skills = builtin_skills();
         let guide = &skills.found[0];
         assert_eq!(guide.name, "zlogic-guide");
-        assert!(guide.descriptions.contains_key("zh-CN"), "{:?}", guide.descriptions);
-        assert!(guide.descriptions.contains_key("en-US"), "{:?}", guide.descriptions);
+        assert!(
+            guide.descriptions.contains_key("zh-CN"),
+            "{:?}",
+            guide.descriptions
+        );
+        assert!(
+            guide.descriptions.contains_key("en-US"),
+            "{:?}",
+            guide.descriptions
+        );
     }
 
     #[test]
@@ -568,7 +579,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            installed(discover(&dirs, &root, Some(workspace))).found.is_empty(),
+            installed(discover(&dirs, &root, Some(workspace)))
+                .found
+                .is_empty(),
             "the same plugin switch must gate its skills as well as its MCP servers"
         );
         assert_eq!(
@@ -583,7 +596,11 @@ mod tests {
     #[test]
     fn nothing_installed_is_not_a_problem() {
         let tmp = tempfile::tempdir().unwrap();
-        let skills = installed(discover(&dirs_under(tmp.path()), &tmp.path().join("repo"), None));
+        let skills = installed(discover(
+            &dirs_under(tmp.path()),
+            &tmp.path().join("repo"),
+            None,
+        ));
         assert_eq!(skills, Skills::default());
     }
 

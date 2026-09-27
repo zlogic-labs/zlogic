@@ -371,13 +371,13 @@ impl Connection {
                     cmd,
                     zlogic_proctree::Console::Hidden,
                 ))
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .map_err(|e| {
-                        // The overwhelmingly common case, and worth naming: the command is not
-                        // installed, or not on zlogic's PATH (which is not the shell's).
-                        fail(format!("cannot start `{command}`: {e}"))
-                    })?;
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| {
+                    // The overwhelmingly common case, and worth naming: the command is not
+                    // installed, or not on zlogic's PATH (which is not the shell's).
+                    fail(format!("cannot start `{command}`: {e}"))
+                })?;
                 if let Some(pipe) = pipe {
                     stderr.clone().drain(server_id.to_string(), pipe);
                 }
