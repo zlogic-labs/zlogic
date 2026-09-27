@@ -249,11 +249,11 @@ mod tests {
 
     #[test]
     fn an_explicit_name_moves_all_four_directories() {
-        let d = Dirs::discover_in(&env_of(&[("HOME", "/home/u")]), None, "mochuno").unwrap();
-        assert_eq!(d.config, PathBuf::from("/home/u/.config/mochuno"));
-        assert_eq!(d.data, PathBuf::from("/home/u/.local/share/mochuno"));
-        assert_eq!(d.state, PathBuf::from("/home/u/.local/state/mochuno"));
-        assert_eq!(d.cache, PathBuf::from("/home/u/.cache/mochuno"));
+        let d = Dirs::discover_in(&env_of(&[("HOME", "/home/u")]), None, "other-app").unwrap();
+        assert_eq!(d.config, PathBuf::from("/home/u/.config/other-app"));
+        assert_eq!(d.data, PathBuf::from("/home/u/.local/share/other-app"));
+        assert_eq!(d.state, PathBuf::from("/home/u/.local/state/other-app"));
+        assert_eq!(d.cache, PathBuf::from("/home/u/.cache/other-app"));
     }
 
     #[test]
@@ -261,15 +261,15 @@ mod tests {
         let d = Dirs::discover_in(
             &env_of(&[
                 ("HOME", "/home/u"),
-                ("MOCHUNO_HOME", "/opt/mochuno"),
+                ("OTHER_APP_HOME", "/opt/other-app"),
                 ("ZLOGIC_HOME", "/opt/zlogic"),
             ]),
             None,
-            "mochuno",
+            "other-app",
         )
         .unwrap();
-        assert_eq!(d.config, PathBuf::from("/opt/mochuno/config"));
-        assert_eq!(d.state, PathBuf::from("/opt/mochuno/state"));
+        assert_eq!(d.config, PathBuf::from("/opt/other-app/config"));
+        assert_eq!(d.state, PathBuf::from("/opt/other-app/state"));
     }
 
     #[test]
@@ -277,7 +277,7 @@ mod tests {
         for app in ["", ".", "..", "../elsewhere", "a/b", r"a\b", "with space"] {
             assert!(check_app_name(app).is_err(), "{app:?} must be rejected");
         }
-        for app in ["zlogic", "mochuno", "my-app_2", "app.v2"] {
+        for app in ["zlogic", "other-app", "my-app_2", "app.v2"] {
             assert!(check_app_name(app).is_ok(), "{app:?} must be accepted");
         }
     }
