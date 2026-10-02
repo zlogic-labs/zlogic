@@ -3,5 +3,5 @@
 //! which welds this CLI together with the `daemon` subcommand into a single executable.
 
 fn main() -> std::process::ExitCode {
-    zlogic_cli::run()
+    zlogic::run()
 }
