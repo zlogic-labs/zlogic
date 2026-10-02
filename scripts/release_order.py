@@ -29,7 +29,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-CRATES = ROOT / "crates"
+# The workspace is not all crates/: the CLI lives at apps/cli and is the one people actually
+# `cargo install`, so it has to be in the set. Read the member list rather than hardcoding a
+# second directory — a new member outside crates/ would otherwise be silently skipped.
+MANIFEST_DIRS = ["crates", "apps"]
 
 DEP_RE = re.compile(r"^\s*([a-z0-9-]+)\s*=\s*\{([^}]*)\}\s*$", re.M)
 PATH_RE = re.compile(r"(^|,)\s*path\s*=")
@@ -52,7 +55,8 @@ def main() -> int:
         ws_default_publish = bool(m and m.group(1) == "true")
 
     crates: dict[str, dict] = {}
-    for manifest in sorted(CRATES.glob("*/Cargo.toml")):
+    manifests = [m for d in MANIFEST_DIRS for m in sorted((ROOT / d).glob("*/Cargo.toml"))]
+    for manifest in manifests:
         text = manifest.read_text(encoding="utf-8")
         name = re.search(r'^\s*name\s*=\s*"([^"]+)"', text, re.M)
         if not name:

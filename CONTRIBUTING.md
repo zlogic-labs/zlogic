@@ -14,7 +14,7 @@ in this repository.
 
 ```sh
 cargo build --release
-cargo run -p zlogic-cli
+cargo run -p zlogic
 cargo test
 ```
 

@@ -1,9 +1,24 @@
 [package]
-name = "zlogic-cli"
+# The package is named `zlogic`, not `zlogic-cli`, because that is the name the crate is
+# published under on crates.io — `cargo install zlogic` has to resolve to something. The
+# `-cli` suffix would read better next to the library crates, but it is not the name anyone
+# installs.
+name = "zlogic"
 edition = "2021"
-description = "Ratatui TUI frontend for zlogic, wired to the in-process engine (desktop/cli flow)."
+description = "Open-source AI coding agent and agent harness: a terminal UI wired to the in-process engine."
 license.workspace = true
-version = "0.9.9"
+version.workspace = true
+repository = "https://github.com/zlogic-labs/zlogic"
+homepage = "https://zlogic.run"
+documentation = "https://docs.rs/zlogic"
+readme = "README.md"
+keywords = ["ai", "agent", "tui", "cli", "llm"]
+categories = ["command-line-utilities", "development-tools"]
+# The workspace default is publish = false; this crate opts in. Note what publishing it means:
+# what lands on crates.io is the TUI host and the engine libraries, without the closed-source
+# daemon that the shipped binary welds in. `zlogic daemon …` falls back to a sibling
+# zlogic-daemon binary for source builds; there is no such binary in a cargo install.
+publish.workspace = true
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -42,7 +57,9 @@ windows-sys = { version = "0.59", features = [
 [dev-dependencies]
 tempfile.workspace = true
 
-# The command name is zlogic (the package name is still zlogic-cli: `-p zlogic-cli` refers to the package, the artifact is zlogic[.exe]).
+# The command name is zlogic, which the package name already implies — Cargo derives the
+# binary name from it. Spelled out so the artifact is not renamed by accident: renaming the
+# package changes what `cargo install` produces.
 [[bin]]
 name = "zlogic"
 path = "src/main.rs"
