@@ -1,0 +1,93 @@
+# Publish the libraries to crates.io with trusted publishing.
+#
+# This runs here, in the public repository, rather than on a maintainer's machine for two
+# reasons. Trusted publishing authenticates this workflow's OIDC identity, so there is no
+# long-lived API token stored anywhere; and provenance only means something if the artifact
+# was built from the repository it claims to come from.
+#
+# The shipped `zlogic` binary is NOT published from here. It welds this tree together with the
+# closed-source daemon, so it is built and released from the private repository instead. What
+# goes to crates.io are the library crates.
+#
+# The version comes from Cargo.toml, not from the tag. The tag is `v<product-version>`
+# (`v1.0.0-beta.2`) while the crate version is the derived machine version (`0.999.102`) —
+# macOS/MSI/MSIX all reject pre-release strings, so the manifests stay numeric. The rule lives
+# in docs/versioning.md in the private repository.
+#
+# The first publish of any given crate name still has to be done by hand with an API token,
+# before trusted publishing can be configured for it. After that this workflow owns it.
+
+name: Publish crates
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Actually publish (unchecked = dry run only)
+        type: boolean
+        default: false
+
+concurrency:
+  group: publish-crates
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # This is the entire authentication mechanism. There is no CARGO_REGISTRY_TOKEN anywhere
+  # in this workflow — crates-io-auth-action exchanges the OIDC token below for a short-lived
+  # registry token and revokes it when the job ends.
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the manifests and work out the publish order
+        # Also fails if any dependency still has only a path, which is the thing that
+        # would otherwise turn into a failed publish halfway through the sequence.
+        id: plan
+        run: python3 scripts/release_order.py | tee order.txt
+
+      - name: Dry run
+        run: |
+          set -euo pipefail
+          for crate in $(cat order.txt); do
+            echo "::group::cargo publish --dry-run -p $crate"
+            cargo publish -p "$crate" --dry-run --locked
+            echo "::endgroup::"
+          done
+
+      - name: Authenticate with crates.io
+        if: ${{ inputs.publish == true }}
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish
+        if: ${{ inputs.publish == true }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          for crate in $(cat order.txt); do
+            echo "::group::cargo publish -p $crate"
+            # crates.io rejects a duplicate version. A re-run should skip what already
+            # landed rather than abandon the rest of the sequence.
+            cargo publish -p "$crate" --locked \
+              || echo "::warning::$crate was not published (a version may already exist)"
+            echo "::endgroup::"
+            # crates.io caps the publish rate; backing off keeps the later crates in the
+            # sequence from being rejected for being impatient.
+            sleep 15
+          done
