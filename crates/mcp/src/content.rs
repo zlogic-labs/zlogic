@@ -46,7 +46,10 @@ pub fn to_result(
             ContentBlock::Image(image) => {
                 let name = format!("{safe_tool}-image-{}", index + 1);
                 let mime = sanitize_untrusted_text(&image.mime_type);
-                match capture(ctx, name, mime.clone(), &image.data) {
+                // A picture is a picture card, whatever produced it. `browser_take_screenshot` is
+                // a screenshot, and it used to arrive as a `File` row with a made-up path — the one
+                // shape in this function that says "there is a file on disk" when there is not.
+                match capture_picture(ctx, name, mime.clone(), &image.data) {
                     Some(file) => out = file.add_to(out),
                     None => text.push(format!("[image: {mime}, could not be stored]")),
                 }
@@ -76,7 +79,13 @@ pub fn to_result(
                     let mime = sanitize_untrusted_text(
                         &mime_type.unwrap_or_else(|| "application/octet-stream".into()),
                     );
-                    match capture(ctx, uri.clone(), mime.clone(), &blob) {
+                    // A blob may be a picture, whichever arm of MCP delivered it — a server
+                    // that embeds a screenshot as a resource gets the same card as one that returns
+                    // an image block. Routing on the declared MIME would miss the commonest case,
+                    // because a blob resource is allowed to carry no MIME at all, so this asks the
+                    // bytes instead: `capture_picture` sniffs them and falls back to the file card
+                    // for a non-image, which is what a URI — being a real address — wants anyway.
+                    match capture_picture(ctx, uri.clone(), mime.clone(), &blob) {
                         Some(file) => out = file.add_to(out),
                         None => text.push(format!("[resource {uri}: {mime}, could not be stored]")),
                     }
@@ -143,6 +152,37 @@ pub fn to_result(
     }
 }
 
+/// Decodes one MCP image block into an image card, measuring it from the bytes.
+///
+/// Separate from [`capture`] because the card is the difference: a screenshot has no path on
+/// disk, and a `File` row claims one. `None` on any failure, none of which should take the whole
+/// call down — and note the fallback inside `capture_picture` still stores the bytes as a file,
+/// so a payload too broken to measure is persisted rather than dropped.
+fn capture_picture(
+    ctx: &ToolCtx,
+    name: String,
+    mime_type: String,
+    base64_data: &str,
+) -> Option<CapturedFile> {
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(base64_data) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(target: "zlogic::mcp", "an image block was not valid base64: {e}");
+            return None;
+        }
+    };
+    // The label is the name the card is filed under: an MCP screenshot has no region and no
+    // monitor to name, so the tool and the index are the whole of what can honestly be said.
+    let label = name.clone();
+    match ctx.capture_picture(name, label, mime_type, &bytes) {
+        Ok(file) => Some(file),
+        Err(e) => {
+            tracing::warn!(target: "zlogic::mcp", "could not store an image block: {e}");
+            None
+        }
+    }
+}
+
 /// Decodes one MCP binary block into zlogic's generic persisted-file result. `None` on either
 /// failure, either of which is the server's fault or the disk's and neither of which should take
 /// the whole call down.
@@ -173,6 +213,18 @@ mod tests {
     use super::*;
     use crate::test_ctx;
     use rmcp::model::{ContentBlock, EmbeddedResource, Resource};
+
+    /// A real 3×2 PNG. The image tests need bytes a decoder accepts: a card's dimensions come from
+    /// a header read, so `b"\x89PNG"`-shaped junk would fall back to a file card and never reach
+    /// the assertions about pictures.
+    const PNG_3X2: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x02, 0x08, 0x02, 0x00, 0x00, 0x00, 0x12,
+        0x16, 0xF1, 0x4D, 0x00, 0x00, 0x00, 0x14, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x3C,
+        0x21, 0x27, 0xC7, 0x00, 0x06, 0x4C, 0x10, 0x8A, 0x81, 0x81, 0x01, 0x00, 0x13, 0x2E, 0x01,
+        0x08, 0xCE, 0x20, 0xB4, 0x58, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
+        0x60, 0x82,
+    ];
 
     fn text_of(result: &ToolExecResult) -> String {
         result.model_text()
@@ -226,7 +278,7 @@ mod tests {
     #[test]
     fn an_image_goes_to_the_object_store_and_the_model_gets_a_placeholder() {
         let ctx = test_ctx();
-        let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNGnot-really");
+        let png = base64::engine::general_purpose::STANDARD.encode(PNG_3X2);
         let out = to_result(
             "s",
             "screenshot",
@@ -244,16 +296,25 @@ mod tests {
             out.dangling_display_objects().is_empty(),
             "card and reference must agree"
         );
+        // An image *card*, not a file card: there is no file, so a `File { path }` would be
+        // pointing at a path that does not exist.
         match &out.display[0] {
-            ToolDisplay::File {
+            ToolDisplay::Image {
                 mime,
+                width,
+                height,
                 bytes,
                 object_id,
-                ..
+                label,
             } => {
-                assert_eq!(mime.as_deref(), Some("image/png"));
-                assert_eq!(*bytes, 14);
-                assert!(object_id.is_some());
+                assert_eq!(mime, "image/png");
+                assert_eq!((*width, *height), (3, 2), "measured from the bytes");
+                assert_eq!(*bytes, PNG_3X2.len() as u64);
+                assert_eq!(label, "screenshot-image-1");
+                assert_eq!(
+                    object_id, &out.objects[0].object_id,
+                    "the card points at the object"
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -265,7 +326,97 @@ mod tests {
         );
 
         let stored = ctx.objects.get(&out.objects[0].object_id).unwrap();
-        assert_eq!(stored, b"\x89PNGnot-really");
+        assert_eq!(stored, PNG_3X2);
+    }
+
+    /// The model-facing half depends on this: `zlogic_core` only turns a tool file into an image
+    /// block when the declared MIME matches what the bytes decode as. A server that mislabels its
+    /// screenshot used to be stored under the server's label, and the model got a placeholder
+    /// where it should have got the picture.
+    #[test]
+    fn a_mislabelled_image_is_stored_as_what_it_actually_is() {
+        let ctx = test_ctx();
+        let png = base64::engine::general_purpose::STANDARD.encode(PNG_3X2);
+        let out = to_result(
+            "s",
+            "screenshot",
+            CallToolResult::success(vec![ContentBlock::image(png, "image/jpeg")]),
+            &ctx,
+        );
+        match &out.display[0] {
+            ToolDisplay::Image { mime, .. } => assert_eq!(mime, "image/png", "the bytes win"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Bytes too broken to measure still get stored — as a file, because there is no width and
+    /// height to put on an image card, and a card claiming `0×0` is worse than an honest file row.
+    #[test]
+    fn an_unmeasurable_image_degrades_to_a_file_card() {
+        let ctx = test_ctx();
+        let junk = base64::engine::general_purpose::STANDARD.encode(b"\x89PNGnot-really");
+        let out = to_result(
+            "s",
+            "screenshot",
+            CallToolResult::success(vec![ContentBlock::image(junk, "image/png")]),
+            &ctx,
+        );
+        match &out.display[0] {
+            ToolDisplay::File { path, .. } => assert_eq!(path, "screenshot-image-1"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            ctx.objects.get(&out.objects[0].object_id).unwrap(),
+            b"\x89PNGnot-really"
+        );
+    }
+
+    /// A screenshot delivered as an embedded resource is the same picture as one delivered as an
+    /// image block, and gets the same card.
+    #[test]
+    fn an_image_blob_resource_is_a_picture_card_too() {
+        let ctx = test_ctx();
+        let blob = base64::engine::general_purpose::STANDARD.encode(PNG_3X2);
+        let contents = ResourceContents::blob(blob, "screenshot://page.png");
+        let out = to_result(
+            "s",
+            "t",
+            CallToolResult::success(vec![ContentBlock::Resource(EmbeddedResource::new(
+                contents,
+            ))]),
+            &ctx,
+        );
+        match &out.display[0] {
+            ToolDisplay::Image {
+                label, mime, width, ..
+            } => {
+                assert_eq!(label, "screenshot://page.png");
+                assert_eq!(mime, "image/png");
+                assert_eq!(*width, 3);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(text_of(&out).contains("screenshot://page.png"));
+    }
+
+    /// A non-image blob keeps the file card: a URI *is* an address, so `File { path }` is true.
+    #[test]
+    fn a_binary_blob_resource_stays_a_file() {
+        let ctx = test_ctx();
+        let blob = base64::engine::general_purpose::STANDARD.encode(b"binary");
+        let contents = ResourceContents::blob(blob, "file:///tmp/x.bin");
+        let out = to_result(
+            "s",
+            "t",
+            CallToolResult::success(vec![ContentBlock::Resource(EmbeddedResource::new(
+                contents,
+            ))]),
+            &ctx,
+        );
+        match &out.display[0] {
+            ToolDisplay::File { path, .. } => assert_eq!(path, "file:///tmp/x.bin"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -356,10 +507,12 @@ mod tests {
         assert!(text_of(&out).contains("no error details"));
     }
 
+    /// Several screenshots in one result must not collide: the label is what the user reads on the
+    /// card, and two cards both saying `screenshots-image-1` would be indistinguishable.
     #[test]
     fn several_media_blocks_get_distinct_display_names() {
         let ctx = test_ctx();
-        let data = base64::engine::general_purpose::STANDARD.encode(b"image");
+        let data = base64::engine::general_purpose::STANDARD.encode(PNG_3X2);
         let out = to_result(
             "s",
             "screenshots",
@@ -369,15 +522,15 @@ mod tests {
             ]),
             &ctx,
         );
-        let paths: Vec<&str> = out
+        let labels: Vec<&str> = out
             .display
             .iter()
             .filter_map(|display| match display {
-                ToolDisplay::File { path, .. } => Some(path.as_str()),
+                ToolDisplay::Image { label, .. } => Some(label.as_str()),
                 _ => None,
             })
             .collect();
-        assert_eq!(paths, ["screenshots-image-1", "screenshots-image-2"]);
+        assert_eq!(labels, ["screenshots-image-1", "screenshots-image-2"]);
     }
 
     /// Large output gets the same head-and-tail treatment as any other tool's.

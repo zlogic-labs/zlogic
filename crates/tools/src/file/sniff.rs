@@ -78,6 +78,10 @@ pub fn detect_mime(name: &str, head: &[u8]) -> Option<&'static str> {
 }
 
 /// Names that only make sense as a label for text.
+///
+/// `image/svg+xml` is text by its bytes but must keep the image label: the file server
+/// hands this verdict to the browser as `Content-Type`, and a `text/plain` on an `.svg`
+/// is exactly what makes every renderer refuse it.
 fn is_text(mime: &str) -> bool {
     mime.starts_with("text/")
         || matches!(
@@ -89,6 +93,7 @@ fn is_text(mime: &str) -> bool {
                 | "application/sql"
                 | "application/javascript"
                 | "application/x-ndjson"
+                | "image/svg+xml"
         )
 }
 
@@ -297,6 +302,18 @@ mod tests {
         head.extend_from_slice("é".as_bytes());
         assert_eq!(sniff(&head), Content::Text("utf-8"));
         assert_eq!(sniff(&[0xff, 0x00, 0xfe, 0x01]), Content::Unknown);
+    }
+
+    #[test]
+    fn svg_keeps_the_image_label_its_bytes_cannot_give() {
+        // The bytes are XML, so the name is the only place `image/svg+xml` survives — and
+        // the file server turns this verdict into the browser's `Content-Type`.
+        assert_eq!(
+            detect_mime("icon.svg", b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+            Some("image/svg+xml")
+        );
+        // Bytes still win wherever they can tell the two apart.
+        assert_eq!(detect_mime("icon.svg", PNG_1X1), Some("image/png"));
     }
 
     #[test]
