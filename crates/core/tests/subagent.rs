@@ -13,7 +13,7 @@ use common::*;
 use zlogic_core::{AgentProfile, CoreSpawner, EventSink, Limits};
 use zlogic_llm::LlmClient;
 use zlogic_llm::mock::MockScript;
-use zlogic_protocol::llm::{FinishReason, ThinkingIntent};
+use zlogic_protocol::llm::{FinishReason, LlmError, LlmErrorKind, ThinkingIntent};
 use zlogic_protocol::stream::{StreamPayload, ToolDisplay};
 use zlogic_protocol::usage::{Purpose, TokenUsage};
 use zlogic_store::EntryKind;
@@ -500,5 +500,65 @@ async fn a_bare_unknown_name_is_refused_even_with_a_base_profile() {
             .with(|db| db.sessions().children(h.session).unwrap())
             .is_empty(),
         "a refused spawn creates nothing"
+    );
+}
+
+/// A sub-agent the network cut off reports as a failure, not as a conclusion: the parent has to
+/// learn that the run is dead — with the reason, and with the restart left to it.
+#[tokio::test]
+async fn a_sub_agent_cut_off_externally_is_reported_to_the_parent() {
+    let h = Harness::new();
+    let offline = || MockScript {
+        fail_with: Some(LlmError {
+            kind: LlmErrorKind::Network,
+            retryable: true,
+            message: "connection reset".into(),
+            status: None,
+            request_id: None,
+        }),
+        ..Default::default()
+    };
+    // Two failures, not one: the report claims the retries are spent, so the child must not be
+    // answering on a second try.
+    let child = Scripted::new(vec![offline(), offline()]);
+    let spawner = spawner(
+        &h,
+        vec![profile("researcher", child.clone() as Arc<dyn LlmClient>)],
+    );
+    let parent = Scripted::new(vec![
+        spawn_call("researcher", "dig"),
+        MockScript::text("understood"),
+    ]);
+
+    let out = h
+        .core_with_spawner(spawner)
+        .run(TurnId::new(), h.plan(parent), user("go"), h.token())
+        .await
+        .unwrap();
+
+    assert!(child.request_count() > 0, "the sub-agent did start");
+    assert_eq!(out.stats.tools.failed, 1, "a dead run is not a success");
+    assert_eq!(out.status, zlogic_protocol::stream::TurnStatus::Completed);
+
+    let result = h.store.with(|db| {
+        db.entries()
+            .list(h.session)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == EntryKind::ToolResult)
+            .unwrap()
+    });
+    let text = result.data["content"].as_str().unwrap().to_string();
+    assert!(text.contains("connection reset"), "why it died: {text}");
+    assert!(text.contains("restart"), "and who decides: {text}");
+
+    // The interrupted run's transcript stays reachable from the report.
+    let child_session = h
+        .store
+        .with(|db| db.sessions().children(h.session).unwrap())
+        .remove(0);
+    assert!(
+        text.contains(&child_session.session_id.to_string()),
+        "the report links the transcript: {text}"
     );
 }
