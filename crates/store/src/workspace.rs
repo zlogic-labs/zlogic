@@ -282,6 +282,7 @@ fn encode_kind(kind: WorkspaceKind) -> &'static str {
         WorkspaceKind::Chat => "chat",
         WorkspaceKind::Custom => "custom",
         WorkspaceKind::MobileAndroid => "mobile_android",
+        WorkspaceKind::Research => "research",
     }
 }
 
@@ -291,6 +292,7 @@ fn decode_kind(text: &str) -> rusqlite::Result<WorkspaceKind> {
         "chat" => Ok(WorkspaceKind::Chat),
         "custom" => Ok(WorkspaceKind::Custom),
         "mobile_android" => Ok(WorkspaceKind::MobileAndroid),
+        "research" => Ok(WorkspaceKind::Research),
         _ => Err(rusqlite::Error::FromSqlConversionFailure(
             0,
             rusqlite::types::Type::Text,
