@@ -61,13 +61,20 @@ fn commands() -> Vec<ClipboardCommand> {
 
 #[cfg(not(test))]
 fn pipe_text(command: &ClipboardCommand, text: &str) -> bool {
-    let Ok(mut child) = Command::new(command.program)
+    let mut process = Command::new(command.program);
+    process
         .args(command.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
+        .stderr(Stdio::null());
+    // `powershell.exe` is a console binary and this is not always a console parent (the desktop
+    // drives the CLI), so on Windows the spawn must ask for no window itself.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        process.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let Ok(mut child) = process.spawn() else {
         return false;
     };
     let Some(mut stdin) = child.stdin.take() else {
