@@ -13,7 +13,7 @@
 /// Every migration, in order. The index is the schema version.
 pub const MIGRATIONS: &[&str] = &[
     V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19, V20, V21,
-    V22, V23, V24,
+    V22, V23, V24, V25, V26, V27, V28,
 ];
 
 /// The current version — what a freshly created database reports.
@@ -479,6 +479,84 @@ UPDATE workspaces SET kind = 'chat'
 WHERE tools = '["time","web_fetch","web_search"]';
 "#;
 
+/// Whether the session's last turn ended interrupted (the user stopped it, or it was cut off
+/// mid-flight) — what the sidebar shows as "this conversation is parked half-said".
+///
+/// A maintained column, like `turn_count` / `last_message_at`: deriving it per session list means
+/// walking every `turn_end` of every session in the workspace, which measured far more expensive
+/// than the rest of the list put together. It only changes when a turn ends, which is a write.
+///
+/// The backfill is the one pass over the timeline this design exists to avoid, paid once at
+/// migration: `ROW_NUMBER` picks the last `turn_end` per session, so a turn that was interrupted
+/// and then followed by a normal one is not marked.
+const V25: &str = r#"
+ALTER TABLE session ADD COLUMN interrupted INTEGER NOT NULL DEFAULT 0;
+UPDATE session SET interrupted = 1 WHERE session_id IN (
+  SELECT session_id FROM (
+    SELECT session_id,
+           json_extract(data, '$.status') AS status,
+           json_extract(data, '$.status.incomplete') AS incomplete,
+           ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY seq DESC) AS rn
+      FROM session_entry
+     WHERE kind = 'event' AND json_extract(data, '$.type') = 'turn_end'
+  )
+  WHERE rn = 1 AND (status = 'cancelled' OR incomplete = 'interrupted')
+);
+"#;
+
+/// The session layer of the environment variables. A table rather than a JSON column on `session`
+/// because the set is edited one row at a time from a table UI, and rewriting a blob to switch one
+/// switch off is the wrong shape for that.
+///
+/// Keyed on `root_session_id` and not the session's own id: a variable the user sets for a
+/// conversation has to reach the sub-agent's shell too, and the whole tree shares one root — the
+/// same reason `session.root_session_id` exists. The foreign key therefore points at the root row,
+/// and `ON DELETE CASCADE` takes a whole tree's variables with it when the root goes.
+const V26: &str = r#"
+CREATE TABLE IF NOT EXISTS session_env (
+  root_session_id TEXT NOT NULL,
+  name            TEXT NOT NULL,
+  value           TEXT NOT NULL,
+  enabled         INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (root_session_id, name),
+  FOREIGN KEY (root_session_id) REFERENCES session(session_id) ON DELETE CASCADE
+);
+"#;
+
+/// Widens V25's mark to the third ending the chat view can continue from: a turn that **errored
+/// out** joins the stopped and cut-off ones. V25's backfill only knew those two, so every session
+/// whose last turn ended `failed` before this migration is unmarked until it runs another turn.
+///
+/// The same one pass over the timeline, paid once more for the same reason V25 paid it the first
+/// time — the maintained column is what makes the session list cheap, and a list that had to
+/// re-derive it would walk every turn of every session it returns. Scoped to the rows V25 could
+/// not have set (`interrupted = 0`), so it is the failing sessions and nothing else that pays.
+const V27: &str = r#"
+UPDATE session SET interrupted = 1 WHERE interrupted = 0 AND session_id IN (
+  SELECT session_id FROM (
+    SELECT session_id,
+           json_extract(data, '$.status') AS status,
+           ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY seq DESC) AS rn
+      FROM session_entry
+     WHERE kind = 'event' AND json_extract(data, '$.type') = 'turn_end'
+  )
+  WHERE rn = 1 AND status = 'failed'
+);
+"#;
+
+/// Addressing a turn by its id rather than by its position.
+///
+/// Every turn in this codebase is loaded by `(session_id, turn_seq)`, and those are what the two
+/// indexes on `session_entry` carry. Asking for a turn *by id* is a different question, and it is
+/// the one a session in a shared workspace has to ask: to tell that a file one session just wrote
+/// is not another's, the engine reads the other session's **live** turn — and a lock row carries a
+/// `turn_id`, not a `turn_seq`. Measured on this machine's 12,187-entry session: 94 ms scanned
+/// against the table, per concurrent session, on the path of every turn that ends while another is
+/// running. The index is the whole difference; `seq` is last because the query orders by it.
+const V28: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_entry_turn_id ON session_entry(session_id, turn_id, seq);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,5 +603,82 @@ mod tests {
             one("SELECT exec_cwd FROM session WHERE session_id = 's1'"),
             r"D:\proj"
         );
+    }
+
+    /// The backfill is the only pass over the timeline this design exists to avoid, so it has to
+    /// get the answer right on a database that already holds years of turns.
+    #[test]
+    fn v25_marks_a_session_interrupted_from_its_last_turn_end() {
+        let conn = Connection::open_in_memory().unwrap();
+        const V25_IDX: usize = 24;
+        for m in &MIGRATIONS[..V25_IDX] {
+            conn.execute_batch(m).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO session (session_id, workspace_id, kind, agent, agent_paths, root_session_id, created_at, updated_at)
+             VALUES ('s1', 'ws1', 'chat', 'main', 'main', 's1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                    ('s2', 'ws1', 'chat', 'main', 'main', 's2', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                    ('s3', 'ws1', 'chat', 'main', 'main', 's3', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             INSERT INTO session_entry (entry_id, session_id, seq, turn_seq, turn_id, kind, data, created_at)
+             VALUES ('e1', 's1', 1, 1, 't1', 'event', '{\"type\":\"turn_end\",\"status\":\"cancelled\"}', '2026-01-01T00:00:01Z'),
+                    ('e2', 's2', 1, 1, 't1', 'event', '{\"type\":\"turn_end\",\"status\":{\"incomplete\":\"interrupted\"}}', '2026-01-01T00:00:01Z'),
+                    ('e3', 's3', 1, 1, 't1', 'event', '{\"type\":\"turn_end\",\"status\":\"cancelled\"}', '2026-01-01T00:00:01Z'),
+                    ('e4', 's3', 2, 2, 't2', 'event', '{\"type\":\"turn_end\",\"status\":\"completed\"}', '2026-01-01T00:00:02Z'),
+                    ('e5', 's1', 2, 1, 't1', 'event', '{\"type\":\"notice\",\"message\":\"hi\"}', '2026-01-01T00:00:03Z');",
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATIONS[V25_IDX]).unwrap();
+
+        let marked = |session: &str| -> i64 {
+            conn.query_row(
+                "SELECT interrupted FROM session WHERE session_id = ?1",
+                [session],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(marked("s1"), 1, "stopped by the user");
+        assert_eq!(marked("s2"), 1, "cut off mid-flight");
+        assert_eq!(marked("s3"), 0, "a normal turn after it clears the mark");
+    }
+
+    /// V25 marked the stopped and the cut-off, and left a failure unmarked on purpose. V27 is that
+    /// decision reversed, so the rows it has to find are exactly the ones V25 walked past.
+    #[test]
+    fn v27_marks_a_session_whose_last_turn_errored() {
+        let conn = Connection::open_in_memory().unwrap();
+        const V27_IDX: usize = 26;
+        for m in &MIGRATIONS[..V27_IDX] {
+            conn.execute_batch(m).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO session (session_id, workspace_id, kind, agent, agent_paths, root_session_id, created_at, updated_at)
+             VALUES ('s1', 'ws1', 'chat', 'main', 'main', 's1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                    ('s2', 'ws1', 'chat', 'main', 'main', 's2', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                    ('s3', 'ws1', 'chat', 'main', 'main', 's3', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                    ('s4', 'ws1', 'chat', 'main', 'main', 's4', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             INSERT INTO session_entry (entry_id, session_id, seq, turn_seq, turn_id, kind, data, created_at)
+             VALUES ('e1', 's1', 1, 1, 't1', 'event', '{\"type\":\"turn_end\",\"status\":\"failed\"}', '2026-01-01T00:00:01Z'),
+                    ('e2', 's2', 1, 1, 't1', 'event', '{\"type\":\"turn_end\",\"status\":\"failed\"}', '2026-01-01T00:00:01Z'),
+                    ('e3', 's2', 2, 2, 't2', 'event', '{\"type\":\"turn_end\",\"status\":\"completed\"}', '2026-01-01T00:00:02Z'),
+                    ('e4', 's3', 1, 1, 't1', 'event', '{\"type\":\"turn_end\",\"status\":\"limit_reached\"}', '2026-01-01T00:00:01Z'),
+                    ('e5', 's4', 1, 1, 't1', 'event', '{\"type\":\"turn_end\",\"status\":\"failed\"}', '2026-01-01T00:00:01Z'),
+                    ('e6', 's4', 2, 2, 't2', 'event', '{\"type\":\"turn_end\",\"status\":\"failed\"}', '2026-01-01T00:00:02Z');",
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATIONS[V27_IDX]).unwrap();
+
+        let marked = |session: &str| -> i64 {
+            conn.query_row(
+                "SELECT interrupted FROM session WHERE session_id = ?1",
+                [session],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(marked("s1"), 1, "errored out with nothing after it");
+        assert_eq!(marked("s2"), 0, "a normal turn after the failure clears it");
+        assert_eq!(marked("s3"), 0, "hitting a budget the user set is not an unfinished turn");
+        assert_eq!(marked("s4"), 1, "the last failure counts, not the first");
     }
 }

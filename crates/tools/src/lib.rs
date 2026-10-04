@@ -53,6 +53,7 @@ pub mod compute;
 pub mod display;
 pub mod exec;
 pub mod file;
+pub mod inspector;
 pub mod net;
 pub mod registry;
 pub mod resources;
@@ -72,6 +73,7 @@ use serde::{Deserialize, Serialize};
 use zlogic_objects::{ObjectId, ObjectStore};
 use zlogic_protocol::interaction::{InteractionBody, InteractionDecision};
 use zlogic_protocol::llm::ToolDefinition;
+use zlogic_protocol::settings::EnvSource;
 use zlogic_protocol::{CallId, EntryId, SessionId, TurnId};
 // Re-exported so a tool author does not have to name tokio-util, and so there is visibly one
 // cancellation type in the system rather than a wrapper per layer.
@@ -83,11 +85,12 @@ pub use compute::Time;
 pub use display::{DiffStat, FileChange, MathLine, ToolDisplay};
 pub use exec::{Shell, ShellBudgets, ShellDialect, ShellPreference};
 pub use file::{Edit, ReadFile, WriteFile};
+pub use inspector::{ComputerFacts, ComputerInspector};
 pub use net::{SearchKeySource, SearchProvider, WebFetch, WebSearch, WebSearchSettings};
 pub use registry::{Materialized, ToolRegistry, ToolSource};
 pub use resources::{ManagedResourceConnection, ManagedResourceHost, ManagedResourceProvider};
 pub use runtime::{executable_on_path, executable_on_path_in};
-pub use search::{Glob, Grep, ListDir};
+pub use search::{Glob, Grep, ListDir, SearchBudgets, SearchTools};
 pub use sensitive::{
     ResourceAuthorization, SensitiveEnvironment, SensitiveResource, authorize_sensitive_resource,
 };
@@ -104,6 +107,7 @@ pub use zlogic_protocol::interaction::{
     Choice, Control, FieldValue, Form, FormAnswer, FormField, InteractionPort, InteractionRequest,
 };
 pub use zlogic_protocol::stream::{OutputSink, OutputStream};
+pub use display::DisplaySink;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
@@ -450,6 +454,24 @@ pub struct ToolCtx {
     /// A tool that never awaits — the built-in file tools — simply never observes it and runs to
     /// completion. That is correct: they finish in microseconds.
     pub cancel: CancellationToken,
+    /// Cancelled when **this call** runs out of `tools.timeout_secs`. Never cancelled by Esc.
+    ///
+    /// **Two tokens, not one, because they mean different things and only a tool can tell them
+    /// apart.** [`Self::cancel`] is the user saying stop: drop what you have, the conversation is
+    /// over. This one is the runtime saying *you took too long*: the same work is unwanted, but the
+    /// conversation continues and the turn needs a real result to write down. A tool that returned
+    /// `cancelled` for a timeout would tell the model the user interrupted it, which is a lie the
+    /// model then reasons from.
+    ///
+    /// A child of [`Self::cancel`], so Esc stops a call through both — cancelling the parent
+    /// cancels every child. The converse does not hold, and that asymmetry is the point: this token
+    /// firing says nothing about the conversation.
+    ///
+    /// **Only meaningful for work that would outlive the call.** A tool running on the executor is
+    /// dropped with the future and cannot leak. A tool on `spawn_blocking` can: dropping its future
+    /// abandons a thread that keeps reading or writing with nobody waiting for it. Those tools
+    /// select on this token and return early; the rest never observe it, which is correct.
+    pub budget: CancellationToken,
     /// Where tools actually run. **Read fresh on every call** — it can migrate mid-session
     /// (into a worktree and back), so it is not a per-turn snapshot.
     pub exec_cwd: PathBuf,
@@ -486,13 +508,64 @@ pub struct ToolCtx {
     pub interaction: Option<Arc<dyn InteractionPort>>,
     /// Where incremental output goes. `None` discards it, which is what a batch run wants.
     pub output: Option<Arc<dyn OutputSink>>,
+    /// Where a tool attaches UI metadata to its own running call, before it returns. `None` in a
+    /// batch run. `create_agent` uses it to name the sub-agent's session on its card the moment
+    /// that session exists, rather than when the sub-agent is done.
+    pub display: Option<Arc<dyn DisplaySink>>,
     /// Output longer than this is offloaded to the object store, with head and tail kept.
     pub max_result_chars: usize,
     pub runtime_paths: Vec<PathBuf>,
+    /// Where the variables a subprocess inherits come from. `None` in a host that has no
+    /// configuration to offer, and the shell then runs with nothing but the scrubbed inherited
+    /// environment — the same behaviour as before the provider existed.
+    pub env: Option<Arc<dyn EnvProvider>>,
+    /// The registered `computer` tool, as something the gate can ask questions of. The tool
+    /// itself lives in the closed half (see `zlogic-pro`'s `tools-pro::computer`); what lives
+    /// here is the trait it implements, because the approval gate needs to ask "what is this
+    /// call about to touch" and the gate runs before any tool does.
+    ///
+    /// Only the gate reads this. A host that never registers that tool has no way to ask, and
+    /// the gate then treats every `computer` call as one whose target it cannot describe —
+    /// which escalates to asking the user rather than waving it through.
+    pub computer: Option<Arc<dyn ComputerInspector>>,
 }
 
 pub trait RuntimePathProvider: Send + Sync {
     fn bin_dirs(&self) -> Vec<PathBuf>;
+}
+
+/// What a variable's value can be computed from. The three layers need different facts, and the
+/// engine — not the tools crate — is what knows which is which, so this is data rather than a
+/// callback: the provider is called on every shell invocation and must not be able to block.
+#[derive(Debug, Clone, Copy)]
+pub struct EnvFacts<'a> {
+    /// The workspace root, for the workspace layer's file and for the `ZLOGIC_WORKSPACE_ROOT` value.
+    pub root: &'a Path,
+    /// Where this call actually runs, which is the worktree when the session entered one.
+    pub exec_cwd: &'a Path,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+}
+
+/// One variable in the effective set.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnvVariable {
+    pub name: String,
+    pub value: String,
+    pub source: EnvSource,
+}
+
+/// Supplies the variables a shell call inherits.
+///
+/// Modelled on [`RuntimePathProvider`] and for the same reason: the tool must not know where
+/// configuration comes from, and the engine must be able to change its mind between two calls
+/// without rebuilding a registry. The trait returns the **complete** set rather than a delta,
+/// because a layered lookup has to be able to mask a lower layer, and a delta cannot express that.
+pub trait EnvProvider: Send + Sync {
+    /// Built-ins and user variables, already merged across the three layers and filtered to the
+    /// ones that are switched on. Called per shell invocation, not cached per turn: editing
+    /// `settings.yaml` has to take effect on the very next command.
+    fn variables(&self, facts: &EnvFacts<'_>) -> Vec<EnvVariable>;
 }
 
 /// The outcome of resolving a path. **States facts; draws no conclusions.**
@@ -509,6 +582,31 @@ pub struct ResolvedPath {
 }
 
 impl ToolCtx {
+    /// The variables a subprocess should inherit, resolved now.
+    ///
+    /// Resolved per call rather than snapshotted into the context: the whole point of the three
+    /// layers is that a workspace's `settings.yaml` can be edited between two commands, and a
+    /// value frozen when the turn started would make the next command the one that proves it.
+    pub fn env_vars(&self) -> Vec<EnvVariable> {
+        let Some(provider) = &self.env else {
+            return Vec::new();
+        };
+        provider.variables(&EnvFacts {
+            root: &self.root,
+            exec_cwd: &self.exec_cwd,
+            session_id: self.session_id,
+            turn_id: self.turn_id,
+        })
+    }
+
+    /// The same set as plain pairs, for handing to a process environment.
+    pub fn env_pairs(&self) -> Vec<(String, String)> {
+        self.env_vars()
+            .into_iter()
+            .map(|var| (var.name, var.value))
+            .collect()
+    }
+
     /// Resolves a required path argument after rejecting the empty string.
     /// Serde's `required` only proves that the key exists; without this check `{"path":""}`
     /// resolves to the current working directory, which is especially dangerous for destructive
@@ -683,6 +781,69 @@ impl ToolCtx {
         ))
     }
 
+    /// Stores an encoded image and builds its three projections together.
+    ///
+    /// Separate from [`ToolCtx::capture_file`] because the card is not a file card: a screenshot
+    /// has no path, and rendering it as one would put `screen://…` in front of a user who has no
+    /// idea what that is. The image still reaches the model through the ordinary tool-file path —
+    /// `zlogic_core` decides that from the MIME type, not from the card.
+    pub fn capture_image(
+        &self,
+        name: impl Into<String>,
+        label: impl Into<String>,
+        mime_type: impl Into<String>,
+        width: u32,
+        height: u32,
+        bytes: &[u8],
+    ) -> Result<CapturedFile> {
+        let id = self.objects.put(bytes)?;
+        let name = sanitize_file_name(&name.into());
+        let mime_type = normalize_mime(&mime_type.into());
+        Ok(CapturedFile {
+            content: ToolFile {
+                name: name.clone(),
+                mime_type: mime_type.clone(),
+                object_id: id.clone(),
+                bytes: bytes.len() as u64,
+            },
+            display: ToolDisplay::Image {
+                object_id: id.clone(),
+                mime: mime_type,
+                width,
+                height,
+                bytes: bytes.len() as u64,
+                label: label.into(),
+            },
+            object: ObjectRef::keyed(id, ObjectRole::Output, name),
+        })
+    }
+
+    /// Stores an encoded image and builds its three projections together, measuring the picture
+    /// from its own bytes.
+    ///
+    /// The counterpart to [`ToolCtx::capture_image`] for a caller that has the encoded picture but
+    /// never held the frame it came from — an MCP server handing back a screenshot, say. The
+    /// dimensions are read from the header rather than taken on trust, because a card whose
+    /// `width`/`height` disagree with the object it points at is what a client lays out from.
+    ///
+    /// Bytes that are not an image fall back to [`ToolCtx::capture_file`] rather than becoming a
+    /// card with two zeroes in it. The MIME is re-derived from the bytes when it disagrees with
+    /// what they actually are: a server that labels a JPEG `image/png` would otherwise be stored
+    /// under a label `zlogic_core` later refuses to decode, and the model would get a placeholder
+    /// where it should have got the picture.
+    pub fn capture_picture(
+        &self,
+        name: impl Into<String>,
+        label: impl Into<String>,
+        mime_type: impl Into<String>,
+        bytes: &[u8],
+    ) -> Result<CapturedFile> {
+        let Some((mime, width, height)) = measure_picture(bytes) else {
+            return self.capture_file(name, mime_type, bytes);
+        };
+        self.capture_image(name, label, mime, width, height, bytes)
+    }
+
     /// File-backed counterpart of [`ToolCtx::capture_file`]. `put_path` streams into the object
     /// store, so a large recording or archive is not first copied into one in-memory `Vec`.
     pub fn capture_file_path(
@@ -760,8 +921,9 @@ impl Recovery {
                  limit."
             }
             Recovery::FilterAtSource => {
-                "To see the middle, re-run with the filtering at the source — pipe through grep, \
-                 head or tail so only what you need comes back."
+                "To see the middle, re-run with the filtering at the source — pipe through grep \
+                 or head so only what you need comes back. Not `tail`: it prints nothing until \
+                 its input ends, so it silences the live log for the whole run."
             }
             Recovery::Unavailable => "The omitted part is not retrievable.",
         }
@@ -931,6 +1093,28 @@ impl CapturedFile {
     }
 }
 
+/// `(mime, width, height)` of an encoded picture, or `None` when the bytes are not one.
+///
+/// Only the header is read: `into_dimensions` decodes nothing, so an untrusted 40-megapixel PNG
+/// costs a few hundred bytes of parsing here and its pixels are never touched. The MIME comes
+/// from the same sniff, which is why it is returned rather than taken from the caller — a
+/// mislabelled payload has to be stored under what it actually is, or `zlogic_core`'s projector
+/// will refuse it later.
+fn measure_picture(bytes: &[u8]) -> Option<(String, u32, u32)> {
+    let format = image::guess_format(bytes).ok()?;
+    let mime = match format {
+        image::ImageFormat::Png => "image/png",
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::Gif => "image/gif",
+        image::ImageFormat::WebP => "image/webp",
+        _ => return None,
+    };
+    let (width, height) = image::ImageReader::with_format(std::io::Cursor::new(bytes), format)
+        .into_dimensions()
+        .ok()?;
+    Some((mime.to_string(), width, height))
+}
+
 fn captured_file(id: ObjectId, name: String, mime_type: String, bytes: u64) -> CapturedFile {
     let name = sanitize_file_name(&name);
     let mime_type = normalize_mime(&mime_type);
@@ -1096,6 +1280,7 @@ pub fn parse_args_with_prompt<T: serde::de::DeserializeOwned>(
 
 #[cfg(test)]
 pub(crate) fn test_ctx(root: &Path) -> ToolCtx {
+    let cancel = CancellationToken::new();
     ToolCtx {
         exec_cwd: root.to_path_buf(),
         root: root.to_path_buf(),
@@ -1109,9 +1294,15 @@ pub(crate) fn test_ctx(root: &Path) -> ToolCtx {
         worktree: None,
         interaction: None,
         output: None,
+        display: None,
         max_result_chars: 100,
         runtime_paths: Vec::new(),
-        cancel: CancellationToken::new(),
+        env: None,
+        computer: None,
+        // A real child, as production builds it: a test that cancels `ctx.cancel` must reach a tool
+        // watching only the budget, or the two paths diverge here and the bug hides until runtime.
+        budget: cancel.child_token(),
+        cancel,
     }
 }
 

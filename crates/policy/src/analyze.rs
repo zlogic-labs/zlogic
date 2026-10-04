@@ -29,7 +29,11 @@ const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
 /// Env vars whose assignment can hijack what a later command actually
 /// executes (loader injection, lookup-path swaps, shell rc override) —
 /// a policy match on the command head is meaningless under them.
-const DANGEROUS_ENV: &[&str] = &[
+///
+/// Public because the variable loader needs the same judgement: a configured variable is a
+/// *standing* assignment rather than a one-command prefix, so a name refused here has to be
+/// refused there too, from one list rather than two that drift.
+pub const DANGEROUS_ENV: &[&str] = &[
     "PATH",
     "IFS",
     "ENV",
@@ -48,8 +52,13 @@ const DANGEROUS_ENV: &[&str] = &[
     "SSH_ASKPASS",
 ];
 
+/// Whether assigning this name can change what a later command executes.
+pub fn env_name_is_dangerous(name: &str) -> bool {
+    DANGEROUS_ENV.contains(&name) || name.starts_with("LD_") || name.starts_with("DYLD_")
+}
+
 fn check_env_name(name: &str, ops: &mut Vec<Op>) {
-    if DANGEROUS_ENV.contains(&name) || name.starts_with("LD_") || name.starts_with("DYLD_") {
+    if env_name_is_dangerous(name) {
         ops.push(Op::Unknown {
             reason: format!("env assignment {name} can hijack what executes"),
             snippet: String::new(),

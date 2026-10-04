@@ -28,9 +28,10 @@ pub use provider::{
 pub use provider_models::ProviderModelsFile;
 pub use roles::{RoleSettings, RoleThinking, SESSION};
 pub use settings::{
-    ApprovalMode, AutoTitle, CheckpointsConfig, ContextConfig, CostConfig, ExchangeRate,
-    LimitsConfig, LogConfig, NetworkSettings, RetentionConfig, SessionConfig, ShellPreference,
-    ToolsConfig, WebSearchConfig, WorktreeConfig,
+    ApprovalMode, AutoTitle, CheckpointsConfig, ComputerConfig, ContextConfig, CostConfig, EnvConfig,
+    EnvScope, EnvSource, EnvVar, EnvVarDetail, ExchangeRate, LimitsConfig, LogConfig,
+    NetworkSettings, RetentionConfig, SessionConfig, ShellPreference, ToolsConfig, WebSearchConfig,
+    WorktreeConfig,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +123,7 @@ pub struct ConfigFile {
     pub cost: Option<CostConfig>,
     pub limits: Option<LimitsConfig>,
     pub network: Option<NetworkSettings>,
+    pub env: Option<EnvConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -151,6 +153,8 @@ pub struct AppConfig {
     pub cost: CostConfig,
     pub limits: LimitsConfig,
     pub network: NetworkSettings,
+    /// The global layer of the environment variables every shell call inherits.
+    pub env: EnvConfig,
     pub revision: u64,
     pub warnings: Vec<String>,
 }
@@ -173,6 +177,7 @@ impl Default for AppConfig {
             cost: CostConfig::default(),
             limits: LimitsConfig::default(),
             network: NetworkSettings::default(),
+            env: EnvConfig::default(),
             revision: 0,
             warnings: Vec::new(),
         }
@@ -424,6 +429,9 @@ impl AppConfig {
         if let Some(n) = file.network {
             self.network = n;
         }
+        if let Some(e) = file.env {
+            self.env = e;
+        }
         self.revision += 1;
     }
 
@@ -457,6 +465,10 @@ impl AppConfig {
         self.tools.shell.validate().map_err(ConfigError::Invalid)?;
         self.tools
             .web_search
+            .validate()
+            .map_err(ConfigError::Invalid)?;
+        self.tools
+            .computer
             .validate()
             .map_err(ConfigError::Invalid)?;
         for (provider_id, provider) in &self.providers {
@@ -916,12 +928,7 @@ pub fn load_env_file(dirs: &Dirs) -> Result<BTreeMap<String, String>> {
 }
 
 fn is_env_name(key: &str) -> bool {
-    !key.is_empty()
-        && !key.contains(['=', '\0'])
-        && key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        && !key.as_bytes()[0].is_ascii_digit()
+    settings::is_env_name(key)
 }
 
 pub fn seed_config_dir(dirs: &Dirs) -> Result<Vec<PathBuf>> {
@@ -1106,8 +1113,11 @@ const CONFIG_TEMPLATE: &str = r#"# zlogic's basic settings. The provider / model
 
 # Approval mode: auto = normal (dangerous operations are still asked about); bypass = full authority, every permission prompt skipped.
 # auto is the default; think it through before turning bypass on.
+# Plan mode: true restricts each turn to the tools that only read, so the agent investigates and proposes without changing anything.
+# Off is the default; plan mode is a posture for one stretch of work, not a setting to leave on.
 # session:
 #   approval_mode: auto
+#   plan_mode: false
 
 # Demand-side role → chain of candidate models. session is a reserved word meaning "the main model of this conversation".
 # llm_roles:
@@ -1125,6 +1135,28 @@ const CONFIG_TEMPLATE: &str = r#"# zlogic's basic settings. The provider / model
 #   no_proxy:            # hosts that skip the proxy (optional)
 #     - localhost
 #     - 127.0.0.1
+
+# ── environment variables for the shell tool ─────────────────────────────
+# Every `shell` call runs with its environment rebuilt from scratch. The shell does read your startup
+# files (`tools.shell.read_profile`), so the PATH you spent an afternoon on is already there — this
+# block is for everything that is *not* in them, and for values that must not change under you
+# mid-turn. Anything a command needs to see therefore belongs here, or in a project's
+# `.zlogic/settings.yaml`, or in the variables page of the desktop app. A project's own settings
+# travel with the repository, so names that could hijack execution (PATH, LD_*, NODE_OPTIONS, …) and
+# names that look like a credential are refused there and the refusal is reported.
+#
+# The value is a literal: no `${...}` expansion of any kind, and no keychain reference. Write the
+# name, and the shell expands `$NAME` itself.
+# env:
+#   enabled: true
+#   variables:
+#     NODE_ENV: development
+#     RUST_LOG:
+#       value: debug
+#       enabled: false          # declared, switched off — it masks a lower layer rather than falling back
+#
+# zlogic also supplies ZLOGIC_WORKSPACE_ROOT, ZLOGIC_CWD, ZLOGIC_SESSION_ID, ZLOGIC_TURN_ID,
+# ZLOGIC_CACHE_DIR, ZLOGIC_OS, ZLOGIC_ARCH and ZLOGIC_VERSION. The `ZLOGIC_` prefix is reserved.
 
 # ── worktree ──────────────────────────────────────────────────────────────
 # Where `enter_worktree` puts the checkouts it creates. Each worktree is a subdirectory of this directory.
@@ -1147,7 +1179,7 @@ const CONFIG_TEMPLATE: &str = r#"# zlogic's basic settings. The provider / model
 # plus the batch of tools it asks for) — dozens of rounds is normal for a big change, so this value is deliberately generous; the UI says so when you hit it.
 # limits:
 #   max_rounds: 150
-#   max_depth: 2
+#   max_depth: 1
 #   max_parallel_tools: 16   # how many tools may run at once in one round (0 = serial; calls that need approval are still one at a time)
 #   task_wait_secs: 60      # before a turn wraps up, how long to wait for background tasks this turn started with shell (compile/test);
 #                           # 0 = do not wait. If the wait is not over you are asked: keep waiting / kill it / let it run.
@@ -1173,15 +1205,32 @@ const CONFIG_TEMPLATE: &str = r#"# zlogic's basic settings. The provider / model
 #   # error that names neither the class nor the budget that actually applied.
 #   timeout_secs: 0
 #
+#   # Wall-clock ceiling on one `grep` / `glob` / `list_dir` call. 0 = off.
+#   # **This is the one tool call that can run for hours without producing anything to show for
+#   # it**: a pattern matching nothing reads every file in the tree, and `include_ignored` turns a
+#   # Rust repository's `target/` from a skipped directory into tens of thousands of files. Checked
+#   # *inside* the walk, so expiry returns the hits already found plus a note that the tree was not
+#   # fully read — rather than an error, and rather than a search still burning disk after you have
+#   # given up on it. Raise it if a legitimately huge search is being cut short; 0 turns it off.
+#   search_timeout_secs: 60
+#
 #   # How long `shell` may run, per kind of command. **You never set these per call** — the model
 #   # says whether it needs the result (`wait: true`) and shell matches the command to a class,
 #   # because a number guessed before the work is known is wrong in both directions: too short and
 #   # a test suite is killed at 30s and re-run four times, too long and one call holds the turn.
 #   # A workspace may override any single field in `<project>/.zlogic/settings.yaml`, same paths:
-#   #   tools:
-#   #     shell:
-#   #       test_secs: 1800          # an integration suite that is genuinely slow
+#   tools:
+#     shell:
+#       test_secs: 1800          # an integration suite that is genuinely slow
+#     search:
+#       timeout_secs: 300         # a monorepo whose ignored trees are genuinely enormous
 #   shell:
+#     read_profile: true         # bash starts as a login shell, PowerShell runs $PROFILE, cmd runs AutoRun.
+#                                 # **false** is `--noprofile --norc` / `-NoProfile` / `/d`: your startup
+#                                 # files cannot then `set -e`, install a trap or block on a prompt in
+#                                 # front of a command the model wrote — at the cost of a PATH only you
+#                                 # can extend, so everything a command needs has to be declared as a
+#                                 # variable below.
 #     quick_secs: 60               # git status, ls, a grep
 #     test_secs: 600               # cargo test, pytest, vitest — generous on purpose: a suite killed
 #                                   #   at the quick budget has told nobody anything
@@ -1207,6 +1256,26 @@ const CONFIG_TEMPLATE: &str = r#"# zlogic's basic settings. The provider / model
 #     # parallel_url: https://search.parallel.ai/mcp
 #     # Single search timeout (seconds). deep and fresh are both slow.
 #     timeout_secs: 25
+#
+#   # Let the model look at the screen and drive the mouse and keyboard. **Windows only for now**,
+#   # and off until you turn it on: this is the one tool that acts on the whole machine rather than
+#   # on the workspace. Every action still goes through the approval prompt, and a click names what
+#   # it is about to hit before you are asked to allow it.
+#   computer:
+#     enabled: false
+#     # Long edge of the image the model is shown. Smaller is cheaper; below ~800 small text stops
+#     # being readable and the model starts clicking the wrong thing.
+#     max_edge: 1280
+#     # png keeps text sharp; jpeg is smaller. Only worth jpeg on a very large display.
+#     format: png
+#     # Default budget for a `wait` that does not name its own.
+#     wait_ms: 2000
+#     # Ceiling per turn. A model that has lost the thread fails on this counter instead of on the
+#     # context window.
+#     max_screens_per_turn: 20
+#     # Return a screenshot after an action. Turn it off and the model flies blind, so only do this
+#     # if you are driving it yourself and watching.
+#     observe_after_action: true
 #
 # **There is no place to put a key here**, and the rule is the same as for provider keys (see the top of models.yaml):
 # look it up by name, and the first one that yields a value wins —

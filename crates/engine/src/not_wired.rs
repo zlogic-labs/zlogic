@@ -1,38 +1,44 @@
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 use zlogic_protocol::extensions::{
     ExtensionCatalog, ExtensionCatalogReq, ExtensionDescriptor, ExtensionInspectReq,
     ExtensionInstallPlan, ExtensionInstallReq, ExtensionRemoveReq, ExtensionSetEnabledReq,
     McpImportReq, McpImportResult, McpLogoutReq, McpOAuthBeginReq, McpOAuthBeginResult,
     McpOAuthCancelReq, McpOAuthStatusReq, McpOAuthStatusResult, McpSetKeyReq,
-    McpSetOAuthClientSecretReq, McpSetTokenReq, McpUpsertReq,
+    McpSetOAuthClientSecretReq, McpSetScopeReq, McpSetTokenReq, McpSetupReq, McpSetupResult,
+    McpTestReq, McpTestResult, McpUpsertReq,
 };
 use zlogic_protocol::query::{
     ApiError, ApiResult, CatalogCheck, ConfigRemoveProviderReq, ConfigUpdateReq, ConfigView,
     CredentialDeleteReq, CredentialSetReq, CredentialState, CredentialVerifyReq,
-    CredentialVerifyResult, EntriesReq, ObjectData, ObjectDataReq, ObjectReadReq, ObjectText,
-    OpenAiCompatibleProviderReq, Page, ProviderCatalog, ProviderModels, ProviderModelsReq,
-    ProviderSignInBegin, ProviderSignInBeginReq, ProviderSignInCancelReq, ProviderSignInStatus,
+    CredentialVerifyResult, EntriesReq, ObjectData, ObjectDataReq, ObjectRange, ObjectRangeReq,
+    ObjectReadReq, ObjectText, OpenAiCompatibleProviderReq, Page, ProviderCatalog, ProviderModels,
+    ProviderModelsReq, ProviderSignInBegin, ProviderSignInBeginReq, ProviderSignInCancelReq,
+    ProviderSignInStatus,
     ProviderSignInStatusReq, RuntimeTask, RuntimeTaskDeleteReq, RuntimeTaskListReq, RuntimeTaskLog,
-    RuntimeTaskLogReq, RuntimeTaskPage, RuntimeTaskStopReq, SessionListReq, SessionOpenReq,
-    SessionOpened, SessionRenameReq, SessionSearchHit, SessionSearchReq, SessionSummary, TaskJob,
-    TaskJobCreateReq, TaskJobDeleteReq, TaskJobDraft, TaskJobDraftReq, TaskJobListReq,
-    TaskJobRunReq, TaskJobRunsReq, TaskJobSetEnabledReq, TextTranslateReq, TextTranslateResp,
-    ToolInfo, TranscriptEntry, TranscriptReq, TranslationDeleteReq, TranslationEntry,
-    TranslationListReq, TurnItem, TurnState, TurnsReq, UsageSummary, UsageSummaryReq,
-    WorkspaceFileBase64, WorkspaceFileCreateReq, WorkspaceFileDeleteReq, WorkspaceFileEntry,
-    WorkspaceFileListReq, WorkspaceFileRange, WorkspaceFileRangeReq, WorkspaceFileReadReq,
-    WorkspaceFileRenameReq, WorkspaceFileSearchReq, WorkspaceFileText, WorkspaceFileWriteReq,
-    WorkspaceGitBranchReq, WorkspaceGitCommitDetail, WorkspaceGitCommitDetailReq,
-    WorkspaceGitCommitReq, WorkspaceGitDiff, WorkspaceGitDiffReq,
+    RuntimeTaskLogReq, RuntimeTaskPage, RuntimeTaskStopReq, SessionForkReq, SessionListReq,
+    SessionOpenReq, SessionOpened, SessionRenameReq, SessionSearchHit, SessionSearchReq,
+    SessionSummary, TaskJob, TaskJobCreateReq, TaskJobDeleteReq, TaskJobDraft, TaskJobDraftReq,
+    TaskJobListReq, TaskJobRunReq, TaskJobRunsReq, TaskJobSetEnabledReq, TextCompleteStreamReq,
+    TextDelta, TextTranslateReq, TextTranslateResp, ToolInfo, TranscriptEntry, TranscriptReq,
+    TranslationDeleteReq, TranslationEntry, TranslationListReq, TurnItem, TurnState, TurnsReq,
+    UsageSummary, UsageSummaryReq, WorkspaceFileBase64, WorkspaceFileCreateReq,
+    WorkspaceFileDeleteReq, WorkspaceFileEntry, WorkspaceFileListReq, WorkspaceFileRange,
+    WorkspaceFileRangeReq, WorkspaceFileReadReq, WorkspaceFileRenameReq, WorkspaceFileSearchReq,
+    WorkspaceFileText, WorkspaceFileWriteReq, WorkspaceGitBranchReq, WorkspaceGitCommitDetail,
+    WorkspaceGitCommitDetailReq, WorkspaceGitCommitReq, WorkspaceGitDiff, WorkspaceGitDiffReq,
     WorkspaceGitGenerateCommitMessageReq, WorkspaceGitInfo, WorkspaceGitInitReq,
     WorkspaceGitOverview, WorkspaceGitOverviewReq, WorkspaceGitStageReq, WorkspaceGitSyncReq,
-    WorkspaceKind, WorkspaceSelector, WorkspaceSummary, WorkspaceUpdateReq,
+    WorkspaceGitTrustReq, WorkspaceKind, WorkspaceSelector, WorkspaceSummary, WorkspaceUpdateReq,
 };
+use zlogic_protocol::query::{EnvGetReq, EnvSetReq, EnvView};
 use zlogic_protocol::query::{
-    WorkspaceCheckpoint, WorkspaceCheckpointCaptureReq, WorkspaceCheckpointFileDiff,
-    WorkspaceCheckpointFileDiffReq, WorkspaceCheckpointList, WorkspaceCheckpointListReq,
-    WorkspaceCheckpointPlan, WorkspaceCheckpointPlanReq, WorkspaceCheckpointRestore,
-    WorkspaceCheckpointRestoreReq, WorkspaceCheckpointStep, WorkspaceCheckpointStepReq,
+    WorkspaceCheckpoint, WorkspaceCheckpointCaptureReq, WorkspaceCheckpointClearReq,
+    WorkspaceCheckpointCleared, WorkspaceCheckpointFileDiff, WorkspaceCheckpointFileDiffReq,
+    WorkspaceCheckpointList, WorkspaceCheckpointListReq, WorkspaceCheckpointPlan,
+    WorkspaceCheckpointPlanReq, WorkspaceCheckpointRestore, WorkspaceCheckpointRestoreReq,
+    WorkspaceCheckpointStep, WorkspaceCheckpointStepReq, WorkspaceCheckpointSteps,
+    WorkspaceCheckpointStepsReq,
 };
 use zlogic_protocol::{
     AgentProfile, AgentProfileCreateReq, AgentProfileDeleteReq, AgentProfileListReq,
@@ -43,9 +49,9 @@ use zlogic_protocol::{
 };
 
 use crate::service::{
-    AgentProfileService, AuxiliaryService, ConfigService, CredentialService, ExtensionService,
-    ManagedResourceService, MemoryService, ObjectService, SessionService, TaskService,
-    ToolCatalogService, TranslationService, TurnService, WorkspaceCheckpointsService,
+    AgentProfileService, AuxiliaryService, ConfigService, CredentialService, EnvService,
+    ExtensionService, ManagedResourceService, MemoryService, ObjectService, SessionService,
+    TaskService, ToolCatalogService, TranslationService, TurnService, WorkspaceCheckpointsService,
     WorkspaceFilesService, WorkspaceGitService, WorkspaceService,
 };
 
@@ -72,6 +78,13 @@ impl AuxiliaryService for NotWired {
 
     async fn text_translate(&self, _req: TextTranslateReq) -> ApiResult<TextTranslateResp> {
         nope!("text_translate")
+    }
+
+    async fn text_complete_stream(
+        &self,
+        _req: TextCompleteStreamReq,
+    ) -> ApiResult<mpsc::UnboundedReceiver<TextDelta>> {
+        nope!("text_complete_stream")
     }
 }
 
@@ -132,6 +145,9 @@ impl SessionService for NotWired {
     }
     async fn rename(&self, _req: SessionRenameReq) -> ApiResult<SessionSummary> {
         nope!("session_rename")
+    }
+    async fn fork(&self, _req: SessionForkReq) -> ApiResult<SessionSummary> {
+        nope!("session_fork")
     }
     async fn delete(&self, _session_id: SessionId) -> ApiResult<()> {
         nope!("session_delete")
@@ -245,6 +261,9 @@ impl WorkspaceGitService for NotWired {
     async fn git_init(&self, _req: WorkspaceGitInitReq) -> ApiResult<WorkspaceGitOverview> {
         nope!("workspace_git_init")
     }
+    async fn git_trust(&self, _req: WorkspaceGitTrustReq) -> ApiResult<WorkspaceGitOverview> {
+        nope!("workspace_git_trust")
+    }
     async fn git_sync(&self, _req: WorkspaceGitSyncReq) -> ApiResult<WorkspaceGitOverview> {
         nope!("workspace_git_sync")
     }
@@ -282,6 +301,12 @@ impl WorkspaceCheckpointsService for NotWired {
     ) -> ApiResult<WorkspaceCheckpointStep> {
         nope!("workspace_checkpoint_step")
     }
+    async fn checkpoint_steps(
+        &self,
+        _req: WorkspaceCheckpointStepsReq,
+    ) -> ApiResult<WorkspaceCheckpointSteps> {
+        nope!("workspace_checkpoint_steps")
+    }
     async fn checkpoint_diff(
         &self,
         _req: WorkspaceCheckpointFileDiffReq,
@@ -299,6 +324,12 @@ impl WorkspaceCheckpointsService for NotWired {
         _req: WorkspaceCheckpointRestoreReq,
     ) -> ApiResult<WorkspaceCheckpointRestore> {
         nope!("workspace_checkpoint_restore")
+    }
+    async fn checkpoint_clear(
+        &self,
+        _req: WorkspaceCheckpointClearReq,
+    ) -> ApiResult<WorkspaceCheckpointCleared> {
+        nope!("workspace_checkpoint_clear")
     }
 }
 
@@ -363,6 +394,10 @@ impl ObjectService for NotWired {
 
     async fn object_data(&self, _req: ObjectDataReq) -> ApiResult<ObjectData> {
         nope!("object_data")
+    }
+
+    async fn object_range(&self, _req: ObjectRangeReq) -> ApiResult<ObjectRange> {
+        nope!("object_range")
     }
 }
 
@@ -486,6 +521,15 @@ impl ExtensionService for NotWired {
     async fn mcp_set_key(&self, _req: McpSetKeyReq) -> ApiResult<()> {
         nope!("extension_mcp_set_key")
     }
+    async fn mcp_set_scope(&self, _req: McpSetScopeReq) -> ApiResult<ExtensionDescriptor> {
+        nope!("extension_mcp_set_scope")
+    }
+    async fn mcp_test(&self, _req: McpTestReq) -> ApiResult<McpTestResult> {
+        nope!("extension_mcp_test")
+    }
+    async fn mcp_setup(&self, _req: McpSetupReq) -> ApiResult<McpSetupResult> {
+        nope!("extension_mcp_setup")
+    }
     async fn mcp_set_oauth_client_secret(&self, _req: McpSetOAuthClientSecretReq) -> ApiResult<()> {
         nope!("extension_mcp_set_oauth_client_secret")
     }
@@ -500,6 +544,16 @@ impl ExtensionService for NotWired {
     }
     async fn mcp_logout(&self, _req: McpLogoutReq) -> ApiResult<()> {
         nope!("extension_mcp_logout")
+    }
+}
+
+#[async_trait]
+impl EnvService for NotWired {
+    async fn get(&self, _req: EnvGetReq) -> ApiResult<EnvView> {
+        nope!("env_get")
+    }
+    async fn set(&self, _req: EnvSetReq) -> ApiResult<EnvView> {
+        nope!("env_set")
     }
 }
 

@@ -14,6 +14,7 @@ use zlogic_protocol::query::{
     ConfigUpdateReq, ConfigView, OpenAiCompatibleProviderReq, PriceSnapshot, ProviderCatalog,
     SettingsView, UsageSummary, UsageSummaryReq,
 };
+use zlogic_protocol::settings::EnvConfig;
 use zlogic_protocol::usage::{QuotaScope, QuotaStatus};
 use zlogic_store::UsageQuery;
 
@@ -27,6 +28,11 @@ pub struct Config {
     /// Routing reads the same effective config as the settings view. Reload replaces this snapshot
     /// too, otherwise a newly added model appears in the picker but `session_set_model` rejects it.
     router: Option<Arc<ModelRouter>>,
+    /// The global layer of the environment variables, republished on every load. The resolver
+    /// that reads it is called synchronously from inside a tool, so it cannot take this type's
+    /// async lock; a copy behind a plain one is what makes "the next shell call sees the edit"
+    /// true without a restart.
+    env_global: Arc<crate::env::EnvGlobal>,
 
     credential_store: Arc<dyn CredentialStore>,
     transport: Option<Arc<dyn zlogic_llm::transport::HttpTransport>>,
@@ -54,6 +60,7 @@ impl Config {
             dirs,
             bypass_flag: None,
             router: None,
+            env_global: Arc::new(crate::env::EnvGlobal::default()),
             credential_store,
             transport: None,
             store,
@@ -78,6 +85,14 @@ impl Config {
         self
     }
 
+    /// Shares one global-variable cell with the resolver `CoreServices` hands to `shell`. The
+    /// caller owns it because the two are wired in one bootstrap pass and the resolver has to exist
+    /// first; a second cell would mean the settings page and the shell could disagree.
+    pub fn with_env_global(mut self, env_global: Arc<crate::env::EnvGlobal>) -> Self {
+        self.env_global = env_global;
+        self
+    }
+
     pub fn with_transport(
         mut self,
         transport: Arc<dyn zlogic_llm::transport::HttpTransport>,
@@ -93,6 +108,7 @@ impl Config {
         if let Some(transport) = &self.transport {
             transport.apply_network(&cfg.network);
         }
+        self.env_global.set(cfg.env.clone());
         if let Some(store) = &self.checkpoints {
             let c = &cfg.checkpoints;
             store.set_config(zlogic_checkpoints::Config {
@@ -108,6 +124,28 @@ impl Config {
 
     pub async fn snapshot(&self) -> Arc<AppConfig> {
         self.current.read().await.clone()
+    }
+
+    /// The global `env:` block, shared with the resolver that hands variables to `shell`.
+    pub fn env_global(&self) -> Arc<crate::env::EnvGlobal> {
+        self.env_global.clone()
+    }
+
+    /// Where the global layer is written, for a table that wants to say so.
+    pub fn global_path(&self) -> String {
+        self.dirs.config_file().to_string_lossy().into_owned()
+    }
+
+    /// Writes the global layer and reloads, so the same `push_policies` path that republishes it
+    /// to the resolver runs here too. The workspace and session layers do not come through this:
+    /// they are not this file's business.
+    pub async fn set_env(&self, env: EnvConfig) -> Result<()> {
+        self.write(ConfigUpdateReq {
+            env: Some(env),
+            ..Default::default()
+        })
+        .await
+        .map(|_| ())
     }
 
     fn view(&self, cfg: &AppConfig) -> ConfigView {
@@ -128,6 +166,7 @@ impl Config {
                 checkpoints: cfg.checkpoints.clone(),
                 auto_detect_env: cfg.auto_detect_env,
                 keychain: cfg.keychain,
+                env: cfg.env.clone(),
             },
             llm_roles: cfg.llm_roles.clone(),
             global_path: self.dirs.config_file().to_string_lossy().into_owned(),
@@ -251,6 +290,9 @@ impl Config {
         }
         if let Some(roles) = &req.llm_roles {
             config_patch.insert("llm_roles".into(), value_or_default(roles)?);
+        }
+        if let Some(env) = &req.env {
+            config_patch.insert("env".into(), value_or_default(env)?);
         }
         if let Some(on) = req.auto_detect_env {
             models_patch.insert("auto_detect_env".into(), scalar_or(&on, &true)?);
@@ -1078,6 +1120,9 @@ fn apply_update(cfg: &mut AppConfig, req: &ConfigUpdateReq) {
     }
     if let Some(v) = &req.llm_roles {
         cfg.llm_roles = v.clone();
+    }
+    if let Some(v) = &req.env {
+        cfg.env = v.clone();
     }
 }
 
