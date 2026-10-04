@@ -279,7 +279,9 @@ pub(crate) fn build_client(
 fn builtin_chain(role: &Purpose) -> &'static [&'static str] {
     match role {
         Purpose::Main | Purpose::Agent(_) => &[SESSION],
-        Purpose::Title | Purpose::Approval | Purpose::Utility => &[SESSION, "light"],
+        Purpose::Title | Purpose::Approval | Purpose::Utility | Purpose::Voice => {
+            &[SESSION, "light"]
+        }
         Purpose::Compaction => &[SESSION],
         Purpose::ApprovalDeep => &[SESSION, "main"],
     }
@@ -292,7 +294,8 @@ fn thinking_off_by_default(role: &Purpose) -> bool {
         | Purpose::Compaction
         | Purpose::Approval
         | Purpose::ApprovalDeep
-        | Purpose::Utility => true,
+        | Purpose::Utility
+        | Purpose::Voice => true,
     }
 }
 

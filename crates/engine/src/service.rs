@@ -1,36 +1,42 @@
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 use zlogic_protocol::extensions::{
     ExtensionCatalog, ExtensionCatalogReq, ExtensionDescriptor, ExtensionInspectReq,
     ExtensionInstallPlan, ExtensionInstallReq, ExtensionRemoveReq, ExtensionSetEnabledReq,
     McpImportReq, McpImportResult, McpLogoutReq, McpOAuthBeginReq, McpOAuthBeginResult,
     McpOAuthCancelReq, McpOAuthStatusReq, McpOAuthStatusResult, McpSetKeyReq,
-    McpSetOAuthClientSecretReq, McpSetTokenReq, McpUpsertReq,
+    McpSetOAuthClientSecretReq, McpSetScopeReq, McpSetTokenReq, McpSetupReq, McpSetupResult,
+    McpTestReq, McpTestResult, McpUpsertReq,
 };
 use zlogic_protocol::query::{
     ApiResult, CatalogCheck, ConfigRemoveProviderReq, ConfigUpdateReq, ConfigView,
     CredentialDeleteReq, CredentialSetReq, CredentialState, CredentialVerifyReq,
-    CredentialVerifyResult, EntriesReq, ObjectData, ObjectDataReq, ObjectReadReq, ObjectText,
-    OpenAiCompatibleProviderReq, Page, ProviderCatalog, ProviderModels, ProviderModelsReq,
-    ProviderSignInBegin, ProviderSignInBeginReq, ProviderSignInCancelReq, ProviderSignInStatus,
-    ProviderSignInStatusReq, RuntimeTask, RuntimeTaskDeleteReq, RuntimeTaskListReq, RuntimeTaskLog,
-    RuntimeTaskLogReq, RuntimeTaskPage, RuntimeTaskStopReq, SessionListReq, SessionOpenReq,
-    SessionOpened, SessionRenameReq, SessionSearchHit, SessionSearchReq, SessionSummary, TaskJob,
-    TaskJobCreateReq, TaskJobDeleteReq, TaskJobDraft, TaskJobDraftReq, TaskJobListReq,
-    TaskJobRunReq, TaskJobRunsReq, TaskJobSetEnabledReq, TextTranslateReq, TextTranslateResp,
-    ToolInfo, TranscriptEntry, TranscriptReq, TranslationDeleteReq, TranslationEntry,
-    TranslationListReq, TurnItem, TurnState, TurnsReq, UsageSummary, UsageSummaryReq,
-    WorkspaceCheckpoint, WorkspaceCheckpointCaptureReq, WorkspaceCheckpointFileDiff,
-    WorkspaceCheckpointFileDiffReq, WorkspaceCheckpointList, WorkspaceCheckpointListReq,
-    WorkspaceCheckpointPlan, WorkspaceCheckpointPlanReq, WorkspaceCheckpointRestore,
-    WorkspaceCheckpointRestoreReq, WorkspaceCheckpointStep, WorkspaceCheckpointStepReq,
-    WorkspaceFileBase64, WorkspaceFileCreateReq, WorkspaceFileDeleteReq, WorkspaceFileEntry,
-    WorkspaceFileListReq, WorkspaceFileRange, WorkspaceFileRangeReq, WorkspaceFileReadReq,
-    WorkspaceFileRenameReq, WorkspaceFileSearchReq, WorkspaceFileText, WorkspaceFileWriteReq,
-    WorkspaceGitBranchReq, WorkspaceGitCommitDetail, WorkspaceGitCommitDetailReq,
-    WorkspaceGitCommitReq, WorkspaceGitDiff, WorkspaceGitDiffReq,
+    CredentialVerifyResult, EntriesReq, EnvGetReq, EnvSetReq, EnvView, ObjectData, ObjectDataReq,
+    ObjectRange, ObjectRangeReq, ObjectReadReq, ObjectText, OpenAiCompatibleProviderReq, Page,
+    ProviderCatalog, ProviderModels,
+    ProviderModelsReq, ProviderSignInBegin, ProviderSignInBeginReq, ProviderSignInCancelReq,
+    ProviderSignInStatus, ProviderSignInStatusReq, RuntimeTask, RuntimeTaskDeleteReq,
+    RuntimeTaskListReq, RuntimeTaskLog, RuntimeTaskLogReq, RuntimeTaskPage, RuntimeTaskStopReq,
+    SessionForkReq, SessionListReq, SessionOpenReq, SessionOpened, SessionRenameReq,
+    SessionSearchHit, SessionSearchReq, SessionSummary, TaskJob, TaskJobCreateReq,
+    TaskJobDeleteReq, TaskJobDraft, TaskJobDraftReq, TaskJobListReq, TaskJobRunReq, TaskJobRunsReq,
+    TaskJobSetEnabledReq,
+    TextCompleteStreamReq, TextDelta, TextTranslateReq, TextTranslateResp, ToolInfo,
+    TranscriptEntry, TranscriptReq, TranslationDeleteReq, TranslationEntry, TranslationListReq,
+    TurnItem, TurnState, TurnsReq, UsageSummary, UsageSummaryReq, WorkspaceCheckpoint,
+    WorkspaceCheckpointCaptureReq, WorkspaceCheckpointClearReq, WorkspaceCheckpointCleared,
+    WorkspaceCheckpointFileDiff, WorkspaceCheckpointFileDiffReq, WorkspaceCheckpointList,
+    WorkspaceCheckpointListReq, WorkspaceCheckpointPlan, WorkspaceCheckpointPlanReq,
+    WorkspaceCheckpointRestore, WorkspaceCheckpointRestoreReq, WorkspaceCheckpointStep,
+    WorkspaceCheckpointStepReq, WorkspaceCheckpointSteps,
+    WorkspaceCheckpointStepsReq, WorkspaceFileBase64, WorkspaceFileCreateReq,
+    WorkspaceFileDeleteReq, WorkspaceFileEntry, WorkspaceFileListReq, WorkspaceFileRange,
+    WorkspaceFileRangeReq, WorkspaceFileReadReq, WorkspaceFileRenameReq, WorkspaceFileSearchReq,
+    WorkspaceFileText, WorkspaceFileWriteReq, WorkspaceGitBranchReq, WorkspaceGitCommitDetail,
+    WorkspaceGitCommitDetailReq, WorkspaceGitCommitReq, WorkspaceGitDiff, WorkspaceGitDiffReq,
     WorkspaceGitGenerateCommitMessageReq, WorkspaceGitInfo, WorkspaceGitInitReq,
     WorkspaceGitOverview, WorkspaceGitOverviewReq, WorkspaceGitStageReq, WorkspaceGitSyncReq,
-    WorkspaceKind, WorkspaceSelector, WorkspaceSummary, WorkspaceUpdateReq,
+    WorkspaceGitTrustReq, WorkspaceKind, WorkspaceSelector, WorkspaceSummary, WorkspaceUpdateReq,
 };
 use zlogic_protocol::usage::QuotaStatus;
 use zlogic_protocol::{
@@ -48,6 +54,12 @@ pub trait AuxiliaryService: Send + Sync {
     ) -> ApiResult<String>;
     async fn draft_task_job(&self, req: TaskJobDraftReq) -> ApiResult<TaskJobDraft>;
     async fn text_translate(&self, req: TextTranslateReq) -> ApiResult<TextTranslateResp>;
+    /// A completion whose answer is handed over as it arrives. The receiver ends when the call
+    /// does; an error inside the call arrives as its last item.
+    async fn text_complete_stream(
+        &self,
+        req: TextCompleteStreamReq,
+    ) -> ApiResult<mpsc::UnboundedReceiver<TextDelta>>;
 }
 
 /// Quick translate's history: what was translated before, and the cache that comes with it.
@@ -85,6 +97,8 @@ pub trait SessionService: Send + Sync {
     async fn open(&self, req: SessionOpenReq) -> ApiResult<SessionOpened>;
 
     async fn rename(&self, req: SessionRenameReq) -> ApiResult<SessionSummary>;
+
+    async fn fork(&self, req: SessionForkReq) -> ApiResult<SessionSummary>;
 
     async fn delete(&self, session_id: SessionId) -> ApiResult<()>;
 
@@ -154,6 +168,9 @@ pub trait WorkspaceGitService: Send + Sync {
     async fn git_commit(&self, req: WorkspaceGitCommitReq) -> ApiResult<WorkspaceGitOverview>;
     async fn git_stage(&self, req: WorkspaceGitStageReq) -> ApiResult<WorkspaceGitOverview>;
     async fn git_init(&self, req: WorkspaceGitInitReq) -> ApiResult<WorkspaceGitOverview>;
+    /// Trust a repository zlogic was refused: see [`WorkspaceGitTrustReq`]. Returns the overview
+    /// as it reads once the trust is in place, so a caller can show the result without re-reading.
+    async fn git_trust(&self, req: WorkspaceGitTrustReq) -> ApiResult<WorkspaceGitOverview>;
     async fn git_sync(&self, req: WorkspaceGitSyncReq) -> ApiResult<WorkspaceGitOverview>;
     async fn git_branch(&self, req: WorkspaceGitBranchReq) -> ApiResult<WorkspaceGitOverview>;
     async fn git_commit_detail(
@@ -188,6 +205,13 @@ pub trait WorkspaceCheckpointsService: Send + Sync {
         &self,
         req: WorkspaceCheckpointStepReq,
     ) -> ApiResult<WorkspaceCheckpointStep>;
+    /// The same step for several points at once, without the file rows. A list view that shows a
+    /// number per row asks for its rows together; making it a call per row is what makes such a
+    /// view fill in one row at a time.
+    async fn checkpoint_steps(
+        &self,
+        req: WorkspaceCheckpointStepsReq,
+    ) -> ApiResult<WorkspaceCheckpointSteps>;
     /// The patch for one file of a plan. Its own call because it is per row and per file: a plan
     /// for a thousand changed files must not carry a thousand patches.
     async fn checkpoint_diff(
@@ -203,6 +227,13 @@ pub trait WorkspaceCheckpointsService: Send + Sync {
         &self,
         req: WorkspaceCheckpointRestoreReq,
     ) -> ApiResult<WorkspaceCheckpointRestore>;
+    /// Deletes every snapshot of this workspace, after the user confirmed it twice. Not a
+    /// retention path: retention drops what the policy ages out, and this is the user saying
+    /// they want the copies gone now.
+    async fn checkpoint_clear(
+        &self,
+        req: WorkspaceCheckpointClearReq,
+    ) -> ApiResult<WorkspaceCheckpointCleared>;
 }
 
 #[async_trait]
@@ -236,6 +267,7 @@ pub trait TaskService: Send + Sync {
 pub trait ObjectService: Send + Sync {
     async fn object_read(&self, req: ObjectReadReq) -> ApiResult<ObjectText>;
     async fn object_data(&self, req: ObjectDataReq) -> ApiResult<ObjectData>;
+    async fn object_range(&self, req: ObjectRangeReq) -> ApiResult<ObjectRange>;
 }
 
 #[async_trait]
@@ -259,6 +291,17 @@ pub trait ConfigService: Send + Sync {
 #[async_trait]
 pub trait ToolCatalogService: Send + Sync {
     async fn list(&self) -> ApiResult<Vec<ToolInfo>>;
+}
+
+/// The three layers of environment variables, for the hosts that show them.
+///
+/// Separate from [`ConfigService`] because two of the three layers are not configuration the
+/// process owns: a workspace's `settings.yaml` belongs to a repository and a session's variables
+/// belong to a conversation, and neither is reachable through the one global config file.
+#[async_trait]
+pub trait EnvService: Send + Sync {
+    async fn get(&self, req: EnvGetReq) -> ApiResult<EnvView>;
+    async fn set(&self, req: EnvSetReq) -> ApiResult<EnvView>;
 }
 
 #[async_trait]
@@ -309,6 +352,12 @@ pub trait ExtensionService: Send + Sync {
     async fn mcp_import(&self, req: McpImportReq) -> ApiResult<McpImportResult>;
     async fn mcp_set_token(&self, req: McpSetTokenReq) -> ApiResult<()>;
     async fn mcp_set_key(&self, req: McpSetKeyReq) -> ApiResult<()>;
+    async fn mcp_set_scope(&self, req: McpSetScopeReq) -> ApiResult<ExtensionDescriptor>;
+    /// Connect to one server, report its tools, and change nothing.
+    async fn mcp_test(&self, req: McpTestReq) -> ApiResult<McpTestResult>;
+    /// Run the dependency install a definition implies for itself. Separate from the test so the
+    /// user decides, having seen the failure it is meant to fix.
+    async fn mcp_setup(&self, req: McpSetupReq) -> ApiResult<McpSetupResult>;
     async fn mcp_set_oauth_client_secret(&self, req: McpSetOAuthClientSecretReq) -> ApiResult<()>;
     async fn mcp_oauth_begin(&self, req: McpOAuthBeginReq) -> ApiResult<McpOAuthBeginResult>;
     async fn mcp_oauth_status(&self, req: McpOAuthStatusReq) -> ApiResult<McpOAuthStatusResult>;

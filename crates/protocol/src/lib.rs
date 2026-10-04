@@ -58,14 +58,15 @@ pub use message::{
 pub use query::{
     ConfigCreateScope, ConfigUpdateReq, ConfigView, CredentialDeleteReq, CredentialSetReq,
     CredentialSource, CredentialState, CredentialVerifyReq, CredentialVerifyResult, EditProtection,
-    EntriesReq, EntryRole, ModelSelection, ModelSelectionSource, OpenAiCompatibleProviderReq, Page,
-    PendingInteraction, PendingOrigin, PendingSubmission, SessionListReq, SessionOpenReq,
-    SessionOpened, SessionRenameReq, SessionSearchHit, SessionSearchReq, SessionSummary,
-    SettingsView, TitleSource, ToolInfo, ToolUsageGroup, TranscriptBody, TranscriptEntry,
-    TranscriptKind, TranscriptPart, TranscriptReq, TranscriptToolCall, TurnAnswer, TurnAnswerKind,
-    TurnItem, TurnPhase, TurnState, TurnsReq, UploadedObject, UsageGroup, UsageSessionKind,
-    UsageSummary, UsageSummaryReq, WorkspaceGitInfo, WorkspaceKind, WorkspaceSelector,
-    WorkspaceSummary, WorkspaceToolsUpdate, WorkspaceUpdateReq, chat_workspace_tools,
+    EntriesReq, EntryRole, GitRefusal, ModelSelection, ModelSelectionSource,
+    OpenAiCompatibleProviderReq, Page, PendingInteraction, PendingOrigin, PendingSubmission,
+    SessionListReq, SessionOpenReq, SessionOpened, SessionRenameReq, SessionSearchHit,
+    SessionSearchReq, SessionSummary, SettingsView, TitleSource, ToolInfo, ToolUsageGroup,
+    TranscriptBody, TranscriptEntry, TranscriptKind, TranscriptPart, TranscriptReq,
+    TranscriptToolCall, TurnAnswer, TurnAnswerKind, TurnItem, TurnPhase, TurnState, TurnsReq,
+    UploadedObject, UsageGroup, UsageSessionKind, UsageSummary, UsageSummaryReq, WorkspaceGitInfo,
+    WorkspaceKind, WorkspaceSelector, WorkspaceSummary, WorkspaceToolsUpdate, WorkspaceUpdateReq,
+    chat_workspace_tools,
 };
 pub use resources::{
     ManagedResource, ManagedResourceDeleteReq, ManagedResourceEnvironment, ManagedResourceKind,
