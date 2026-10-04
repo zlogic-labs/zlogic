@@ -1,10 +1,22 @@
 use std::path::{Path, PathBuf};
 
-use git2::Repository;
+use git2::{ErrorCode, Repository};
+
+/// A repository that is here but that this process is not allowed to open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoRefusal {
+    /// The `.git` directory is not owned by the user running this process, so libgit2 refuses it.
+    /// Nothing about the repository is broken, and `git` the CLI lets an administrator in where
+    /// libgit2 does not, so this says what *this* process may do, not what the user may do.
+    OwnerMismatch,
+}
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RepoFacts {
     pub is_repo: bool,
+    /// Set when discovery met a repository and refused it, as distinct from meeting no repository
+    /// at all: the first is a state to report, the second is the normal answer for a plain folder.
+    pub refusal: Option<RepoRefusal>,
     pub branch: Option<String>,
     pub head: Option<String>,
     pub common_dir: Option<PathBuf>,
@@ -13,8 +25,14 @@ pub struct RepoFacts {
 
 impl RepoFacts {
     pub fn discover(dir: &Path) -> Self {
-        let Ok(repo) = Repository::discover(dir) else {
-            return Self::default();
+        let repo = match Repository::discover(dir) {
+            Ok(repo) => repo,
+            Err(error) => {
+                return Self {
+                    refusal: refusal_of(&error),
+                    ..Self::default()
+                }
+            }
         };
         let head = repo.head().ok();
         let branch = match head.as_ref() {
@@ -34,6 +52,7 @@ impl RepoFacts {
 
         Self {
             is_repo: true,
+            refusal: None,
             branch,
             head: sha,
             common_dir: Some(repo.commondir().to_path_buf()),
@@ -62,6 +81,16 @@ impl RepoFacts {
             return None;
         }
         repo.commondir().parent().map(Path::to_path_buf)
+    }
+}
+
+/// Why libgit2 would not open what it found. Every other failure — no `.git` above the path, a
+/// directory that is not one, a corrupt file — means there is no repository to report, which is
+/// the plain default and needs no name of its own.
+fn refusal_of(error: &git2::Error) -> Option<RepoRefusal> {
+    match error.code() {
+        ErrorCode::Owner => Some(RepoRefusal::OwnerMismatch),
+        _ => None,
     }
 }
 
