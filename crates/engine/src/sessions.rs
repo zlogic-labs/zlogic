@@ -7,16 +7,23 @@ use zlogic_core::SharedStore;
 use zlogic_objects::ObjectStore;
 use zlogic_protocol::query::{
     ApiError, ApiResult, EditProtection, EntriesReq, EntryRole, ModelSelection,
-    ModelSelectionSource, Page, PendingOrigin, PendingSubmission, SessionListReq, SessionOpenReq,
-    SessionOpened, SessionRenameReq, SessionSearchHit, SessionSearchReq, SessionSummary,
-    TranscriptBody, TranscriptEntry, TranscriptKind, TranscriptPart, TranscriptReq, TurnAnswer,
-    TurnAnswerKind, TurnCompaction, TurnItem, TurnWake, TurnWidget, TurnsReq, WorkspaceSummary,
+    ModelSelectionSource, Page, PendingOrigin, PendingSubmission, SessionForkReq, SessionListReq,
+    SessionOpenReq, SessionOpened, SessionRenameReq, SessionSearchHit, SessionSearchReq,
+    SessionService, SessionSummary, TranscriptBody, TranscriptEntry, TranscriptKind, TranscriptPart,
+    TranscriptReq, TurnAnswer, TurnAnswerKind, TurnCompaction, TurnItem, TurnWake, TurnWidget,
+    TurnsReq, WorkspaceSummary,
 };
 use zlogic_protocol::usage::Purpose;
 use zlogic_protocol::{Effort, SessionId, TurnId, query::TitleSource};
+use zlogic_protocol::stream::{StateChange, StateNotice};
 use zlogic_store::{EntryKind, EntryRecord, NewSession, SessionRecord};
+use zlogic_task::{ExecutorSpec, TaskStore};
 
-use crate::service::{SessionService, WorkspaceService};
+use crate::hub::EventHub;
+// The trait keeps the unadorned name: it is what `Sessions` implements and the only trait this
+// module names. The wire type that also wants to be `SessionService` is imported under its own
+// name from the protocol below.
+use crate::service::WorkspaceService;
 use crate::{EngineError, ModelRouter, Result, TurnRegistry};
 
 const SNIPPET_CHARS: usize = 160;
@@ -32,8 +39,12 @@ pub struct Sessions {
     router: Option<Arc<ModelRouter>>,
     registry: Option<Arc<TurnRegistry>>,
     grants: Option<Arc<crate::Grants>>,
+    /// What this engine process's background runs are listening on. Absent in a deployment that
+    /// hosts sessions without hosting processes, and then no service is ever reported.
+    roots: Option<Arc<crate::ports::ProcessRoots>>,
     /// Materialized uploaded files are session-owned and leave with the session.
     attachment_dir: PathBuf,
+    hub: Arc<EventHub>,
 }
 
 impl Sessions {
@@ -50,8 +61,16 @@ impl Sessions {
             router: None,
             registry: None,
             grants: None,
+            roots: None,
             attachment_dir,
+            hub: Arc::new(EventHub::new()),
         }
+    }
+
+    /// The live hub, so a session created here announces itself on the same channel the turns do.
+    pub fn with_hub(mut self, hub: Arc<EventHub>) -> Self {
+        self.hub = hub;
+        self
     }
 
     pub fn with_router(mut self, router: Arc<ModelRouter>) -> Self {
@@ -67,6 +86,116 @@ impl Sessions {
     pub fn with_registry(mut self, registry: Arc<TurnRegistry>) -> Self {
         self.registry = Some(registry);
         self
+    }
+
+    pub fn with_roots(mut self, roots: Arc<crate::ports::ProcessRoots>) -> Self {
+        self.roots = Some(roots);
+        self
+    }
+
+    /// The servers this conversation's background runs are listening on.
+    ///
+    /// Scoped to the whole session tree rather than the calling session: a sub-agent that starts a
+    /// dev server started it for this conversation, and the user reads one panel.
+    ///
+    /// Only a run whose pid this engine holds can answer. A run owned by another process — the
+    /// desktop and a local daemon share one database — has its pid in that process instead, and is
+    /// reported without ports rather than guessed at.
+    ///
+    /// Nothing is persisted and nothing is remembered between calls: a port that outlives its
+    /// process would point a badge at whatever took the number next.
+    fn services(&self, root: SessionId) -> Vec<SessionService> {
+        let Some(roots) = self.roots.clone() else {
+            return Vec::new();
+        };
+        let rows = self.store.with_named("session_open.services", |db| {
+            let mut rows = Vec::new();
+            for run in TaskStore::new(db.conn()).list_active_for_tree(root)? {
+                if !matches!(run.executor, ExecutorSpec::Process(_)) {
+                    continue;
+                }
+                let session = run
+                    .notification_session_id
+                    .and_then(|id| db.sessions().find(id).ok().flatten());
+                rows.push((run, session));
+            }
+            Ok::<_, zlogic_task::StoreError>(rows)
+        });
+        let Ok(rows) = rows else {
+            return Vec::new();
+        };
+        let wanted: Vec<_> = rows.iter().map(|(run, _)| run.task_id).collect();
+        let ports = roots.listening_ports(&wanted);
+        rows.into_iter()
+            .filter_map(|(run, session)| {
+                let found = ports.get(&run.task_id)?.clone();
+                let ExecutorSpec::Process(spec) = &run.executor else {
+                    return None;
+                };
+                // A run launched by this very session reports no agent path: it is the
+                // conversation itself, and a path here would name nothing the reader did not
+                // already know.
+                let (session_id, agent_path) = match session {
+                    Some(rec) if rec.session_id != root => {
+                        (rec.session_id, Some(rec.agent_paths.as_string()))
+                    }
+                    Some(rec) => (rec.session_id, None),
+                    None => (root, None),
+                };
+                Some(SessionService {
+                    task_id: run.task_id.to_string(),
+                    session_id,
+                    agent_path,
+                    title: crate::task::process_title(spec),
+                    ports: found,
+                })
+            })
+            .collect()
+    }
+
+    /// The fork itself, shared by [`Sessions::fork`] and `Command::Fork`: a new root session
+    /// around a copy of the original's prefix, and the original left untouched.
+    ///
+    /// Returns the new session's row rather than a summary — the caller holds the service that
+    /// projects one, and `Command::Fork` has nowhere to put it.
+    pub(crate) fn fork_session(
+        store: &SharedStore,
+        hub: &EventHub,
+        req: &SessionForkReq,
+    ) -> Result<SessionRecord> {
+        let forked = store
+            .with(|db| {
+                let src = db.sessions().get(req.session_id)?;
+                let mut new = NewSession::root(src.workspace_id);
+                new.exec_cwd = src.exec_cwd.clone();
+                new.model_ref = src.model_ref.clone();
+                new.effort = src.effort.clone();
+                let created = db.sessions().create(new)?;
+                db.entries().copy_through(
+                    req.session_id,
+                    created.session_id,
+                    req.keep_through_turn as i64,
+                )?;
+                if let Some(title) = &src.title {
+                    db.sessions().set_title(
+                        created.session_id,
+                        &format!("{title} (fork)"),
+                        zlogic_store::TitleSource::User,
+                    )?;
+                }
+                // The copy keeps the original entries' timestamps, so without this the fork
+                // carries the old turn's `last_message_at` and the session list — which sorts on
+                // that column — files it below quieter sessions.
+                db.sessions().touch_last_message_at(created.session_id)?;
+                Ok::<_, zlogic_store::StoreError>(created)
+            })
+            .map_err(EngineError::from)?;
+        hub.notify(StateNotice {
+            session_id: forked.session_id.to_string(),
+            turn_id: None,
+            change: StateChange::TurnStateChanged,
+        });
+        Ok(forked)
     }
 
     fn record(&self, session_id: SessionId) -> Result<SessionRecord> {
@@ -86,6 +215,7 @@ impl Sessions {
             workspace_id: rec.workspace_id,
             agent_paths: rec.agent_paths.0.clone(),
             root_session_id: rec.root_session_id,
+            parent_session_id: rec.parent_session_id,
             title: rec.title.clone(),
             title_source: rec.title_source.map(title_source),
             model_ref: rec.model_ref.clone(),
@@ -96,6 +226,8 @@ impl Sessions {
             turn_count: rec.turn_count,
             live_turn_id,
             awaiting_input,
+            // Maintained by the store on the session row, so it costs the list nothing to report.
+            interrupted: rec.interrupted,
             archived_at: rec.archived_at,
         })
     }
@@ -284,6 +416,10 @@ impl Sessions {
              * answer to a question nobody asked. A notification injected later (the turn was
              * already replying) is left to the detail — the turn was not woken by it. */
             let mut wakes: Vec<TurnWake> = Vec::new();
+            /* 这一轮写了几段正文。`detail_kinds` 里没有 Text：纯问答的轮除了答复没有过程，
+               但模型仍可能先写一段叙述再写答复（没有工具调用时就是这样）—— 只剩一段时折叠行
+               已经把它全画出来了，多于一段时折叠行就该有「展开详情」的入口。 */
+            let mut text_segments = 0usize;
             let mut before_any_content = true;
             for entry in entries {
                 if let TranscriptBody::TaskUpdate {
@@ -314,6 +450,7 @@ impl Sessions {
                 match &entry.body {
                     TranscriptBody::User { parts } => user.extend(parts.iter().cloned()),
                     TranscriptBody::Text { text, truncated } if entry.is_final => {
+                        text_segments += 1;
                         answer = Some(TurnAnswer {
                             kind: TurnAnswerKind::Text,
                             text: text.clone(),
@@ -347,10 +484,14 @@ impl Sessions {
                             summary_tokens: *summary_tokens,
                         });
                     }
+                    /* 非最终答复的正文段（工具调用之间的那些叙述）：也算"这一轮写过文字"，
+                       否则一段纯叙述会被最终答复那一条盖掉。必须放在上面那条 `if is_final`
+                       之后 —— 反过来会让它永远匹配不到。 */
+                    TranscriptBody::Text { .. } => text_segments += 1,
                     _ => {}
                 }
             }
-            let detail = detailed.contains(seq);
+            let detail = detailed.contains(seq) || text_segments > 1;
             if user.is_empty() && answer.is_none() && status.is_none() && !detail {
                 continue;
             }
@@ -617,7 +758,7 @@ fn log_slow_api(api: &str, started: std::time::Instant, steps: &[(&'static str, 
 }
 
 #[async_trait]
-impl SessionService for Sessions {
+impl crate::service::SessionService for Sessions {
     async fn list(&self, req: SessionListReq) -> ApiResult<Page<SessionSummary>> {
         let started = std::time::Instant::now();
         let mut steps: Vec<(&'static str, u64)> = Vec::new();
@@ -797,6 +938,11 @@ impl SessionService for Sessions {
 
         mark("summary + last_turn + turn_state + pending");
 
+        // Outside the connection closure on purpose: this reads two kernel tables, and holding a
+        // pooled connection across that would be the slowest part of the call by a wide margin.
+        let services = self.services(rec.root_session_id);
+        mark("services");
+
         let opened = SessionOpened {
             session,
             exec_cwd: rec
@@ -809,6 +955,7 @@ impl SessionService for Sessions {
             pending_submissions,
             model: self.model_selection(&rec),
             edit_protection: EditProtection::Active,
+            services,
         };
 
         log_slow_api("session_open", started, &steps);
@@ -833,6 +980,13 @@ impl SessionService for Sessions {
             .map_err(ApiError::from)?;
 
         let rec = self.record(rec.session_id).map_err(ApiError::from)?;
+        self.summary_of(&rec).map_err(ApiError::from)
+    }
+
+    /// Fork a new session from a turn. The op rather than only a `Command` because the caller
+    /// needs the new session's id to open it, and a command returns nothing.
+    async fn fork(&self, req: SessionForkReq) -> ApiResult<SessionSummary> {
+        let rec = Self::fork_session(&self.store, &self.hub, &req).map_err(ApiError::from)?;
         self.summary_of(&rec).map_err(ApiError::from)
     }
 
