@@ -12,12 +12,42 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 use zlogic_protocol::llm::ToolDefinition;
 
 use crate::{
-    PromptExample, Recovery, Result, Tool, ToolCtx, ToolError, ToolExecResult, ToolExposure,
-    ToolMeta, ToolPromptSpec, ToolRisk, parse_args,
+    CancellationToken, PromptExample, Recovery, Result, Tool, ToolCtx, ToolError, ToolExecResult,
+    ToolExposure, ToolMeta, ToolPromptSpec, ToolRisk, parse_args,
 };
 
 const MAX_ENTRIES: usize = 100_000;
 const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Polled between entries by the archive operations.
+///
+/// A newtype rather than a bare `&CancellationToken` so the call sites read as what they are — a
+/// stop check, not a token read — and so a later second signal has somewhere to go without
+/// re-threading every signature.
+#[derive(Clone, Copy)]
+struct Stop<'a>(&'a CancellationToken);
+
+impl Stop<'_> {
+    /// `Err` once the caller has been abandoned. Checked *between* entries: the work inside one
+    /// entry (a multi-gigabyte `io::copy`) is not interruptible, so the bound here is one entry,
+    /// not the whole operation.
+    fn check(&self) -> Result<()> {
+        if self.0.is_cancelled() {
+            return Err(stopped());
+        }
+        Ok(())
+    }
+}
+
+/// The operation was abandoned — by `tools.timeout_secs`, or by the user pressing Esc.
+///
+/// Not [`ToolError::Cancelled`] and not a plain failure, because the runtime already reports this
+/// event as a timeout and a tool contradicting that with "the user interrupted you" would be a
+/// different, untrue story. The text is usually never read: the caller has already given up, and
+/// what it writes to the timeline is its own account of the timeout.
+fn stopped() -> ToolError {
+    ToolError::Failed("archive operation was stopped before it finished".into())
+}
 
 pub struct ArchiveInfo;
 pub struct ArchiveProcess;
@@ -99,7 +129,10 @@ impl Tool for ArchiveInfo {
         let args: InfoArgs = parse_args(args)?;
         let path = ctx.resolve_required_path("path", &args.path)?.path;
         let limit = args.limit.unwrap_or(1_000).clamp(1, 10_000);
-        let output = tokio::task::spawn_blocking(move || list_archive(&path, limit))
+        // A child of the conversation token, so Esc reaches the worker too: the two signals differ
+        // in meaning but not at all in who can fire them here.
+        let stop = ctx.cancel.child_token();
+        let output = tokio::task::spawn_blocking(move || list_archive(&path, limit, Stop(&stop)))
             .await
             .map_err(|error| ToolError::Failed(format!("archive worker failed: {error}")))??;
         ctx.offload_if_large(&output, Recovery::Narrow)
@@ -208,11 +241,22 @@ impl Tool for ArchiveProcess {
                     files.push((source, file.path));
                 }
                 let output_for_worker = output.clone();
-                tokio::task::spawn_blocking(move || create_archive(&output_for_worker, files))
-                    .await
-                    .map_err(|error| {
-                        ToolError::Failed(format!("archive worker failed: {error}"))
-                    })??;
+                let stop = ctx.cancel.child_token();
+                tokio::task::spawn_blocking(move || {
+                    // A half-written archive is worse than no archive: it is a file the size of the
+                    // real one, holding a prefix of it, and nothing on disk distinguishes the two.
+                    // `extract` has always deleted its output on failure for the same reason — this
+                    // is that policy applied to the other writer.
+                    let result = create_archive(&output_for_worker, files, Stop(&stop));
+                    if result.is_err() {
+                        let _ = std::fs::remove_file(&output_for_worker);
+                    }
+                    result
+                })
+                .await
+                .map_err(|error| {
+                    ToolError::Failed(format!("archive worker failed: {error}"))
+                })??;
                 let name = output
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -237,8 +281,9 @@ impl Tool for ArchiveProcess {
                     )));
                 }
                 let output_for_worker = output.clone();
+                let stop = ctx.cancel.child_token();
                 let count = tokio::task::spawn_blocking(move || {
-                    let result = extract_archive(&input, &output_for_worker);
+                    let result = extract_archive(&input, &output_for_worker, Stop(&stop));
                     if result.is_err() {
                         let _ = std::fs::remove_dir_all(&output_for_worker);
                     }
@@ -258,7 +303,7 @@ impl Tool for ArchiveProcess {
     }
 }
 
-fn list_archive(path: &Path, limit: usize) -> Result<String> {
+fn list_archive(path: &Path, limit: usize, stop: Stop<'_>) -> Result<String> {
     let kind = archive_kind(path)?;
     let mut entries = Vec::new();
     let mut total = 0_u64;
@@ -267,6 +312,7 @@ fn list_archive(path: &Path, limit: usize) -> Result<String> {
             let mut archive = ZipArchive::new(File::open(path)?)
                 .map_err(|error| ToolError::Failed(format!("invalid ZIP archive: {error}")))?;
             for index in 0..archive.len().min(limit) {
+                stop.check()?;
                 let file = archive
                     .by_index(index)
                     .map_err(|error| ToolError::Failed(format!("invalid ZIP entry: {error}")))?;
@@ -286,6 +332,7 @@ fn list_archive(path: &Path, limit: usize) -> Result<String> {
                 .map_err(|error| ToolError::Failed(format!("invalid TAR archive: {error}")))?
                 .take(limit)
             {
+                stop.check()?;
                 let entry = entry
                     .map_err(|error| ToolError::Failed(format!("invalid TAR entry: {error}")))?;
                 let size = entry.size();
@@ -309,10 +356,15 @@ fn list_archive(path: &Path, limit: usize) -> Result<String> {
     .map_err(|error| ToolError::Failed(error.to_string()))
 }
 
-fn create_archive(output: &Path, files: Vec<(PathBuf, String)>) -> Result<()> {
+fn create_archive(
+    output: &Path,
+    files: Vec<(PathBuf, String)>,
+    stop: Stop<'_>,
+) -> Result<()> {
     let kind = archive_kind(output)?;
     let mut total = 0_u64;
     for (source, _) in &files {
+        stop.check()?;
         let metadata = std::fs::metadata(source)?;
         if !metadata.is_file() {
             return Err(ToolError::BadArgs(format!(
@@ -341,6 +393,7 @@ fn create_archive(output: &Path, files: Vec<(PathBuf, String)>) -> Result<()> {
             let options =
                 SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
             for (source, path) in files {
+                stop.check()?;
                 writer
                     .start_file(path, options)
                     .map_err(|error| ToolError::Failed(format!("cannot add ZIP entry: {error}")))?;
@@ -354,6 +407,7 @@ fn create_archive(output: &Path, files: Vec<(PathBuf, String)>) -> Result<()> {
         ArchiveKind::Tar => {
             let mut builder = tar::Builder::new(File::create(output)?);
             for (source, path) in files {
+                stop.check()?;
                 builder.append_path_with_name(source, path)?;
             }
             builder.finish()?;
@@ -362,6 +416,7 @@ fn create_archive(output: &Path, files: Vec<(PathBuf, String)>) -> Result<()> {
             let encoder = GzEncoder::new(File::create(output)?, Compression::default());
             let mut builder = tar::Builder::new(encoder);
             for (source, path) in files {
+                stop.check()?;
                 builder.append_path_with_name(source, path)?;
             }
             builder.finish()?;
@@ -371,7 +426,7 @@ fn create_archive(output: &Path, files: Vec<(PathBuf, String)>) -> Result<()> {
     Ok(())
 }
 
-fn extract_archive(input: &Path, output: &Path) -> Result<usize> {
+fn extract_archive(input: &Path, output: &Path, stop: Stop<'_>) -> Result<usize> {
     let kind = archive_kind(input)?;
     std::fs::create_dir_all(output)?;
     let mut count = 0_usize;
@@ -386,6 +441,7 @@ fn extract_archive(input: &Path, output: &Path) -> Result<usize> {
                 )));
             }
             for index in 0..archive.len() {
+                stop.check()?;
                 let mut entry = archive
                     .by_index(index)
                     .map_err(|error| ToolError::Failed(format!("invalid ZIP entry: {error}")))?;
@@ -427,6 +483,7 @@ fn extract_archive(input: &Path, output: &Path) -> Result<usize> {
                 .entries()
                 .map_err(|error| ToolError::Failed(format!("invalid TAR archive: {error}")))?
             {
+                stop.check()?;
                 if count >= MAX_ENTRIES {
                     return Err(ToolError::Failed(format!(
                         "archive contains more than {MAX_ENTRIES} entries"
@@ -548,18 +605,63 @@ mod tests {
         assert!(validate_archive_path("/absolute").is_err());
     }
 
+    /// The never-cancelled token, for the tests that are about the archive and not the stop path.
+    fn running() -> CancellationToken {
+        CancellationToken::new()
+    }
+
     #[test]
     fn zip_round_trip_keeps_the_requested_entry_path() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source.txt");
         std::fs::write(&source, "hello archive").unwrap();
         let archive = temp.path().join("sample.zip");
-        create_archive(&archive, vec![(source, "nested/renamed.txt".to_string())]).unwrap();
+        create_archive(
+            &archive,
+            vec![(source, "nested/renamed.txt".to_string())],
+            Stop(&running()),
+        )
+        .unwrap();
         let destination = temp.path().join("expanded");
-        assert_eq!(extract_archive(&archive, &destination).unwrap(), 1);
+        assert_eq!(extract_archive(&archive, &destination, Stop(&running())).unwrap(), 1);
         assert_eq!(
             std::fs::read_to_string(destination.join("nested/renamed.txt")).unwrap(),
             "hello archive"
         );
+    }
+
+    /// A stop signal set before the work begins ends it, rather than being noticed only after the
+    /// archive is already written. Without this check, a timed-out `create` writes a full archive
+    /// that nobody is waiting for.
+    #[test]
+    fn an_already_cancelled_stop_ends_the_operation() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        std::fs::write(&source, "hello archive").unwrap();
+        let archive = temp.path().join("sample.zip");
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let result = create_archive(&archive, vec![(source, "a.txt".to_string())], Stop(&token));
+
+        assert!(result.is_err(), "{result:?}");
+        assert!(
+            !archive.exists(),
+            "the caller cleans up on error, but nothing may have been created to clean up"
+        );
+    }
+
+    #[test]
+    fn a_stopped_extraction_leaves_nothing_behind() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        std::fs::write(&source, "hello archive").unwrap();
+        let archive = temp.path().join("sample.zip");
+        create_archive(&archive, vec![(source, "a.txt".to_string())], Stop(&running())).unwrap();
+        let destination = temp.path().join("expanded");
+        let token = CancellationToken::new();
+        token.cancel();
+
+        assert!(extract_archive(&archive, &destination, Stop(&token)).is_err());
     }
 }

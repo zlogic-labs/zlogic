@@ -83,7 +83,7 @@ impl TaskHost for StubTasks {
         &self,
         _request: AgentRequest,
         _spawner: Arc<dyn AgentSpawner>,
-    ) -> Result<TaskId, String> {
+    ) -> Result<(TaskId, zlogic_protocol::SessionId), String> {
         unreachable!("no tool runs in these tests")
     }
 

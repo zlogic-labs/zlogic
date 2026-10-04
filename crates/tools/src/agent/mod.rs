@@ -46,8 +46,13 @@ pub struct AgentRequest {
     /// Present for background agents. The final mailbox checkpoint closes this gate atomically
     /// with observing an empty inbox, so a sender can never enqueue after the last drain.
     pub mailbox: Option<Arc<AgentMailboxGate>>,
-    /// Which tool call it hangs under, so the UI can drill into it from the parent timeline.
+    /// Which tool call asked for this run. Recorded on a background task's trigger so a
+    /// notification can be traced back to the call that started it — not how the UI finds the
+    /// child, which is `ToolDisplay::Agent` on the call itself.
     pub anchor_call_id: CallId,
+    /// A child session that already exists. A background task reserves one up front so the
+    /// parent's card can name it before the task gets a runner; `None` = the spawner creates it.
+    pub session_id: Option<SessionId>,
     /// Unattended agents have no interaction port. A policy decision that needs a person therefore
     /// fails closed instead of leaving a background run waiting on a vanished turn.
     pub unattended: bool,
@@ -198,7 +203,16 @@ pub trait AgentSpawner: Send + Sync {
     /// - Usage has to be attributable. Rolled into the parent session it would both distort the
     ///   parent's compaction signal and make "what did that sub-agent cost" unanswerable.
     /// Only the conclusion comes back here.
-    async fn spawn(&self, req: AgentRequest) -> Result<AgentOutcome, String>;
+    ///
+    /// `on_spawned` fires the instant the child session exists and before the sub-agent has done
+    /// anything: the parent turn needs that id to label and subscribe to the sub-agent **while it
+    /// runs**. Waiting for the conclusion to carry it back means the card sits empty for the whole
+    /// run, which reads as a hang.
+    async fn spawn(
+        &self,
+        req: AgentRequest,
+        on_spawned: &(dyn Fn(SessionId) + Send + Sync),
+    ) -> Result<AgentOutcome, String>;
 
     /// The available sub-agent profile names.
     /// Used to check the `agent` argument, so a name the model invented is answered with the real
