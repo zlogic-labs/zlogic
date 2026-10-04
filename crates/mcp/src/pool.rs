@@ -32,8 +32,8 @@ use async_trait::async_trait;
 use rmcp::model::{CallToolResult, JsonObject, Tool as RmcpTool};
 
 use crate::conn::{Connection, Label};
-use crate::def::ServerDef;
-use crate::resolve::{PoolKey, Resolved, ResolvedTransport};
+use crate::def::{Binding, ServerDef};
+use crate::resolve::{PoolKey, Resolved, ResolvedTransport, Resolver};
 use crate::{McpError, Result};
 
 #[derive(Debug, Clone)]
@@ -135,11 +135,17 @@ impl Session for Connection {
 pub struct McpPool {
     config: PoolConfig,
     connector: Arc<dyn Connector>,
+    /// `<state>/mcp` — the parent of the directories a [`Binding::Global`] stdio server is launched
+    /// in. Held here because the pool is the one thing both the tool call and the catalogue share.
+    shared_root: PathBuf,
     slots: Mutex<HashMap<PoolKey, Slot>>,
 }
 
 struct Slot {
     server_id: String,
+    /// How far this connection is shared. Kept because idle reclaim has to treat a global
+    /// connection differently: it is the thing the user asked to keep.
+    binding: Binding,
     /// `Some` once a handshake has succeeded. Concurrent first calls share one connect attempt:
     /// four tool calls in one round must not start four copies of the same server.
     cell: Arc<tokio::sync::OnceCell<SharedSession>>,
@@ -164,20 +170,31 @@ pub struct ConnStatus {
 }
 
 impl McpPool {
-    pub fn new(config: PoolConfig) -> Self {
-        Self::with_connector(config, Arc::new(RmcpConnector))
+    pub fn new(config: PoolConfig, shared_root: impl Into<PathBuf>) -> Self {
+        Self::with_connector(config, Arc::new(RmcpConnector), shared_root)
     }
 
-    pub(crate) fn with_connector(config: PoolConfig, connector: Arc<dyn Connector>) -> Self {
+    pub(crate) fn with_connector(
+        config: PoolConfig,
+        connector: Arc<dyn Connector>,
+        shared_root: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             config,
             connector,
+            shared_root: shared_root.into(),
             slots: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn config(&self) -> &PoolConfig {
         &self.config
+    }
+
+    /// The one resolver both call sites use, so a [`Binding::Global`] server resolves the same way
+    /// whether the catalogue is discovering its tools or a tool is being called.
+    pub(crate) fn resolver(&self, workspace_root: &std::path::Path) -> Resolver {
+        Resolver::system(workspace_root, &self.shared_root)
     }
 
     /// Reclaims idle connections on a timer for as long as the pool is alive.
@@ -250,6 +267,7 @@ impl McpPool {
                     resolved.key.clone(),
                     Slot {
                         server_id: def.id.clone(),
+                        binding: def.binding,
                         cell: cell.clone(),
                         last_used: now,
                         users: [label.workspace_root.clone()].into_iter().collect(),
@@ -267,6 +285,7 @@ impl McpPool {
         // attempt; a failed attempt leaves the cell empty, so the next call retries it.
         let outcome = cell
             .get_or_try_init(|| async {
+                self.prepare(def, resolved)?;
                 self.connector
                     .open(
                         &def.id,
@@ -307,6 +326,23 @@ impl McpPool {
         }
     }
 
+    /// Makes a globally shared stdio server's launch directory exist.
+    /// `<state>/mcp/<server>` is ours and empty on a fresh install, and a child process whose working
+    /// directory does not exist fails to start with a message that says nothing about why. Any other
+    /// scope launches somewhere the user already has, so there is nothing to prepare.
+    fn prepare(&self, def: &ServerDef, resolved: &Resolved) -> Result<()> {
+        if def.binding != Binding::Global {
+            return Ok(());
+        }
+        let ResolvedTransport::Stdio { cwd, .. } = &resolved.transport else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(cwd).map_err(|e| McpError::Connect {
+            server: def.id.clone(),
+            reason: format!("cannot create its shared directory {}: {e}", cwd.display()),
+        })
+    }
+
     /// Drops connections unused for longer than the idle timeout. Returns how many.
     pub fn reap_idle(&self) -> usize {
         self.reap_idle_at(Instant::now())
@@ -316,6 +352,11 @@ impl McpPool {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let before = slots.len();
         slots.retain(|_, slot| {
+            if slot.binding == Binding::Global {
+                // A global connection exists to be reused. Reclaiming it on an idle timer would
+                // throw away the browser the user asked to keep and start another on next use.
+                return true;
+            }
             let idle = now.saturating_duration_since(slot.last_used);
             // A slot that has never connected is bookkeeping (a backoff window), and expires the
             // same way — otherwise a server that failed once would keep its entry for ever.
@@ -335,11 +376,15 @@ impl McpPool {
 
     /// Called when a workspace closes. Only drops connections no other workspace is using — a
     /// connection whose parameters never mentioned a workspace is shared, and closing one project
-    /// must not disconnect the others.
+    /// must not disconnect the others. A [`Binding::Global`] connection belongs to the process
+    /// rather than to any of them, so the last workspace closing does not take it down either.
     pub fn evict_workspace(&self, root: &std::path::Path) -> usize {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let before = slots.len();
         slots.retain(|_, slot| {
+            if slot.binding == Binding::Global {
+                return true;
+            }
             slot.users.remove(root);
             !slot.users.is_empty()
         });
@@ -386,13 +431,16 @@ impl McpPool {
     }
 
     /// Makes room for one more, dropping the least recently used entry.
+    /// A [`Binding::Global`] entry goes last: it is one entry no matter how many workspaces use
+    /// it, and it is the one whose loss the user would notice, so the cap is paid for by the
+    /// ordinary per-workspace connections first.
     fn enforce_cap(&self, slots: &mut HashMap<PoolKey, Slot>) {
         while slots.len() >= self.config.max_connections {
-            let Some(victim) = slots
+            let victim = slots
                 .iter()
-                .min_by_key(|(_, slot)| slot.last_used)
-                .map(|(key, _)| key.clone())
-            else {
+                .min_by_key(|(_, slot)| (slot.binding == Binding::Global, slot.last_used))
+                .map(|(key, _)| key.clone());
+            let Some(victim) = victim else {
                 return;
             };
             tracing::warn!(
@@ -567,7 +615,11 @@ pub(crate) mod testing {
     }
 
     pub(crate) fn fake_pool(connector: Arc<FakeConnector>, config: PoolConfig) -> Arc<McpPool> {
-        Arc::new(McpPool::with_connector(config, connector))
+        Arc::new(McpPool::with_connector(
+            config,
+            connector,
+            std::env::temp_dir().join("zlogic-mcp-test-shared"),
+        ))
     }
 }
 
@@ -578,7 +630,9 @@ mod tests {
     use crate::def::{Origin, parse_value};
     use crate::resolve::Resolver;
     use serde_json::json;
+    use std::path::Path;
     use std::sync::atomic::Ordering;
+    use zlogic_protocol::SessionId;
 
     fn def(id: &str, v: serde_json::Value) -> ServerDef {
         let mut p = parse_value(&v, id, Origin::Global, None);
@@ -599,7 +653,7 @@ mod tests {
     }
 
     async fn resolved(d: &ServerDef, root: &str) -> Resolved {
-        Resolver::with_lookups(root, Arc::new(|_| None), Arc::new(|_| None))
+        Resolver::with_lookups(root, "/shared", Arc::new(|_| None), Arc::new(|_| None))
             .resolve(d, None)
             .unwrap()
     }
@@ -796,6 +850,126 @@ mod tests {
         assert!(p.is_empty());
     }
 
+    /// A global connection is the one the user asked to keep, so the idle timer must not take it.
+    #[tokio::test]
+    async fn a_global_connection_survives_the_idle_timer() {
+        let c = Arc::new(FakeConnector::default());
+        let p = pool(
+            c.clone(),
+            PoolConfig {
+                idle_timeout: Duration::from_secs(60),
+                ..Default::default()
+            },
+        );
+        let d = def("browser", json!({ "command": "x", "binding": "global" }));
+        p.session(&d, &resolved(&d, "/w").await, label("/w"))
+            .await
+            .unwrap();
+
+        let later = Instant::now() + Duration::from_secs(3600);
+        assert_eq!(p.reap_idle_at(later), 0, "kept for the life of the process");
+        assert_eq!(p.len(), 1);
+    }
+
+    /// Two workspaces, two sessions, one process: this is the whole point of `global`.
+    #[tokio::test]
+    async fn a_global_server_is_one_connection_across_workspaces_and_sessions() {
+        let c = Arc::new(FakeConnector::default());
+        let p = pool(c.clone(), PoolConfig::default());
+        let d = def("browser", json!({ "command": "x", "binding": "global" }));
+        let (s1, s2) = (SessionId::new(), SessionId::new());
+
+        for root in ["/w/one", "/w/two"] {
+            for session in [s1, s2] {
+                let r = p
+                    .resolver(Path::new(root))
+                    .resolve(&d, Some(session))
+                    .unwrap();
+                p.session(&d, &r, label(root)).await.unwrap();
+            }
+        }
+        assert_eq!(
+            c.opens.load(Ordering::SeqCst),
+            1,
+            "one process for all four"
+        );
+        assert_eq!(p.len(), 1);
+    }
+
+    /// The same declaration without the scope: a stdio server's directory is the workspace, so
+    /// derivation gives one connection per workspace and the user gets four processes.
+    #[tokio::test]
+    async fn without_the_scope_the_same_server_starts_once_per_workspace() {
+        let c = Arc::new(FakeConnector::default());
+        let p = pool(c.clone(), PoolConfig::default());
+        let d = def("browser", json!({ "command": "x" }));
+        let session = SessionId::new();
+
+        for root in ["/w/one", "/w/two"] {
+            let r = p
+                .resolver(Path::new(root))
+                .resolve(&d, Some(session))
+                .unwrap();
+            p.session(&d, &r, label(root)).await.unwrap();
+        }
+        assert_eq!(c.opens.load(Ordering::SeqCst), 2);
+    }
+
+    /// A workspace-scoped server splits even when nothing in its parameters does, which is the only
+    /// thing the scope can add over derivation.
+    #[tokio::test]
+    async fn a_workspace_scope_splits_a_server_whose_parameters_do_not() {
+        let c = Arc::new(FakeConnector::default());
+        let p = pool(c.clone(), PoolConfig::default());
+        let d = def(
+            "srv",
+            json!({ "command": "x", "cwd": "/fixed", "binding": "workspace" }),
+        );
+        let session = SessionId::new();
+
+        for root in ["/w/one", "/w/two"] {
+            let r = p
+                .resolver(Path::new(root))
+                .resolve(&d, Some(session))
+                .unwrap();
+            p.session(&d, &r, label(root)).await.unwrap();
+        }
+        assert_eq!(c.opens.load(Ordering::SeqCst), 2);
+    }
+
+    /// The cap is a backstop, and a global connection is the one entry whose loss a user notices.
+    #[tokio::test]
+    async fn the_cap_gives_up_an_ordinary_connection_before_a_global_one() {
+        let c = Arc::new(FakeConnector::default());
+        let p = pool(
+            c.clone(),
+            PoolConfig {
+                max_connections: 2,
+                ..Default::default()
+            },
+        );
+        let global = def("browser", json!({ "command": "g", "binding": "global" }));
+        p.session(
+            &global,
+            &p.resolver(Path::new("/w")).resolve(&global, None).unwrap(),
+            label("/w"),
+        )
+        .await
+        .unwrap();
+        let first = def("one", json!({ "command": "1", "cwd": "/a" }));
+        let second = def("two", json!({ "command": "2", "cwd": "/b" }));
+        p.session(&first, &resolved(&first, "/a").await, label("/a"))
+            .await
+            .unwrap();
+        p.session(&second, &resolved(&second, "/b").await, label("/b"))
+            .await
+            .unwrap();
+
+        let survivors: Vec<String> = p.status().into_iter().map(|s| s.server_id).collect();
+        assert!(survivors.contains(&"browser".to_string()), "{survivors:?}");
+        assert_eq!(survivors.len(), 2, "{survivors:?}");
+    }
+
     /// The cap is a defence against a misconfigured template, so it must actually bound the pool.
     #[tokio::test]
     async fn the_pool_is_capped_and_evicts_the_least_recently_used() {
@@ -862,12 +1036,14 @@ mod tests {
             "browser",
             json!({ "command": "b", "cwd": "/fixed", "binding": "session" }),
         );
-        let r_shared = Resolver::with_lookups("/w", Arc::new(|_| None), Arc::new(|_| None))
-            .resolve(&shared, Some(session))
-            .unwrap();
-        let r_bound = Resolver::with_lookups("/w", Arc::new(|_| None), Arc::new(|_| None))
-            .resolve(&bound, Some(session))
-            .unwrap();
+        let r_shared =
+            Resolver::with_lookups("/w", "/shared", Arc::new(|_| None), Arc::new(|_| None))
+                .resolve(&shared, Some(session))
+                .unwrap();
+        let r_bound =
+            Resolver::with_lookups("/w", "/shared", Arc::new(|_| None), Arc::new(|_| None))
+                .resolve(&bound, Some(session))
+                .unwrap();
 
         p.session(&shared, &r_shared, label("/w")).await.unwrap();
         p.session(&bound, &r_bound, label("/w")).await.unwrap();

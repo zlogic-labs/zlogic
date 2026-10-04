@@ -125,10 +125,10 @@ pub const CACHE_TTL: chrono::TimeDelta = chrono::TimeDelta::hours(24);
 /// Bump when cached [`ToolSpec`] normalization or annotation semantics change.
 const TOOL_CACHE_VERSION: u8 = 4;
 
-/// Where definitions are read from and where tool lists are cached.
-/// Four paths rather than one root, because they are four different kinds of thing: a file the user
-/// edits, a directory installs land in, files that live in the repository, and a cache that must be
-/// safe to delete.
+/// Where definitions are read from, where tool lists are cached, and where a globally shared server
+/// is launched. Four paths rather than one root, because they are four different kinds of thing: a
+/// file the user edits, a directory installs land in, files that live in the repository, and a cache
+/// that must be safe to delete.
 #[derive(Debug, Clone)]
 pub struct CatalogDirs {
     /// `<config>/mcp.json` — the hand-edited one.
@@ -138,6 +138,10 @@ pub struct CatalogDirs {
     /// `<cache>/mcp` — tool lists, one subdirectory per day. Deleting a day costs one reconnection
     /// per server, nothing else.
     pub cache: PathBuf,
+    /// `<state>/mcp` — the working directory of every [`crate::def::Binding::Global`] stdio server,
+    /// one subdirectory per server. State rather than data because it holds nothing but what a live
+    /// process happened to write.
+    pub shared: PathBuf,
 }
 
 impl CatalogDirs {
@@ -146,6 +150,7 @@ impl CatalogDirs {
             global_file: dirs.config.join("mcp.json"),
             global_dir: dirs.data.join("extensions").join("mcp"),
             cache: dirs.cache.join("mcp"),
+            shared: dirs.state.join("mcp"),
         }
     }
 
@@ -451,7 +456,7 @@ impl Catalog {
         def: &ServerDef,
         workspace_root: &Path,
     ) -> Option<RuntimeStatus> {
-        let scope = cache_scope(def, workspace_root)?;
+        let scope = cache_scope(def, workspace_root, &self.dirs.shared)?;
         let statuses = self
             .runtime_status
             .lock()
@@ -543,7 +548,7 @@ impl Catalog {
             // outlives the turn that started it), and starting a second would double the work and
             // race to write the same cache file. The server is still reported as pending, which is
             // exactly what it is.
-            let cache_scope = cache_scope(&def, workspace_root)
+            let cache_scope = cache_scope(&def, workspace_root, &self.dirs.shared)
                 .unwrap_or_else(|| format!("{}:{}", def.fingerprint(), workspace_root.display()));
             let claim = format!("{}:{cache_scope}", def.id);
             if !self.claim(&claim) {
@@ -713,10 +718,12 @@ impl Catalog {
 
 /// The tool-list cache follows the same sharing boundary as live connections. A stdio server whose
 /// cwd defaults to the workspace therefore gets one list per workspace, while a remote server (or a
-/// stdio server with a fixed cwd) naturally reuses one list everywhere.
-fn cache_scope(def: &ServerDef, workspace_root: &Path) -> Option<String> {
+/// stdio server with a fixed cwd) naturally reuses one list everywhere. A
+/// [`crate::def::Binding::Global`] server resolves to the same key in every workspace, so it gets
+/// one list everywhere too — which is the point of asking for it.
+fn cache_scope(def: &ServerDef, workspace_root: &Path, shared: &Path) -> Option<String> {
     let placeholder = Arc::new(|_: &str| Some("catalog-placeholder".to_string()));
-    Resolver::with_lookups(workspace_root, placeholder.clone(), placeholder)
+    Resolver::with_lookups(workspace_root, shared, placeholder.clone(), placeholder)
         .resolve(def, None)
         .ok()
         .map(|resolved| resolved.key.params().to_string())
@@ -726,9 +733,13 @@ fn cache_scope(def: &ServerDef, workspace_root: &Path) -> Option<String> {
 /// otherwise it is the hash of this workspace root. Unlike `cache_scope`, this stays stable across
 /// edits to the command, so an obsolete fingerprint can be removed without touching another
 /// workspace's list.
-fn cache_partition(def: &ServerDef, workspace_root: &Path) -> Option<String> {
-    let current = cache_scope(def, workspace_root)?;
-    let probe = cache_scope(def, &workspace_root.join(".zlogic-cache-scope-probe"))?;
+fn cache_partition(def: &ServerDef, workspace_root: &Path, shared: &Path) -> Option<String> {
+    let current = cache_scope(def, workspace_root, shared)?;
+    let probe = cache_scope(
+        def,
+        &workspace_root.join(".zlogic-cache-scope-probe"),
+        shared,
+    )?;
     if current == probe {
         return Some("shared".into());
     }
@@ -736,9 +747,14 @@ fn cache_partition(def: &ServerDef, workspace_root: &Path) -> Option<String> {
     Some(format!("workspace-{digest:x}"))
 }
 
-fn cache_path(dir: &Path, def: &ServerDef, workspace_root: &Path) -> Option<PathBuf> {
-    let scope = cache_scope(def, workspace_root)?;
-    let partition = cache_partition(def, workspace_root)?;
+fn cache_path(
+    dir: &Path,
+    def: &ServerDef,
+    workspace_root: &Path,
+    shared: &Path,
+) -> Option<PathBuf> {
+    let scope = cache_scope(def, workspace_root, shared)?;
+    let partition = cache_partition(def, workspace_root, shared)?;
     Some(dir.join(format!(
         "{}-v{}-{}-{}-{}.tools.json",
         file_stem(&def.id),
@@ -758,7 +774,7 @@ pub(crate) fn is_day_folder(name: &str) -> bool {
 fn read_cache(dirs: &CatalogDirs, def: &ServerDef, workspace_root: &Path) -> Option<CachedList> {
     let now = chrono::Utc::now();
     for dir in dirs.day_caches(now) {
-        let Some(path) = cache_path(&dir, def, workspace_root) else {
+        let Some(path) = cache_path(&dir, def, workspace_root, &dirs.shared) else {
             return None;
         };
         let Ok(raw) = std::fs::read_to_string(path) else {
@@ -795,7 +811,7 @@ pub fn write_tool_cache(
 ) -> std::io::Result<()> {
     let dir = dirs.day_cache(now);
     std::fs::create_dir_all(&dir)?;
-    let path = cache_path(&dir, def, workspace_root).ok_or_else(|| {
+    let path = cache_path(&dir, def, workspace_root, &dirs.shared).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("could not resolve cache scope for MCP server `{}`", def.id),
@@ -827,7 +843,7 @@ pub fn write_tool_cache(
 /// does not leave a file behind each time. Every day directory is swept, not just today's: the
 /// folders the user has not reached yet must not resurrect a stale list if a clock goes backwards.
 fn prune_old_cache(dirs: &CatalogDirs, def: &ServerDef, workspace_root: &Path, keep: &Path) {
-    let Some(partition) = cache_partition(def, workspace_root) else {
+    let Some(partition) = cache_partition(def, workspace_root, &dirs.shared) else {
         return;
     };
     let prefix = format!(
@@ -868,7 +884,7 @@ async fn fetch_tools(
     def: &ServerDef,
     workspace_root: &Path,
 ) -> crate::Result<Vec<ToolSpec>> {
-    let resolved = Resolver::system(workspace_root).resolve(def, None)?;
+    let resolved = pool.resolver(workspace_root).resolve(def, None)?;
     let label = Label {
         workspace_root: workspace_root.to_path_buf(),
         session: None,
@@ -958,6 +974,7 @@ mod tests_support {
             global_file: root.join("config/mcp.json"),
             global_dir: root.join("data/extensions/mcp"),
             cache: root.join("cache/mcp"),
+            shared: root.join("state/mcp"),
         };
         let workspace = root.join("work");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -1499,8 +1516,8 @@ mod tests {
         let other = f._tmp.path().join("other-workspace");
         let (cat, _) = catalog(&f);
         let def = cat.load(&f.workspace, vec![]).servers[0].clone();
-        let first_scope = cache_scope(&def, &f.workspace).unwrap();
-        let second_scope = cache_scope(&def, &other).unwrap();
+        let first_scope = cache_scope(&def, &f.workspace, &f.dirs.shared).unwrap();
+        let second_scope = cache_scope(&def, &other, &f.dirs.shared).unwrap();
 
         cat.set_runtime_status_scoped("s", &first_scope, RuntimeStatus::Ready);
         cat.set_runtime_status_scoped(

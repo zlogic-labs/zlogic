@@ -26,9 +26,8 @@ use zlogic_protocol::llm::ToolDefinition;
 use zlogic_tools::{Tool, ToolCtx, ToolError, ToolExecResult, ToolMeta, ToolRisk};
 
 use crate::conn::Label;
-use crate::def::{ServerDef, tool_name};
+use crate::def::{Binding, ServerDef, tool_name};
 use crate::pool::McpPool;
-use crate::resolve::Resolver;
 use crate::security::{has_unsafe_text, sanitize_json_strings, sanitize_untrusted_text};
 use crate::{McpError, content};
 
@@ -421,7 +420,7 @@ impl Tool for McpTool {
 
         // Resolved per call, not cached: a token stored a moment ago is picked up without anything
         // having to be invalidated, and the workspace is whichever one this call is happening in.
-        let resolver = Resolver::system(&ctx.root);
+        let resolver = self.pool.resolver(&ctx.root);
         let mut resolved = match resolver.resolve(&self.def, Some(ctx.session_id)) {
             Ok(r) => r,
             Err(e) => return Ok(ToolExecResult::failed(self.credential_hint(&e))),
@@ -429,8 +428,11 @@ impl Tool for McpTool {
         // A server can ask the client for input while a tool is running. MCP does not put the
         // originating zlogic session on that reverse request, so connections which advertise
         // elicitation must not be shared across sessions. Headless connections advertise no
-        // elicitation and retain the ordinary parameter-based pooling behaviour.
-        if ctx.interaction.is_some() {
+        // elicitation and retain the ordinary parameter-based pooling behaviour. A definition that
+        // asked for a wider scope has already accepted that trade (see [`crate::def::Binding`]), so
+        // nothing here re-narrows it.
+        let shares_sessions = matches!(self.def.binding, Binding::Workspace | Binding::Global);
+        if !shares_sessions && ctx.interaction.is_some() {
             resolved.bind_session(ctx.session_id);
         }
 
@@ -439,7 +441,14 @@ impl Tool for McpTool {
             session: Some(ctx.session_id),
             turn: Some(ctx.turn_id),
             call: Some(ctx.call_id.clone()),
-            interaction: ctx.interaction.clone(),
+            // The capability is decided at connect time from the first caller's label, and a shared
+            // connection has no way to route a prompt it did not open. Not advertising it is the
+            // only honest answer: the server asks nothing instead of asking the wrong window.
+            interaction: if shares_sessions {
+                None
+            } else {
+                ctx.interaction.clone()
+            },
         };
         // Starting a server can take seconds. Saying so beats a card that sits blank.
         ctx.progress(&format!(

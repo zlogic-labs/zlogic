@@ -39,7 +39,9 @@ base64 = "0.22.1"
 http = "1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider"] }
 url = "2.5"
-rmcp = { version = "3.0.0", default-features = false, features = [
+# `=` 钉在 3.2.0：3.3.0 起改要 `process-wrap ^10`，那一版要求 `windows ^0.62`，依赖图就会分裂成
+# 两代 `windows`。解除钉住之前先确认 Tauri 侧已经迁移。
+rmcp = { version = "=3.2.0", default-features = false, features = [
     "client",
     "auth",
     "transport-child-process",
@@ -51,5 +53,5 @@ rmcp = { version = "3.0.0", default-features = false, features = [
 zlogic-mcp = { path = ".", features = ["test-server"] }
 zlogic-objects = { path = "../objects" }
 tempfile.workspace = true
-rmcp = { version = "3.0.0", default-features = false, features = ["server"] }
+rmcp = { version = "=3.2.0", default-features = false, features = ["server"] }
 tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "time"] }

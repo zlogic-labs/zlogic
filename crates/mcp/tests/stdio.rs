@@ -30,6 +30,7 @@ fn fixture() -> Fixture {
         global_file: root.join("config/mcp.json"),
         global_dir: root.join("data/extensions/mcp"),
         cache: root.join("cache/mcp"),
+        shared: root.join("state/mcp"),
     };
     let workspace = root.join("work");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -47,11 +48,14 @@ fn define(f: &Fixture, id: &str, value: serde_json::Value) {
 }
 
 fn catalog(f: &Fixture) -> (Catalog, Arc<McpPool>) {
-    let pool = Arc::new(McpPool::new(PoolConfig {
-        connect_timeout: std::time::Duration::from_secs(10),
-        call_timeout: std::time::Duration::from_secs(10),
-        ..PoolConfig::default()
-    }));
+    let pool = Arc::new(McpPool::new(
+        PoolConfig {
+            connect_timeout: std::time::Duration::from_secs(10),
+            call_timeout: std::time::Duration::from_secs(10),
+            ..PoolConfig::default()
+        },
+        f.dirs.shared.clone(),
+    ));
     (Catalog::new(f.dirs.clone(), pool.clone()), pool)
 }
 
@@ -69,10 +73,14 @@ fn ctx(root: &Path) -> zlogic_tools::ToolCtx {
         worktree: None,
         interaction: None,
         output: None,
+        display: None,
         skills: None,
         max_result_chars: 10_000,
         runtime_paths: Vec::new(),
+        env: None,
+        computer: None,
         cancel: zlogic_tools::CancellationToken::new(),
+        budget: zlogic_tools::CancellationToken::new(),
     }
 }
 
@@ -231,7 +239,7 @@ async fn the_process_is_reused_across_calls_and_across_catalogues() {
     // A second catalogue over the same cache: the tool list is read from disk, so nothing reconnects.
     let second = Catalog::new(
         f.dirs.clone(),
-        Arc::new(McpPool::new(PoolConfig::default())),
+        Arc::new(McpPool::new(PoolConfig::default(), f.dirs.shared.clone())),
     );
     let loaded = second.load(&f.workspace, vec![]);
     assert!(
