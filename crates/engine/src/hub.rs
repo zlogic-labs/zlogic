@@ -1,7 +1,7 @@
 //! |---|---|---|
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::broadcast;
 use zlogic_protocol::stream::{
@@ -26,6 +26,7 @@ pub struct EventHub {
     turns: Mutex<HashMap<String, TurnChannel>>,
     tasks: Mutex<TaskChannels>,
     parents: Mutex<HashMap<String, String>>,
+    turn_end_listeners: Mutex<Vec<Arc<dyn Fn(&str, &str) + Send + Sync>>>,
     notices: broadcast::Sender<StateNotice>,
     notice_gaps: broadcast::Sender<u64>,
     inits: Mutex<InitChannel>,
@@ -118,12 +119,18 @@ impl Default for TaskStream {
 
 /// Whether a sub-agent's event is worth copying into its ancestors' channels.
 ///
-/// Only the interactions a sub-agent is blocked on: the user watching the parent session is the one
-/// who has to answer them, so they must arrive without the parent polling. Everything else a
-/// sub-agent emits — provider chunks, tool output, log lines — is read from the child's own
-/// transcript, which is what an opened sub-agent chat renders. Forwarding those costs a
-/// serialization per event over IPC for every ancestor, and pushes the ancestor's own live turn out
-/// of its bounded replay window (`TURN_REPLAY_CAPACITY`), whose loss is silent.
+/// Only the **interactions it is blocked on**. Everything else a sub-agent emits — provider
+/// chunks, tool output, turn boundaries, log lines — stays in the child's own channel, where a
+/// client reads it by subscribing to that child session. Copying those costs a serialization per
+/// event over IPC for every ancestor, and pushes the ancestor's own live turn out of its bounded
+/// replay window (`TURN_REPLAY_CAPACITY`), whose loss is silent.
+///
+/// Interactions are the exception because of who has to answer them: the user watching the parent
+/// session is the one sitting in front of it, so they must arrive without the parent polling. They
+/// carry no sub-agent stream content, so nothing else rides along with them.
+///
+/// A parent that wants to follow a sub-agent does not need this: `create_agent` attaches the
+/// child's session id to its own tool call, which is where the parent learns it.
 fn reaches_ancestors(payload: &StreamPayload) -> bool {
     matches!(
         payload,
@@ -220,6 +227,7 @@ impl EventHub {
         Self {
             turns: Mutex::new(HashMap::new()),
             parents: Mutex::new(HashMap::new()),
+            turn_end_listeners: Mutex::new(Vec::new()),
             tasks: Mutex::new(TaskChannels::default()),
             notices,
             notice_gaps,
@@ -397,6 +405,38 @@ impl EventHub {
     }
 
     pub fn emit(&self, event: StreamEvent) {
+        self.fan_out(&event);
+        // Deliberately after the lock is dropped: a listener here is host code that may touch a
+        // store, and holding the per-session event lock across that would stall every other
+        // session's stream behind it.
+        if matches!(&event.payload, StreamPayload::TurnEnd { .. }) {
+            let listeners = self
+                .turn_end_listeners
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for listener in listeners.iter() {
+                listener(&event.session_id, &event.turn_id);
+            }
+        }
+    }
+
+    /// Registers a callback for "this turn is over".
+    ///
+    /// For a host holding a resource that belongs to a single turn — an Android device a turn
+    /// selected, say. The turn boundary is the only moment that resource can be released with
+    /// certainty: a session can be closed, left open forever, or never closed again, and an idle
+    /// timer is only ever a guess about which of those happened.
+    ///
+    /// Every turn ends this way, including a sub-agent's own turn under its own session id, so a
+    /// listener never has to know whether it was the root agent.
+    pub fn on_turn_end(&self, listener: impl Fn(&str, &str) + Send + Sync + 'static) {
+        self.turn_end_listeners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Arc::new(listener));
+    }
+
+    fn fan_out(&self, event: &StreamEvent) {
         let mut turns = self.lock_turns();
         if let Some(parent) = &event.agent.parent_agent_id {
             self.parents
@@ -404,12 +444,12 @@ impl EventHub {
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(event.session_id.clone(), parent.clone());
         }
-        Self::push(&mut turns, &event.session_id, &event);
+        Self::push(&mut turns, &event.session_id, event);
         if !event.agent.is_root() && reaches_ancestors(&event.payload) {
             let parents = self.parents.lock().unwrap_or_else(PoisonError::into_inner);
             let mut ancestor = event.agent.parent_agent_id.clone();
             while let Some(session) = ancestor {
-                Self::push(&mut turns, &session, &event);
+                Self::push(&mut turns, &session, event);
                 ancestor = parents.get(&session).cloned();
             }
         }
@@ -513,6 +553,7 @@ mod tests {
                 status: TurnStatus::Completed,
                 reason: None,
                 stats: TurnStats::default(),
+                deliverables: Vec::new(), gone: Vec::new(),
             },
         }
     }
@@ -533,6 +574,108 @@ mod tests {
                 proactive: false,
             },
         }
+    }
+
+    fn round_start(session: &str, turn: &str) -> StreamEvent {
+        StreamEvent {
+            seq: 2,
+            session_id: session.into(),
+            turn_id: turn.into(),
+            agent: AgentRef::root(),
+            payload: StreamPayload::RoundStart {
+                round_id: "r1".into(),
+                round_seq: 1,
+                model: ModelRef {
+                    provider_id: "test".into(),
+                    model_id: "test".into(),
+                    display_name: "test".into(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn a_turn_end_listener_sees_exactly_the_turn_that_ended() {
+        let hub = EventHub::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        hub.on_turn_end(move |session, turn| {
+            sink.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((session.to_owned(), turn.to_owned()));
+        });
+
+        hub.emit(turn_start("s1", "t1"));
+        hub.emit(round_start("s1", "t1"));
+        assert!(
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "nothing is released before the turn ends"
+        );
+
+        hub.emit(event("s1"));
+        assert_eq!(
+            *seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![("s1".to_owned(), "t1".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_child_turn_releases_its_own_and_not_its_ancestors() {
+        let hub = EventHub::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        hub.on_turn_end(move |session, turn| {
+            sink.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((session.to_owned(), turn.to_owned()));
+        });
+
+        let mut child = round_start("child-session", "t9");
+        child.agent = AgentRef {
+            agent_id: Some("sub-1".into()),
+            parent_agent_id: None,
+            name: "sub-1".into(),
+        };
+        child.payload = StreamPayload::TurnEnd {
+            status: TurnStatus::Completed,
+            reason: None,
+            stats: TurnStats::default(),
+            deliverables: Vec::new(), gone: Vec::new(),
+        };
+        hub.emit(child);
+
+        // The child's own turn is the one that ended, and the resource it held belongs to it. A
+        // listener that saw the root session here would release something the root never took.
+        assert_eq!(
+            *seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![("child-session".to_owned(), "t9".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_turn_end_listener_cannot_hold_up_the_next_sessions_events() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let hub = EventHub::new();
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        hub.on_turn_end(move |_, _| {
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        hub.emit(event("s1"));
+        assert!(ran.load(Ordering::SeqCst));
+
+        // The point of running listeners outside the fan-out lock: a listener that emitted from
+        // inside itself would deadlock, and so would any other session's event arriving meanwhile.
+        // The fact that this second emit returns at all is the assertion.
+        hub.emit(event("s2"));
     }
 
     fn console_delta(task: &str, chunk: &str) -> TaskOutputDelta {
@@ -726,6 +869,7 @@ mod tests {
             status: TurnStatus::Completed,
             reason: None,
             stats: TurnStats::default(),
+            deliverables: Vec::new(), gone: Vec::new(),
         };
         hub.emit(parent_end);
         let settled = hub.subscribe_current_turn("parent");

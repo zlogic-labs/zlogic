@@ -15,6 +15,9 @@ use zlogic_protocol::WorkspaceId;
 pub enum Kind {
     Mcp,
     Plugin,
+    /// A skill's switch is keyed by its own name rather than a directory, because the skills this
+    /// layer has to reach are the compiled-in ones — they have no folder to mark.
+    Skill,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +173,7 @@ pub fn workspace_path(dirs: &Dirs, workspace: WorkspaceId) -> PathBuf {
 struct GlobalFile {
     mcp: BTreeMap<String, bool>,
     plugins: BTreeMap<String, bool>,
+    skills: BTreeMap<String, bool>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -177,6 +181,7 @@ struct GlobalFile {
 struct WorkspaceFile {
     mcp: BTreeMap<String, bool>,
     plugins: BTreeMap<String, bool>,
+    skills: BTreeMap<String, bool>,
     trusted: BTreeMap<String, String>,
 }
 
@@ -185,12 +190,14 @@ impl GlobalFile {
         match kind {
             Kind::Mcp => &self.mcp,
             Kind::Plugin => &self.plugins,
+            Kind::Skill => &self.skills,
         }
     }
     fn map_mut(&mut self, kind: Kind) -> &mut BTreeMap<String, bool> {
         match kind {
             Kind::Mcp => &mut self.mcp,
             Kind::Plugin => &mut self.plugins,
+            Kind::Skill => &mut self.skills,
         }
     }
 }
@@ -200,12 +207,14 @@ impl WorkspaceFile {
         match kind {
             Kind::Mcp => &self.mcp,
             Kind::Plugin => &self.plugins,
+            Kind::Skill => &self.skills,
         }
     }
     fn map_mut(&mut self, kind: Kind) -> &mut BTreeMap<String, bool> {
         match kind {
             Kind::Mcp => &mut self.mcp,
             Kind::Plugin => &mut self.plugins,
+            Kind::Skill => &mut self.skills,
         }
     }
 }

@@ -63,6 +63,15 @@ pub enum StreamPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
         stats: TurnStats,
+        /// The files the turn left in its delivery directory. Empty for the turns that produced
+        /// nothing to hand over, and absent from the wire in that case.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        deliverables: Vec<TurnDeliverable>,
+        /// Files the turn wrote and then removed — a scratch file it cleaned up, a checkout that
+        /// put the tree back. The client stops offering rows for these: the entries that recorded
+        /// the write are still in the turn, and the file behind them is not there any more.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        gone: Vec<String>,
     },
 
     // ───────────────────────── round ────────────────────────
@@ -101,6 +110,16 @@ pub enum StreamPayload {
     ToolExecStart {
         call_id: String,
         name: String,
+    },
+    /// A tool attached UI metadata to its **running** call.
+    ///
+    /// Some tools know what they will render before they finish — `create_agent` creates the
+    /// sub-agent's session first, so the card can name it and subscribe to it while the
+    /// sub-agent is still working. `ToolExecEnd` carries display too, but only once the call is
+    /// over, which is exactly too late for anything the UI has to *do* with it.
+    ToolDisplayAttached {
+        call_id: String,
+        display: ToolDisplay,
     },
     ToolOutputDelta {
         call_id: String,
@@ -273,6 +292,23 @@ pub struct RoundStats {
     pub cost: Option<CostView>,
     /// Wall clock for the round.
     pub duration_ms: u64,
+}
+
+/// One file a turn produced, found by listing its delivery directory.
+///
+/// `path` is absolute: the client offers it to open, and the turn's working directory may not be
+/// the workspace root. Nothing here is model-authored — the directory layout is the engine's, and
+/// the model only chooses *what* to write there — which is why this rides on `TurnEnd` rather than
+/// being something the model is asked to report.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnDeliverable {
+    pub path: String,
+    pub bytes: u64,
+    /// From the bytes where they can tell and the name where they cannot, so a `.png` that is
+    /// really a zip is described as what it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
 }
 
 /// What a whole turn cost and did.
@@ -480,6 +516,21 @@ pub enum ToolDisplay {
         height: u16,
         libraries: Vec<String>,
     },
+    /// A picture the tool produced and the model is also being shown: a screenshot, a cropped
+    /// region. The dimensions are carried because a client sizes the frame from them and would
+    /// otherwise decode a PNG before it has anything to lay out.
+    ///
+    /// Its own variant rather than a `File` card because a screenshot has no path. Rendering it as
+    /// `File { path: "screen.png" }` would show a user a path that does not exist, and would make
+    /// a click on the card open a file view instead of the image.
+    Image {
+        object: String,
+        mime: String,
+        width: u32,
+        height: u32,
+        bytes: u64,
+        label: String,
+    },
 }
 
 /// One line of a [`ToolDisplay::Text`] card's mathematical rendering.
@@ -682,6 +733,8 @@ mod tests {
                     rounds: 2,
                     ..Default::default()
                 },
+                deliverables: Vec::new(),
+                gone: Vec::new(),
             },
         };
         let v = serde_json::to_value(&ev).unwrap();

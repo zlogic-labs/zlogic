@@ -131,6 +131,23 @@ fn body_of(rec: &EntryRecord, data: &Value) -> Option<TranscriptBody> {
             Some(TranscriptBody::TurnEnd {
                 status: serde_json::from_value(data.get("status")?.clone()).ok()?,
                 reason: data.get("reason").and_then(Value::as_str).map(String::from),
+                // Turns recorded before delivery directories existed carry no key at all, which is
+                // why this defaults rather than being required.
+                deliverables: data
+                    .get("deliverables")
+                    .cloned()
+                    .and_then(|list| serde_json::from_value(list).ok())
+                    .unwrap_or_default(),
+                gone: data
+                    .get("gone")
+                    .and_then(Value::as_array)
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(Value::as_str)
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             })
         }
         EntryKind::Event => Some(TranscriptBody::Notice {
@@ -894,7 +911,12 @@ mod tests {
         );
 
         match &rig.bodies()[0] {
-            TranscriptBody::TurnEnd { status, reason } => {
+            TranscriptBody::TurnEnd {
+                status,
+                reason,
+                deliverables,
+                ..
+            } => {
                 assert_eq!(
                     *status,
                     zlogic_protocol::stream::TurnStatus::Incomplete(
@@ -902,6 +924,35 @@ mod tests {
                     )
                 );
                 assert_eq!(reason.as_deref(), Some("the model was cut off mid-answer"));
+                assert!(
+                    deliverables.is_empty(),
+                    "an event with no `deliverables` key is a turn from before the folder existed"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_turn_end_event_carries_what_the_turn_delivered() {
+        let rig = Rig::new();
+        rig.push(
+            EntryKind::Event,
+            serde_json::json!({
+                "type": "turn_end",
+                "status": "completed",
+                "deliverables": [
+                    { "path": "/w/.zlogic/cache/s/t/deliverables/chart.png", "bytes": 12, "mime": "image/png" },
+                    { "path": "/w/.zlogic/cache/s/t/deliverables/report.pdf", "bytes": 40, "mime": "application/pdf" }
+                ],
+            }),
+        );
+
+        match &rig.bodies()[0] {
+            TranscriptBody::TurnEnd { deliverables, .. } => {
+                assert_eq!(deliverables.len(), 2);
+                assert_eq!(deliverables[0].mime.as_deref(), Some("image/png"));
+                assert_eq!(deliverables[1].bytes, 40);
             }
             other => panic!("{other:?}"),
         }
