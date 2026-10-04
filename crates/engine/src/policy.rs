@@ -32,8 +32,8 @@ use zlogic_policy::path::physical_resolve;
 #[cfg(windows)]
 use zlogic_policy::winpath::{WinCwd, WinPathForm, WinResolver, parse_path};
 use zlogic_policy::{
-    Access, Decision, Dialect, Effect, Op, PathRule, Policy, ResolvedPath, Zone,
-    default_workspace_policy, evaluate_command,
+    Access, ComputerDecision, ComputerTarget, Decision, Dialect, Effect, Op, PathRule, Policy,
+    ResolvedPath, Zone, default_workspace_policy, evaluate_command,
 };
 use zlogic_protocol::interaction::{GrantScope, InteractionBody};
 use zlogic_protocol::llm::{
@@ -44,7 +44,7 @@ use zlogic_protocol::message::{ContentPart, Message, Role, TextPart};
 use zlogic_protocol::usage::Purpose;
 use zlogic_protocol::{RoundId, SessionId};
 use zlogic_store::{NewUsage, normalise};
-use zlogic_tools::{ShellDialect, ToolRisk};
+use zlogic_tools::{ComputerFacts, ComputerInspector, ShellDialect, ToolRisk};
 
 use crate::ModelRouter;
 
@@ -160,6 +160,11 @@ pub struct PolicyCoreGate {
     home: PathBuf,
     reviewer: Arc<dyn Reviewer>,
     grants: Arc<crate::Grants>,
+    /// The `computer` tool as something that can describe a call without performing it. `None`
+    /// when the tool is not registered, and a `computer` call then falls through to the generic
+    /// structured path — which asks the user, so the worst case is a vaguer prompt, never a
+    /// quieter one.
+    computer: Option<Arc<dyn ComputerInspector>>,
 }
 
 impl PolicyCoreGate {
@@ -185,7 +190,17 @@ impl PolicyCoreGate {
                 store,
                 objects,
             }),
+            computer: None,
         }
+    }
+
+    /// Attaches the tool the gate asks to describe `computer` calls with. A builder rather than a
+    /// constructor argument because the tool is registered by the same bootstrap that builds the
+    /// gate, and threading an `Option` through a six-argument constructor for a field that is
+    /// absent on two of three platforms helps nobody.
+    pub fn with_computer(mut self, computer: Option<Arc<dyn ComputerInspector>>) -> Self {
+        self.computer = computer;
+        self
     }
 
     #[cfg(test)]
@@ -201,6 +216,7 @@ impl PolicyCoreGate {
             dirs,
             home,
             reviewer,
+            computer: None,
         }
     }
 
@@ -208,7 +224,74 @@ impl PolicyCoreGate {
         if req.tool.name == "shell" {
             return self.assess_shell(req);
         }
+        if req.tool.name == crate::COMPUTER_TOOL && self.computer.is_some() {
+            return self.assess_computer(req);
+        }
         self.assess_structured(req)
+    }
+
+    /// The scopes a `computer` prompt may offer.
+    ///
+    /// `session` appears only when a rule can actually be derived from this call, which means the
+    /// target was identified and the action is one a grant can express. Offering it otherwise
+    /// would put a button in front of the user that, when pressed, writes a rule matching every
+    /// window on the machine — or writes nothing at all. Both are worse than not offering it.
+    fn computer_scopes(&self, req: &PolicyRequest) -> Vec<GrantScope> {
+        let mut out = vec![GrantScope::Once, GrantScope::Turn];
+        let Some(inspector) = self.computer.as_ref() else {
+            return out;
+        };
+        if crate::derive_computer_rule_shape(&req.tool.name, &req.args, &inspector.facts(&req.args))
+        {
+            out.push(GrantScope::Session);
+        }
+        out
+    }
+
+    /// Decides one `computer` call, with the tool's own hit test in hand.
+    ///
+    /// This is the only gate branch that asks the *tool* what a call is about to do. Every other
+    /// branch reads the arguments and the filesystem; nothing here can know that `(1180, 640)` is
+    /// a `Transfer` button, and a prompt the user cannot read is a prompt they rubber-stamp.
+    fn assess_computer(&self, req: &PolicyRequest) -> Assessment {
+        let Some(inspector) = self.computer.clone() else {
+            return self.assess_structured(req);
+        };
+        let policy = match self.policy_for(&req.root, req.session_id) {
+            Ok(policy) => policy,
+            Err(reason) => return Assessment::AskUser(reason),
+        };
+        let facts = inspector.facts(&req.args);
+        if let Some(reason) = &facts.malformed {
+            // The arguments are the model's, and it can fix them. Sending this to the user as a
+            // policy question would be asking them to debug someone else's typo.
+            return Assessment::BadArgs(reason.clone());
+        }
+        let target = ComputerTarget {
+            process: facts.process.clone(),
+            title: facts.window.clone(),
+        };
+        let decision = match policy.evaluate_computer(&facts.action, &target) {
+            Ok(decision) => decision,
+            Err(error) => {
+                return Assessment::AskUser(format!("policy evaluation failed: {error}"));
+            }
+        };
+        match decision.effect {
+            Effect::Allow if facts.unidentified => Assessment::AskUser(format!(
+                "a rule allows {:?} here, but this {} could not be identified — it has no \
+                 accessible name, so there is nothing to confirm. {}",
+                facts.action,
+                facts.target.as_deref().unwrap_or("target"),
+                decision.reason
+            )),
+            Effect::Allow => Assessment::Allow,
+            Effect::Deny => Assessment::Deny(computer_reason(&facts, &decision)),
+            // Never `Review`: the reviewer is a model, and the model that has just aimed at a
+            // pixel is the one whose judgement about that pixel is in question. A computer call
+            // goes to the user.
+            Effect::Ask => Assessment::AskUser(computer_reason(&facts, &decision)),
+        }
     }
 
     fn assess_shell(&self, req: &PolicyRequest) -> Assessment {
@@ -402,26 +485,30 @@ impl PolicyCoreGate {
         Ok(policy)
     }
 
-    fn offered_scopes(req: &PolicyRequest) -> Vec<GrantScope> {
-        let mut out = vec![GrantScope::Once, GrantScope::Turn];
+    fn offered_scopes(&self, req: &PolicyRequest) -> Vec<GrantScope> {
         if crate::derive_rule_shape(&req.tool.name, &req.args) {
-            out.extend([
+            return vec![
+                GrantScope::Once,
+                GrantScope::Turn,
                 GrantScope::Session,
                 GrantScope::Workspace,
                 GrantScope::Global,
-            ]);
+            ];
         }
-        out
+        if req.tool.name == crate::COMPUTER_TOOL {
+            return self.computer_scopes(req);
+        }
+        vec![GrantScope::Once, GrantScope::Turn]
     }
 
-    fn ask_body(req: &PolicyRequest, reason: String) -> PolicyDecision {
+    fn ask_body(&self, req: &PolicyRequest, reason: String) -> PolicyDecision {
         PolicyDecision::Ask {
             body: InteractionBody::Permission {
                 tool: req.tool.name.clone(),
                 args_preview: preview(&req.args),
                 reason,
                 caveats: Vec::new(),
-                offered_scopes: Self::offered_scopes(req),
+                offered_scopes: self.offered_scopes(req),
                 grant_preview: crate::grant_preview(&req.tool.name, &req.args),
             },
         }
@@ -431,8 +518,22 @@ impl PolicyCoreGate {
 #[async_trait]
 impl PolicyGate for PolicyCoreGate {
     async fn record_grant(&self, req: &PolicyRequest, scope: GrantScope) {
-        let Some(rule) =
-            crate::derive_rule(&req.tool.name, &req.args, scope, Utc::now(), &self.grants)
+        let at = Utc::now();
+        // The computer branch asks the tool again rather than trusting a cached answer: the window
+        // under the cursor at grant time is the one the user actually said yes to, and a hit test
+        // is cheap next to writing a rule that outlives the turn.
+        let computer = self.computer.as_ref().and_then(|inspector| {
+            crate::derive_computer_rule(
+                &req.tool.name,
+                &req.args,
+                scope,
+                at,
+                &self.grants,
+                &inspector.facts(&req.args),
+            )
+        });
+        let Some(rule) = computer
+            .or_else(|| crate::derive_rule(&req.tool.name, &req.args, scope, at, &self.grants))
         else {
             tracing::warn!(
                 target: "zlogic::policy",
@@ -481,7 +582,7 @@ impl PolicyGate for PolicyCoreGate {
             }
             Assessment::AskUser(reason) => {
                 audit(req, "ask", &reason);
-                Self::ask_body(req, reason)
+                self.ask_body(req, reason)
             }
             Assessment::Review { reason, facts } => {
                 audit(req, "review", &reason);
@@ -526,7 +627,7 @@ impl PolicyGate for PolicyCoreGate {
                             "ask_after_review_block",
                             &format!("{reason}; model review blocked: {model_reason}"),
                         );
-                        Self::ask_body(
+                        self.ask_body(
                             req,
                             format!("{reason}; model review blocked: {model_reason}"),
                         )
@@ -537,7 +638,7 @@ impl PolicyGate for PolicyCoreGate {
                             "ask_after_review",
                             &format!("{reason}; model review: {model_reason}"),
                         );
-                        Self::ask_body(req, format!("{reason}; model review: {model_reason}"))
+                        self.ask_body(req, format!("{reason}; model review: {model_reason}"))
                     }
                 }
             }
@@ -774,6 +875,7 @@ fn classifier_args(tool: &str, args: &Value) -> Value {
         "list_dir" | "glob" | "grep" => &["path", "pattern"],
         // read_file's classifier only needs the path the call would open.
         "read_file" => &["path"],
+        "report_artifacts" => &["artifacts"],
         "web_fetch" => &["url"],
         "web_search" => &["query", "num_results", "mode", "fresh"],
         "ui_target" => &["action", "platform", "target", "port", "launch_if_needed"],
@@ -849,6 +951,7 @@ fn redact_classifier_value(value: &Value) -> Value {
 
 fn merge_policy(base: &mut Policy, extra: Policy) {
     base.commands.extend(extra.commands);
+    base.computer.extend(extra.computer);
     base.exec.extend(extra.exec);
     base.paths.extend(extra.paths);
     base.scripts.extend(extra.scripts);
@@ -932,6 +1035,32 @@ fn structured_file_ops(req: &PolicyRequest, args: &Value, home: &Path) -> Option
         },
         "list_dir" | "glob" | "grep" => vec![path_or_cwd(Access::Read)],
         "write_file" | "edit" => vec![required("path", Access::Write)],
+        // `report_artifacts` names paths rather than opening them, but it is still a tool that
+        // puts files in front of the user, so each one is a Read the caller asked for. A file the
+        // policy would not let the model open must not become a clickable row either.
+        "report_artifacts" => {
+            let Some(list) = object
+                .and_then(|object| object.get("artifacts"))
+                .and_then(Value::as_array)
+            else {
+                return Some(vec![Op::Unknown {
+                    reason: "report_artifacts requires an `artifacts` array of paths".into(),
+                    snippet: args.to_string(),
+                }]);
+            };
+            list.iter()
+                .map(|item| match item.as_str() {
+                    Some(raw) => Op::Path {
+                        access: Access::Read,
+                        path: resolve_policy_path(req, raw, home),
+                    },
+                    None => Op::Unknown {
+                        reason: "an `artifacts` entry is not a string".into(),
+                        snippet: item.to_string(),
+                    },
+                })
+                .collect()
+        }
         _ => return None,
     };
     Some(ops)
@@ -962,6 +1091,39 @@ fn resolve_policy_path(req: &PolicyRequest, raw: &str, home: &Path) -> ResolvedP
         return resolver.dynamic(raw);
     };
     resolver.resolve(raw, &WinCwd::known(cwd), false)
+}
+
+/// The one line a user reads before a `computer` call runs.
+///
+/// Ordered so the part that identifies the action comes first: a prompt whose first clause is
+/// "in Firefox" and whose last is "click Transfer" gets read as a browser approval. A password
+/// field is named as such rather than by its contents, which are never put in a prompt — the count
+/// is the fact that matters, and quoting the text would defeat the point of masking it.
+fn computer_reason(facts: &ComputerFacts, decision: &ComputerDecision) -> String {
+    let mut line = match &facts.target {
+        Some(target) => format!("{} {}", facts.action, target),
+        None => facts.action.clone(),
+    };
+    if facts.password {
+        line.push_str(" (password field)");
+    } else if let Some(count) = facts.char_count {
+        line.push_str(&format!(
+            " ({count} character{} to be sent)",
+            if count == 1 { "" } else { "s" }
+        ));
+    }
+    if facts.unidentified {
+        line.push_str(" — this target has no accessible name, so it cannot be identified");
+    }
+    if let Some(window) = &facts.window {
+        line.push_str(&format!(" in {window:?}"));
+    }
+    if let Some(message) = &decision.message {
+        line.push_str(&format!(": {message}"));
+    } else {
+        line.push_str(&format!(". {}", decision.reason));
+    }
+    line
 }
 
 fn decision_reason(decision: &Decision) -> String {
