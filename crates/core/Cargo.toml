@@ -15,6 +15,7 @@ zlogic-objects = { path = "../objects" }
 zlogic-store = { path = "../store" }
 zlogic-tools = { path = "../tools" }
 zlogic-task = { path = "../task" }
+ignore = "0.4"
 zlogic-llm = { path = "../llm", default-features = false }
 zlogic-config = { path = "../config" }
 zlogic-hooks = { path = "../hooks" }

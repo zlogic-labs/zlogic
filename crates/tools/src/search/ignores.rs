@@ -21,6 +21,9 @@ use std::path::Path;
 /// Dependency trees and tool caches: never hand-written, always reconstructible.
 /// Deliberately excludes `vendor` / `Pods` / `third_party`, which are frequently committed on
 /// purpose — hiding them unconditionally would hide real, searchable code.
+///
+/// The turn-artifact scan keeps these and drops [`BUILD_OUTPUT_DIRS`] — see `zlogic_core::produced`
+/// for why the two want opposite answers.
 pub(crate) const NEVER_SOURCE_DIRS: &[&str] = &[
     ".git",
     // JS / TS

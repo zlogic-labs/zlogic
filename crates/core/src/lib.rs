@@ -51,10 +51,12 @@ pub mod context;
 pub mod cost;
 pub mod entry_data;
 pub mod policy;
+pub mod produced;
 pub mod round;
 pub mod sink;
 pub mod spawn;
 pub mod steer;
+pub mod turndir;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -79,8 +81,8 @@ use zlogic_task::{ExecutorSpec, TaskRun, TaskTrigger};
 pub use zlogic_tools::CancellationToken;
 use zlogic_tools::{
     AgentMailboxGate, AgentSpawner, CheckpointHost, CheckpointOutcome, CheckpointRequest,
-    CheckpointTrigger, RuntimePathProvider, SkillHost, TaskHost, ToolMeta, ToolRegistry, ToolRisk,
-    WorktreeHost,
+    CheckpointTrigger, ComputerInspector, EnvProvider, RuntimePathProvider, SkillHost, TaskHost,
+    ToolMeta, ToolRegistry, ToolRisk, WorktreeHost,
 };
 
 pub use compact::{ContextPolicy, Summary};
@@ -131,7 +133,44 @@ pub enum CoreError {
     Invalid(String),
 }
 
+impl CoreError {
+    /// Whether sending the very same request again could work.
+    /// The LLM layer already judges this per failure and marks the ones a resend can fix (the
+    /// network, a rate limit, a 5xx); nothing else here is worth resending, because every other
+    /// variant is either about our own state — a store, a corrupt history — or a property of the
+    /// request, and neither heals by being sent again.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            CoreError::Llm(error) => error.retryable,
+            _ => false,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, CoreError>;
+
+/// Why a turn ended with nothing behind it.
+/// `None` on every outcome that has an answer. It travels beside [`TurnStatus`] because the
+/// status alone cannot answer the question a caller that *owns* the run has to ask: is there a
+/// conclusion here, or did an error cut the turn off part-way? Without it a dead run and a
+/// finished one look alike, and a sub-agent's half-written reply gets read as its conclusion.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnFailure {
+    /// The reason, worded as the model reads it.
+    pub message: String,
+    /// The error's own retry judgement, never guessed from the wording. `true` after the retry
+    /// budget is spent means the cause was external, so the same run may well succeed later.
+    pub retryable: bool,
+}
+
+impl From<&CoreError> for TurnFailure {
+    fn from(error: &CoreError) -> Self {
+        Self {
+            message: error.to_string(),
+            retryable: error.is_retryable(),
+        }
+    }
+}
 
 /// Everything a turn needs that outlives it.
 pub struct CoreServices {
@@ -149,6 +188,18 @@ pub struct CoreServices {
     /// Process-wide durable task runtime. Core only forwards it to tools.
     pub tasks: Option<Arc<dyn TaskHost>>,
     pub runtime_paths: Option<Arc<dyn RuntimePathProvider>>,
+    /// The variables a shell call inherits, already merged across the global, workspace and session
+    /// layers. On [`CoreServices`] rather than on the turn so a sub-agent inherits it by the same
+    /// whole-struct clone everything else does — a variable the user set for a session has to reach
+    /// the sub-agent's shell too, or the tree runs in a different environment from its parent.
+    pub env: Option<Arc<dyn EnvProvider>>,
+    /// The `computer` tool, as something that can describe a call without performing it.
+    ///
+    /// Held separately from [`CoreServices::tools`] because it is read by the *approval* path, not
+    /// the execution path: before a `computer` call runs, the gate needs to know what the click is
+    /// about to land on. `None` means the tool is not registered on this platform, and the gate
+    /// then has nothing to describe the call with.
+    pub computer: Option<Arc<dyn ComputerInspector>>,
     /// Resolves a model reference (`create_agent`'s `model` argument) into a runnable model and
     /// client. `None` = a custom `model` argument fails closed with "no model resolver", exactly
     /// like `create_agent` without a spawner.
@@ -178,7 +229,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_rounds: 40,
-            max_depth: 2,
+            max_depth: 1,
             max_result_chars: 30_000,
             tool_timeout_secs: 0,
             max_parallel_tools: 16,
@@ -403,6 +454,10 @@ pub struct TurnOutcome {
     /// The assistant text of the final round — a sub-agent's conclusion, and what a title is
     /// drafted from. Everything else stays in the entries.
     pub answer: String,
+    /// Set when an error ended the turn, and only then. `status` says the turn did not complete;
+    /// this says *why*, which is what lets whoever started the run tell a sub-agent that was
+    /// cut off from one that ran out of things to say.
+    pub failure: Option<TurnFailure>,
 }
 
 /// One item entering a new turn.
@@ -947,6 +1002,7 @@ impl Core {
                     status,
                     stats,
                     answer: String::new(),
+                    failure: None,
                 })
             }
             Err(error) => {
@@ -964,6 +1020,7 @@ impl Core {
                     status: TurnStatus::Failed,
                     stats,
                     answer: String::new(),
+                    failure: Some((&error).into()),
                 })
             }
         }
@@ -982,15 +1039,30 @@ impl Core {
             .store
             .with(|db| db.entries().next_turn_seq(self.session_id))?;
 
-        let emitter = Arc::new(TurnEmitter::new(
-            self.sink.clone(),
-            self.session_id,
-            turn_id,
-            self.agent.clone(),
-            self.services.store.clone(),
-            self.services.objects.clone(),
-            turn_seq,
-        ));
+        let emitter = Arc::new(
+            TurnEmitter::new(
+                self.sink.clone(),
+                self.session_id,
+                turn_id,
+                self.agent.clone(),
+                self.services.store.clone(),
+                self.services.objects.clone(),
+                turn_seq,
+            )
+            .with_artifact_sources(crate::sink::ArtifactSources {
+                root: self.root.clone(),
+                // The folder the model is told to write into, read by path because the workspace
+                // scan skips dotfolders and this one lives under `.zlogic`.
+                deliverables: crate::turndir::deliverables_dir(
+                    &self.root,
+                    self.session_id,
+                    turn_id,
+                ),
+                // Where a shell redirect's file may have landed, when the command did not say.
+                session_cache: crate::turndir::session_cache_dir(&self.root, Some(self.session_id)),
+                since: std::time::SystemTime::now(),
+            }),
+        );
         // The clone is what keeps the failure path below able to persist the message — resolution
         // consumes its input, and by this point the mailbox row is already gone. A few strings per
         // turn; do not "optimise" it away.
@@ -1022,6 +1094,7 @@ impl Core {
                     status: TurnStatus::Failed,
                     stats,
                     answer: String::new(),
+                    failure: Some((&error).into()),
                 });
             }
         };
@@ -1181,6 +1254,7 @@ impl Core {
                         status: TurnStatus::Failed,
                         stats,
                         answer,
+                        failure: Some((&e).into()),
                     });
                 }
             };
@@ -1198,6 +1272,10 @@ impl Core {
             if !round.text.is_empty() {
                 answer = round.text.clone();
                 produced_content = true;
+                // The model naming a file is as good as a tool card naming it, and it is often the
+                // only place a name appears at all: a script builds its output path at runtime, and
+                // the reply is where the model finally writes down what it produced.
+                emitter.note(&round.text);
             }
             if round.stats.tools.total > 0 {
                 produced_content = true;
@@ -1431,6 +1509,7 @@ impl Core {
             status,
             stats,
             answer,
+            failure: None,
         })
     }
 
