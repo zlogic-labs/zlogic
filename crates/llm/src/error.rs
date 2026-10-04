@@ -1,7 +1,10 @@
 use zlogic_protocol::error::{ApiError, ErrorCategory, LocalizedMessage, RetryPolicy};
 use zlogic_protocol::llm::{LlmError, LlmErrorKind};
 
-pub const MESSAGE_MAX_CHARS: usize = 8000;
+/// Long enough to read a provider's complaint, short enough that it cannot be a copy of the
+/// prompt. A 400 from a real provider routinely quotes the offending input back, so this string
+/// ends up in `error.log` and in every `%error` log line that quotes it.
+pub const MESSAGE_MAX_CHARS: usize = 800;
 
 pub fn err(kind: LlmErrorKind, message: impl Into<String>) -> LlmError {
     LlmError {
@@ -174,7 +177,7 @@ pub fn from_status(status: u16, body: &str, meta: &ResponseMeta) -> LlmError {
         retryable,
         message: format!(
             "HTTP {status}: {}",
-            truncate(&redact(body), MESSAGE_MAX_CHARS)
+            truncate(&redact(&summarize(body)), MESSAGE_MAX_CHARS)
         ),
         status: Some(status),
         request_id: meta.request_id.clone(),
@@ -259,6 +262,31 @@ const SENSITIVE_NAMES: &[&str] = &[
     "signature",
     "password",
 ];
+
+/// The one part of an error body worth keeping: what the provider said, in its own words.
+///
+/// Everything else in the body is boilerplate or a copy of what was sent. A 400 from a real
+/// provider quotes the offending input back — `messages.2.content.0.text: …` — and this string is
+/// about to be logged, put in a UI toast and sent to a support channel, so the rest is dropped
+/// rather than redacted. Falls back to the raw body when it is not JSON, or when it is JSON with no
+/// recognisable error message.
+fn summarize(body: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_string();
+    };
+    let mut found = None;
+    for key in ["error", "message", "detail", "error_msg"] {
+        let candidate = value.get(key).and_then(|value| match value {
+            serde_json::Value::String(text) => Some(text.as_str()),
+            _ => value.get("message").and_then(|inner| inner.as_str()),
+        });
+        if candidate.is_some() {
+            found = candidate;
+            break;
+        }
+    }
+    found.unwrap_or(body).to_string()
+}
 
 fn redact(body: &str) -> String {
     let lower = body.to_ascii_lowercase();
@@ -470,18 +498,23 @@ mod tests {
     }
 
     #[test]
-    fn credentials_zlogiced_in_the_body_are_redacted() {
+    fn only_the_provider_message_survives_the_body() {
         let e = status(
             400,
-            r#"{"error":"bad request","api_key":"sk-live-1234567890","note":"keep me"}"#,
+            r#"{"error":"bad request","api_key":"sk-live-1234567890","note":"drop me"}"#,
         );
+        assert!(e.message.contains("bad request"), "{}", e.message);
         assert!(!e.message.contains("sk-live-1234567890"), "{}", e.message);
-        assert!(e.message.contains("<redacted>"));
-        assert!(
-            e.message.contains("keep me"),
-            "non-sensitive content must be preserved: {}",
-            e.message
-        );
+        // Everything outside the provider's message is dropped, not redacted: a sibling field can
+        // be anything, including a quote of the request.
+        assert!(!e.message.contains("drop me"), "{}", e.message);
+    }
+
+    #[test]
+    fn a_secret_inside_the_provider_message_is_redacted() {
+        let e = status(400, r#"{"error":{"message":"rejected: token=abcdef123"}}"#);
+        assert!(!e.message.contains("abcdef123"), "{}", e.message);
+        assert!(e.message.contains("<redacted>"), "{}", e.message);
     }
 
     #[test]
@@ -505,9 +538,16 @@ mod tests {
     fn truncate_respects_char_boundaries() {
         let s = "错误信息".repeat(1000);
         let e = status(500, &s);
-        assert!(e.message.len() <= 8100);
+        assert!(
+            e.message.len() <= MESSAGE_MAX_CHARS + 16,
+            "{}",
+            e.message.len()
+        );
         let e = status(500, &"e".repeat(3000));
-        assert!(e.message.contains(&"e".repeat(3000)), "{}", e.message.len());
+        assert_eq!(e.message.len(), MESSAGE_MAX_CHARS + "HTTP 500: ".len());
+        // A body under the cap is kept whole — the cap is a privacy limit, not a summariser.
+        let short = "e".repeat(100);
+        assert!(status(500, &short).message.contains(&short));
     }
 
     #[test]

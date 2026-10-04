@@ -3,6 +3,10 @@
 //! ```text
 //! <state>/logs/
 //! ├── 2026-08-25/
+//! │   ├── policy.log
+//! │   ├── llm.log
+//! │   ├── app.log
+//! │   └── error.log   — every warn/error line, whichever module it came from
 //! └── 2026-08-26/
 //!     └── …
 //! ```
@@ -34,11 +38,14 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 use zlogic_config::LogConfig;
 
+mod privacy;
+
 /// Where log lines go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sink {
     /// Per-day directories of per-module files under the given directory
-    /// (`<dir>/<YYYY-MM-DD>/policy.log` etc.).
+    /// (`<dir>/<YYYY-MM-DD>/policy.log` etc.), plus one `error.log` holding every warn/error
+    /// line from any module.
     /// **The only correct choice for a TUI.**
     File { dir: PathBuf },
     /// stderr. For processes that do not own the terminal: one-shot commands, tests.
@@ -169,36 +176,24 @@ fn build(
                     .with(console_layer()),
             )
         }
-        Sink::File { dir } => {
+        Sink::File { dir } | Sink::Both { dir } => {
             ensure_log_root(dir)?;
             let (policy, guard) = file_layer(dir, Module::Policy);
             let (llm, guard2) = file_layer(dir, Module::Llm);
             let (app, guard3) = file_layer(dir, Module::App);
-            guards.extend([guard, guard2, guard3]);
+            let (errors, guard4) = error_layer(dir);
+            guards.extend([guard, guard2, guard3, guard4]);
             log_dir = Some(dir.clone());
-            Box::new(
-                tracing_subscriber::registry()
-                    .with(filter)
-                    .with(policy)
-                    .with(llm)
-                    .with(app),
-            )
-        }
-        Sink::Both { dir } => {
-            ensure_log_root(dir)?;
-            let (policy, guard) = file_layer(dir, Module::Policy);
-            let (llm, guard2) = file_layer(dir, Module::Llm);
-            let (app, guard3) = file_layer(dir, Module::App);
-            guards.extend([guard, guard2, guard3]);
-            log_dir = Some(dir.clone());
-            Box::new(
-                tracing_subscriber::registry()
-                    .with(filter)
-                    .with(policy)
-                    .with(llm)
-                    .with(app)
-                    .with(console_layer()),
-            )
+            let files = tracing_subscriber::registry()
+                .with(filter)
+                .with(policy)
+                .with(llm)
+                .with(app)
+                .with(errors);
+            match sink {
+                Sink::Both { .. } => Box::new(files.with(console_layer())),
+                _ => Box::new(files),
+            }
         }
     };
     Ok((subscriber, guards, log_dir))
@@ -218,14 +213,44 @@ fn file_layer<S>(
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    let (writer, guard) = tracing_appender::non_blocking(DailyModuleWriter::new(dir, module));
+    file_layer_matching(dir, module.file_stem(), module.target_filter())
+}
+
+/// The one file not chosen by target: every warn and error line, whatever module it came from, so
+/// a bug report is a single file to read. Duplicated on purpose — the module file stays the place
+/// where an error has its context. Like every other file here it is created on first write, so a
+/// quiet day has no `error.log`.
+///
+/// Spans are let through whatever their level. A per-layer filter also filters the **spans**, and
+/// an INFO-level turn span failing this test makes the layer lose the scope — which is exactly the
+/// `turn_id=…` an `error.log` line most needs to carry.
+fn error_layer<S>(dir: &Path) -> (impl Layer<S>, tracing_appender::non_blocking::WorkerGuard)
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    file_layer_matching(dir, "error", |meta: &Metadata<'_>| {
+        meta.is_span() || *meta.level() <= tracing::Level::WARN
+    })
+}
+
+fn file_layer_matching<S>(
+    dir: &Path,
+    stem: &'static str,
+    accepts: fn(&Metadata<'_>) -> bool,
+) -> (impl Layer<S>, tracing_appender::non_blocking::WorkerGuard)
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    let (writer, guard) = tracing_appender::non_blocking(DailyModuleWriter::new(dir, stem));
     let layer = tracing_subscriber::fmt::layer()
         .with_writer(writer)
         // ANSI off when a file is involved: escape codes make `grep` output unreadable and
         // confuse every log viewer.
         .with_ansi(false)
         .with_target(true)
-        .with_filter(FilterFn::new(module.target_filter()));
+        // The gate every field goes through, on events and on spans alike.
+        .fmt_fields(privacy::SafeFields)
+        .with_filter(FilterFn::new(accepts));
     (layer, guard)
 }
 
@@ -237,6 +262,8 @@ where
         .with_writer(std::io::stderr)
         .with_ansi(true)
         .with_target(true)
+        // Same gate as the files: a devtools console is still a place content must not land.
+        .fmt_fields(privacy::SafeFields)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,14 +311,22 @@ struct DailyModuleWriter {
     root: PathBuf,
     module: &'static str,
     current: Option<(String, File)>,
+    written: u64,
+    capped: bool,
 }
 
+/// Per day, per module. A debug run that goes wrong produces a log nobody can grep and a disk that
+/// fills; past this the day is marked incomplete and further lines are dropped.
+const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
 impl DailyModuleWriter {
-    fn new(root: &Path, module: Module) -> Self {
+    fn new(root: &Path, stem: &'static str) -> Self {
         Self {
             root: root.to_path_buf(),
-            module: module.file_stem(),
+            module: stem,
             current: None,
+            written: 0,
+            capped: false,
         }
     }
 
@@ -316,6 +351,9 @@ impl DailyModuleWriter {
                         format!("cannot open log file {}: {e}", path.display()),
                     )
                 })?;
+            // Reopening an existing day has to start from its real size, not from zero.
+            self.written = file.metadata().map(|m| m.len()).unwrap_or(0);
+            self.capped = false;
             self.current = Some((today, file));
         }
         Ok(&mut self.current.as_mut().expect("just set").1)
@@ -324,7 +362,23 @@ impl DailyModuleWriter {
 
 impl Write for DailyModuleWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.open_today()?.write(buf)
+        if self.capped {
+            return Ok(buf.len());
+        }
+        if self.written.saturating_add(buf.len() as u64) > MAX_FILE_BYTES {
+            let module = self.module;
+            let file = self.open_today()?;
+            let _ = writeln!(
+                file,
+                "--- {module}.log hit the {MAX_FILE_BYTES} byte cap; later lines today are missing ---"
+            );
+            let _ = file.flush();
+            self.capped = true;
+            return Ok(buf.len());
+        }
+        self.open_today()?.write(buf)?;
+        self.written += buf.len() as u64;
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -351,7 +405,7 @@ fn build_filter(level: &str) -> Result<EnvFilter, LoggingError> {
     }
     // Our own crates at the requested level; dependencies stay at warn, so a debug session is
     let directives = format!(
-        "warn,zlogic={level},zlogic_cli={level},zlogic_desktop={level},zlogic_daemon={level}"
+        "warn,zlogic={level},zlogic_desktop={level},zlogic_daemon={level}"
     );
     EnvFilter::try_new(&directives).map_err(|_| LoggingError::BadLevel(level))
 }
@@ -477,8 +531,8 @@ mod tests {
         let root = tmp.path().join("logs");
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-        let mut policy = DailyModuleWriter::new(&root, Module::Policy);
-        let mut llm = DailyModuleWriter::new(&root, Module::Llm);
+        let mut policy = DailyModuleWriter::new(&root, "policy");
+        let mut llm = DailyModuleWriter::new(&root, "llm");
         writeln!(policy, "audit line").unwrap();
         writeln!(llm, "llm line").unwrap();
         policy.flush().unwrap();
@@ -541,12 +595,112 @@ mod tests {
     }
 
     #[test]
+    fn errors_and_warnings_also_land_in_error_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("logs");
+        let (subscriber, guards) = build(&cfg("info", true), &Sink::File { dir: dir.clone() })
+            .map(|(s, g, _)| (s, g))
+            .unwrap();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "zlogic::engine", "engine info");
+            tracing::warn!(target: "zlogic::llm::retry", "llm slow");
+            tracing::error!(target: "zlogic::policy", "policy denied");
+            tracing::error!(target: "zlogic::daemon::http", "http failed");
+        });
+        drop(guards);
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let day_dir = dir.join(&today);
+        let error = std::fs::read_to_string(day_dir.join("error.log")).unwrap();
+
+        assert!(error.contains("llm slow"), "{error}");
+        assert!(error.contains("policy denied"), "{error}");
+        assert!(error.contains("http failed"), "{error}");
+        assert!(
+            !error.contains("engine info"),
+            "info is not a problem: {error}"
+        );
+
+        // The module files keep their errors — error.log is an extra copy, not a move.
+        let llm = std::fs::read_to_string(day_dir.join("llm.log")).unwrap();
+        let policy = std::fs::read_to_string(day_dir.join("policy.log")).unwrap();
+        assert!(llm.contains("llm slow"), "{llm}");
+        assert!(policy.contains("policy denied"), "{policy}");
+    }
+
+    #[test]
+    fn a_dropped_field_never_reaches_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("logs");
+        let (subscriber, guards) = build(&cfg("info", true), &Sink::File { dir: dir.clone() })
+            .map(|(s, g, _)| (s, g))
+            .unwrap();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "zlogic::engine",
+                text = "the user's bank password is hunter2",
+                api_key = "sk-live-abcdef",
+                session_id = "s-1",
+                "tool started"
+            );
+        });
+        drop(guards);
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let app = std::fs::read_to_string(dir.join(&today).join("app.log")).unwrap();
+
+        assert!(app.contains("tool started"), "{app}");
+        assert!(app.contains("session_id"), "{app}");
+        assert!(!app.contains("hunter2"), "{app}");
+        assert!(!app.contains("sk-live-abcdef"), "{app}");
+    }
+
+    /// One grep has to return the turn, not one line of it. This also pins the error layer's span
+    /// pass-through: a per-layer filter that rejected the INFO-level span made `error.log` lose the
+    /// very `turn_id` an error line most needs.
+    #[test]
+    fn an_in_scope_span_prints_on_every_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("logs");
+        let (subscriber, guards) = build(&cfg("info", true), &Sink::File { dir: dir.clone() })
+            .map(|(s, g, _)| (s, g))
+            .unwrap();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("turn", turn_id = "t-7", session_id = "s-1");
+            let _guard = span.enter();
+            tracing::info!(target: "zlogic::engine", "first thing");
+            tracing::error!(target: "zlogic::engine", "second thing");
+        });
+        drop(guards);
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let day = dir.join(&today);
+        let app = std::fs::read_to_string(day.join("app.log")).unwrap();
+        let error = std::fs::read_to_string(day.join("error.log")).unwrap();
+
+        for (name, text) in [("app", &app), ("error", &error)] {
+            let matched = text
+                .lines()
+                .filter(|line| line.contains("turn{") && line.contains("turn_id="))
+                .count();
+            assert!(matched > 0, "{name} lost the span context:\n{text}");
+        }
+        assert!(
+            app.contains("second thing"),
+            "the error line is also in app.log"
+        );
+    }
+
+    #[test]
     fn daily_writer_rolls_over_on_date_change() {
         use std::io::Write as _;
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("logs");
-        let mut writer = DailyModuleWriter::new(&root, Module::App);
+        let mut writer = DailyModuleWriter::new(&root, "app");
 
         let day_a = chrono::Local::now().format("%Y-%m-%d").to_string();
         writeln!(writer, "first").unwrap();
