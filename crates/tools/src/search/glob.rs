@@ -17,6 +17,7 @@ use zlogic_protocol::llm::ToolDefinition;
 
 use crate::search::CaseMode;
 use crate::search::ignores::Ignores;
+use crate::search::SearchBudgets;
 use crate::{Recovery, Result, Tool, ToolCtx, ToolExecResult, ToolMeta, ToolRisk, parse_args};
 
 const DEFAULT_MAX_RESULTS: usize = 100;
@@ -40,7 +41,22 @@ struct Args {
     max_results: Option<usize>,
 }
 
-pub struct Glob;
+#[derive(Debug, Clone)]
+pub struct Glob {
+    budgets: SearchBudgets,
+}
+
+impl Default for Glob {
+    fn default() -> Self {
+        Self::with_budgets(SearchBudgets::default())
+    }
+}
+
+impl Glob {
+    pub fn with_budgets(budgets: SearchBudgets) -> Self {
+        Self { budgets }
+    }
+}
 
 #[async_trait]
 impl Tool for Glob {
@@ -112,10 +128,19 @@ impl Tool for Glob {
         let mut matches: Vec<(SystemTime, PathBuf)> = Vec::new();
         let mut visited = 0usize;
         let mut capped_walk = false;
+        let mut timed_out = false;
+        // `MAX_VISITED` bounds how many entries a walk may see; this bounds how long it may spend.
+        // Neither subsumes the other — one entry on a cold network share can cost more than a
+        // second — so a walk that trips either reports which one it was.
+        let deadline = self.budgets.deadline();
 
         for entry in ignores.walker(&root).build() {
             if ctx.is_cancelled() {
                 return Ok(ToolExecResult::cancelled("search interrupted"));
+            }
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                timed_out = true;
+                break;
             }
             // An unreadable directory is skipped silently: a permission error deep in a tree is
             // not what the caller asked about, and one such entry must not fail the whole search.
@@ -142,6 +167,16 @@ impl Tool for Glob {
         }
 
         if matches.is_empty() {
+            if timed_out {
+                return Ok(ToolExecResult::success(format!(
+                    "searched part of {} for \"{}\" and stopped at the {}s limit without a match. \
+                     The tree was not fully read, so this is not evidence that nothing matches — \
+                     narrow path and search again",
+                    root.display(),
+                    a.pattern,
+                    self.budgets.timeout.as_secs(),
+                )));
+            }
             return Ok(ToolExecResult::success(format!(
                 "no paths match \"{}\" under {}",
                 a.pattern,
@@ -166,6 +201,12 @@ impl Tool for Glob {
         if capped_walk {
             body.push_str(&format!(
                 " — the walk stopped after {MAX_VISITED} entries, so there may be more"
+            ));
+        }
+        if timed_out {
+            body.push_str(&format!(
+                " — the walk stopped at the {}s limit, so there may be more",
+                self.budgets.timeout.as_secs()
             ));
         }
         body.push_str(":\n");
@@ -201,7 +242,7 @@ mod tests {
     #[tokio::test]
     async fn finds_files_at_any_depth() {
         let (_d, ctx) = setup();
-        let out = Glob
+        let out = Glob::default()
             .execute(&ctx, r#"{"pattern":"**/*.rs"}"#)
             .await
             .unwrap();
@@ -216,7 +257,7 @@ mod tests {
     #[tokio::test]
     async fn a_single_star_stays_within_one_directory() {
         let (_d, ctx) = setup();
-        let out = Glob
+        let out = Glob::default()
             .execute(&ctx, r#"{"pattern":"src/*.rs"}"#)
             .await
             .unwrap();
@@ -235,7 +276,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(d.path().join("src/deep/b.rs"), "touched").unwrap();
 
-        let out = Glob
+        let out = Glob::default()
             .execute(&ctx, r#"{"pattern":"**/*.rs"}"#)
             .await
             .unwrap();
@@ -250,7 +291,7 @@ mod tests {
     #[tokio::test]
     async fn smart_case_and_explicit_case_modes_are_honoured() {
         let (_d, ctx) = setup();
-        let loose = Glob
+        let loose = Glob::default()
             .execute(&ctx, r#"{"pattern":"**/*.RS","case_mode":"insensitive"}"#)
             .await
             .unwrap();
@@ -260,7 +301,7 @@ mod tests {
             loose.model_text()
         );
 
-        let strict = Glob
+        let strict = Glob::default()
             .execute(&ctx, r#"{"pattern":"**/*.RS"}"#)
             .await
             .unwrap();
@@ -274,7 +315,7 @@ mod tests {
     #[tokio::test]
     async fn directories_match_too() {
         let (_d, ctx) = setup();
-        let out = Glob
+        let out = Glob::default()
             .execute(&ctx, r#"{"pattern":"src/deep"}"#)
             .await
             .unwrap();
@@ -291,7 +332,7 @@ mod tests {
         std::fs::create_dir_all(d.path().join("node_modules/pkg")).unwrap();
         std::fs::write(d.path().join("node_modules/pkg/i.rs"), "x").unwrap();
 
-        let default = Glob
+        let default = Glob::default()
             .execute(&ctx, r#"{"pattern":"**/*.rs"}"#)
             .await
             .unwrap();
@@ -301,7 +342,7 @@ mod tests {
             default.model_text()
         );
 
-        let all = Glob
+        let all = Glob::default()
             .execute(&ctx, r#"{"pattern":"**/*.rs","include_ignored":true}"#)
             .await
             .unwrap();
@@ -320,7 +361,7 @@ mod tests {
         std::fs::create_dir(d.path().join("generated")).unwrap();
         std::fs::write(d.path().join("generated/g.rs"), "g").unwrap();
 
-        let default = Glob
+        let default = Glob::default()
             .execute(&ctx, r#"{"pattern":"**/*.rs"}"#)
             .await
             .unwrap();
@@ -330,7 +371,7 @@ mod tests {
             default.model_text()
         );
 
-        let all = Glob
+        let all = Glob::default()
             .execute(&ctx, r#"{"pattern":"**/*.rs","include_ignored":true}"#)
             .await
             .unwrap();
@@ -349,7 +390,7 @@ mod tests {
         std::fs::create_dir(d.path().join("build")).unwrap();
         std::fs::write(d.path().join("build/script.rs"), "s").unwrap();
 
-        let out = Glob
+        let out = Glob::default()
             .execute(&ctx, r#"{"pattern":"**/*.rs"}"#)
             .await
             .unwrap();
@@ -363,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn no_match_is_a_successful_empty_answer() {
         let (_d, ctx) = setup();
-        let out = Glob
+        let out = Glob::default()
             .execute(&ctx, r#"{"pattern":"**/*.zig"}"#)
             .await
             .unwrap();
@@ -378,7 +419,7 @@ mod tests {
         for i in 0..DEFAULT_MAX_RESULTS + 10 {
             std::fs::write(d.path().join(format!("f{i}.txt")), "x").unwrap();
         }
-        let out = Glob.execute(&ctx, r#"{"pattern":"*.txt"}"#).await.unwrap();
+        let out = Glob::default().execute(&ctx, r#"{"pattern":"*.txt"}"#).await.unwrap();
         let text = out.model_text();
         assert!(
             text.contains(&format!("showing the {DEFAULT_MAX_RESULTS}")),
@@ -394,7 +435,7 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_pattern_is_a_failed_result_not_an_err() {
         let (_d, ctx) = setup();
-        let out = Glob
+        let out = Glob::default()
             .execute(&ctx, r#"{"pattern":"[unclosed"}"#)
             .await
             .unwrap();
@@ -405,7 +446,7 @@ mod tests {
     #[tokio::test]
     async fn searching_a_path_that_is_not_a_directory_is_reported() {
         let (_d, ctx) = setup();
-        let out = Glob
+        let out = Glob::default()
             .execute(&ctx, r#"{"pattern":"*","path":"notes.md"}"#)
             .await
             .unwrap();
@@ -417,14 +458,48 @@ mod tests {
     async fn a_cancelled_turn_stops_the_walk() {
         let (_d, ctx) = setup();
         ctx.cancel.cancel();
-        let out = Glob.execute(&ctx, r#"{"pattern":"**/*"}"#).await.unwrap();
+        let out = Glob::default().execute(&ctx, r#"{"pattern":"**/*"}"#).await.unwrap();
         assert_eq!(out.status, ToolExecStatus::Cancelled);
     }
 
     #[tokio::test]
     async fn missing_required_args_are_rejected() {
         let (_d, ctx) = setup();
-        assert!(Glob.execute(&ctx, "{}").await.is_err());
-        assert!(Glob.execute(&ctx, "not json").await.is_err());
+        assert!(Glob::default().execute(&ctx, "{}").await.is_err());
+        assert!(Glob::default().execute(&ctx, "not json").await.is_err());
+    }
+
+    fn expired() -> Glob {
+        Glob::with_budgets(SearchBudgets {
+            timeout: std::time::Duration::from_nanos(1),
+        })
+    }
+
+    /// Same rule as grep: an abandoned walk that found nothing must not read as "nothing there".
+    #[tokio::test]
+    async fn a_walk_that_ran_out_of_budget_does_not_say_nothing_matches() {
+        let (_d, ctx) = setup();
+        let out = expired()
+            .execute(&ctx, r#"{"pattern":"**/*.rs"}"#)
+            .await
+            .unwrap();
+        let text = out.model_text();
+        assert!(!text.contains("no paths match"), "{text}");
+        assert!(text.contains("not fully read"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_zero_budget_is_off_rather_than_instantly_expired() {
+        let (_d, ctx) = setup();
+        let unlimited = Glob::with_budgets(SearchBudgets {
+            timeout: std::time::Duration::ZERO,
+        });
+        let out = unlimited
+            .execute(&ctx, r#"{"pattern":"**/*.rs"}"#)
+            .await
+            .unwrap();
+        let text = slash(&out.model_text());
+        assert!(text.contains("src/a.rs"), "{text}");
+        assert!(!text.contains("limit"), "an off budget must not be reported: {text}");
     }
 }
