@@ -21,12 +21,16 @@
 //! settings page applies to the very next search. Freezing it turns "I just entered a key" into
 //! "still on the free tier, still rate limited", which is one restart away from being wrong in a
 //! way nothing in the transcript explains.
+//! # So is the provider, and the endpoints
+//! The chosen backend, the URLs and the timeout sit behind the same latch ([`WebSearch::apply_config`]),
+//! pushed by every config save. A frozen provider is the same bug one step further out: the
+//! settings page shows "parallel", the model keeps calling Exa, and the transcript blames the quota.
 //! # The query leaves this machine
 //! Unavoidably: that is what a search tool does. Worth stating because it is the one thing here a
 //! user might not expect — the query text (not the workspace, not any file) goes to the configured
 //! backend, keyless by default at their free tier.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -184,7 +188,7 @@ struct Args {
 }
 
 pub struct WebSearch {
-    settings: WebSearchSettings,
+    settings: RwLock<WebSearchSettings>,
 }
 
 impl Default for WebSearch {
@@ -195,7 +199,38 @@ impl Default for WebSearch {
 
 impl WebSearch {
     pub fn new(settings: WebSearchSettings) -> Self {
-        Self { settings }
+        Self { settings: RwLock::new(settings) }
+    }
+
+    /// A copy taken per call, so no guard is ever held across an await.
+    fn snapshot(&self) -> WebSearchSettings {
+        self.settings
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Applies the fields a config save owns. The key source and the pinned keys are left alone on
+    /// purpose: they are consulted through the credential chain on every call, so rewriting them
+    /// here would be a no-op at best and a lost key at worst.
+    pub fn apply_config(
+        &self,
+        provider: Option<SearchProvider>,
+        exa_url: Option<String>,
+        parallel_url: Option<String>,
+        timeout: Option<Duration>,
+    ) {
+        let defaults = WebSearchSettings::default();
+        let mut guard = self
+            .settings
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.provider = provider;
+        guard.exa_url = exa_url.unwrap_or(defaults.exa_url);
+        guard.parallel_url = parallel_url.unwrap_or(defaults.parallel_url);
+        if let Some(timeout) = timeout {
+            guard.timeout = timeout;
+        }
     }
 }
 
@@ -213,7 +248,7 @@ impl Tool for WebSearch {
     }
 
     fn definition(&self) -> ToolDefinition {
-        let provider = self.settings.resolve_provider();
+        let provider = self.snapshot().resolve_provider();
         let properties = match provider {
             SearchProvider::Exa => json!({
                 "query": {
@@ -280,23 +315,24 @@ impl Tool for WebSearch {
             )));
         }
 
-        let provider = self.settings.resolve_provider();
-        let key = self.settings.key_for(provider);
+        let settings = self.snapshot();
+        let provider = settings.resolve_provider();
+        let key = settings.key_for(provider);
         let (url, body, auth) = match provider {
             SearchProvider::Exa => (
-                exa_url(&self.settings.exa_url, key.as_deref()),
+                exa_url(&settings.exa_url, key.as_deref()),
                 exa_body(query, &a),
                 None,
             ),
             SearchProvider::Parallel => (
-                self.settings.parallel_url.clone(),
+                settings.parallel_url.clone(),
                 parallel_body(query, &ctx.session_id.to_string()),
                 key,
             ),
         };
 
         let client = match reqwest::Client::builder()
-            .timeout(self.settings.timeout)
+            .timeout(settings.timeout)
             .user_agent("zlogic/0.1 (web_search)")
             .build()
         {
@@ -334,7 +370,7 @@ impl Tool for WebSearch {
                     "the {} search backend did not respond within {}s. Try again, or a narrower \
                      query — `deep` mode and `fresh` are both slow.",
                     provider.label(),
-                    self.settings.timeout.as_secs()
+                    settings.timeout.as_secs()
                 )));
             }
             Err(e) => {
@@ -596,6 +632,49 @@ mod tests {
 
         keys.set(SearchProvider::Exa, None);
         assert_eq!(settings.key_for(SearchProvider::Exa), None);
+    }
+
+    /// The bug this latch exists for: the settings page says `parallel`, and without it the model
+    /// keeps calling Exa until the app restarts.
+    #[test]
+    fn a_backend_changed_after_registration_is_used_on_the_next_call() {
+        let keys = Arc::new(MutableKeys::default());
+        keys.set(SearchProvider::Exa, Some("e-key"));
+        let tool = WebSearch::new(WebSearchSettings {
+            key_source: Some(keys),
+            ..Default::default()
+        });
+        assert_eq!(tool.snapshot().resolve_provider(), SearchProvider::Exa);
+
+        tool.apply_config(Some(SearchProvider::Parallel), None, None, None);
+        assert_eq!(
+            tool.snapshot().resolve_provider(),
+            SearchProvider::Parallel,
+            "a configured backend outranks the key that is present, without a restart"
+        );
+
+        tool.apply_config(None, None, None, None);
+        assert_eq!(
+            tool.snapshot().resolve_provider(),
+            SearchProvider::Exa,
+            "unsetting the provider returns to auto, which picks the side that has a key"
+        );
+
+        tool.apply_config(
+            Some(SearchProvider::Exa),
+            Some("http://127.0.0.1:1/exa".into()),
+            Some("http://127.0.0.1:1/parallel".into()),
+            Some(Duration::from_secs(3)),
+        );
+        let applied = tool.snapshot();
+        assert_eq!(applied.exa_url, "http://127.0.0.1:1/exa");
+        assert_eq!(applied.parallel_url, "http://127.0.0.1:1/parallel");
+        assert_eq!(applied.timeout, Duration::from_secs(3));
+        assert_eq!(
+            applied.key_for(SearchProvider::Exa),
+            Some("e-key".to_string()),
+            "the key source survives a config push; it is not a config-owned field"
+        );
     }
 
     #[test]

@@ -42,6 +42,9 @@ pub struct Config {
     /// the bypass flag and the network settings — is what makes the panel's switch take effect
     /// without asking the user to restart the app.
     checkpoints: Option<Arc<zlogic_checkpoints::Checkpoints>>,
+    /// The one tool whose registration cannot be redone per turn, so it is republished here instead.
+    /// Absent in a headless run, where nothing asks for the backend to change.
+    web_search: Option<Arc<zlogic_tools::WebSearch>>,
     /// Reports are asked for far more often than the usage rows change; see
     /// [`crate::usage_cache`].
     usage_reports: crate::usage_cache::ReportCache,
@@ -66,12 +69,18 @@ impl Config {
             store,
             workspaces,
             checkpoints: None,
+            web_search: None,
             usage_reports: crate::usage_cache::ReportCache::new(),
         }
     }
 
     pub fn with_checkpoints(mut self, store: Arc<zlogic_checkpoints::Checkpoints>) -> Self {
         self.checkpoints = Some(store);
+        self
+    }
+
+    pub fn with_web_search(mut self, tool: Arc<zlogic_tools::WebSearch>) -> Self {
+        self.web_search = Some(tool);
         self
     }
 
@@ -119,6 +128,17 @@ impl Config {
                 max_file_bytes: c.max_file_mb * 1024 * 1024,
                 max_files: c.max_files as usize,
             });
+        }
+        if let Some(tool) = &self.web_search {
+            let w = &cfg.tools.web_search;
+            tool.apply_config(
+                w.provider_id()
+                    .as_deref()
+                    .and_then(zlogic_tools::SearchProvider::parse),
+                w.exa_url.clone(),
+                w.parallel_url.clone(),
+                (w.timeout_secs > 0).then(|| std::time::Duration::from_secs(w.timeout_secs)),
+            );
         }
     }
 

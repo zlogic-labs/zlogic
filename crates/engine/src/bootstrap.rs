@@ -339,6 +339,7 @@ impl Engine {
             mut tools,
             shell,
             search,
+            web_search,
             warnings: mut tool_warnings,
         } = tool_registry(
             &config,
@@ -582,6 +583,7 @@ impl Engine {
             .with_router(router.clone())
             .with_env_global(env_global.clone())
             .with_checkpoints(checkpoints.clone())
+            .with_web_search(web_search)
             .with_transport(transport.clone()),
         );
         let env_service = Arc::new(crate::env::EnvLayers::new(
@@ -696,6 +698,9 @@ pub(crate) struct BuiltinTools {
     /// per workspace exactly as it does the shell. Built from the same registry value that was
     /// registered, so what a turn runs is what a workspace override replaces.
     pub search: SearchTools,
+    /// Handed to `Config` so a settings save reaches the registered instance — the registry itself
+    /// is built once and never rebuilt, which would leave a changed backend frozen until restart.
+    pub web_search: Arc<zlogic_tools::WebSearch>,
     pub warnings: Vec<String>,
 }
 
@@ -770,7 +775,8 @@ pub(crate) fn tool_registry(
         settings.timeout = std::time::Duration::from_secs(cfg.timeout_secs);
     }
 
-    registry.add(Arc::new(zlogic_tools::WebSearch::new(settings)));
+    let web_search = Arc::new(zlogic_tools::WebSearch::new(settings));
+    registry.add(web_search.clone());
 
     // The built-in source registered default-budget copies of the three walking tools; replace them
     // with the configured ones so a single `tools.search_timeout_secs` governs all of them.
@@ -781,6 +787,7 @@ pub(crate) fn tool_registry(
         tools: registry,
         shell,
         search,
+        web_search,
         warnings,
     }
 }
