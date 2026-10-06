@@ -1,21 +1,19 @@
-# macOS build of the OSS CLI — built from the public repository's own source only.
+# macOS build of the OSS CLI — built from this repository's own source only.
 #
-# Why it lives in the public repository rather than the private one: the `-no-daemon` binary is
-# exactly what `cargo install zlogic` from crates.io puts on a machine, and its source is 100%
-# in this repository. Building it here has three benefits:
+# The `-no-daemon` binary is exactly what `cargo install zlogic` from crates.io puts on a
+# machine, and its source is 100% in this repository. Building it here buys three things:
 #
-#   - **Actions minutes are free for a public repository** (standard runners on a public repo do
-#     not count against a quota), so it does not burn the private repo's allowance;
-#   - it stays off the release critical path — it only waits for its own version-number PR to
-#     merge, not for the private repo's PR;
-#   - the artifact is traceable to a specific run of the public repository, which is more
-#     auditable than "built by closed-source CI, claimed to equal the public source".
+#   - **Actions minutes are free for a public repository** (standard runners on a public repo
+#     do not count against a quota);
+#   - it stays off the release critical path — it only waits for its own version-number PR
+#     to merge;
+#   - the artifact is traceable to a specific run of this repository.
 #
 # **A secret must never appear in this workflow.** A public repository's Actions context can
 # read every env value and every input written in the workflow; putting a signing private key
-# here is the worst case. For the same reason, never check out any private repository — this
-# binary does not depend on a closed crate by definition, and if a private path dependency is
-# ever added, this will fail to compile loudly, which is exactly the failure we want.
+# here is the worst case. For the same reason, check out nothing but this repository: a path
+# dependency on a crate that is not in here fails to compile loudly, which is exactly the
+# failure we want.
 #
 # Manual trigger (the release script does it for you):
 #   gh workflow run build-oss-cli.yml --ref main
@@ -62,8 +60,7 @@ jobs:
           targets: ${{ matrix.rust_target }}
 
       # The default `. -> target` is exactly right for this repository: the repo root **is**
-      # that workspace. (In the private repository the same build has to point at oss-target/,
-      # which is outside the default range, so it is a cold compile every time.)
+      # that workspace.
       - uses: Swatinem/rust-cache@v2
 
       - name: Build

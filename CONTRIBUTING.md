@@ -3,8 +3,8 @@
 ## Scope of this repository
 
 This repository is the CLI and the agent runtime (Apache-2.0). The desktop app, the remote-access
-daemon and the closed-source tool packs are developed in a separate, private repository and are
-built on top of the crates here — nothing in this tree may depend on them. See the
+daemon and the closed-source tool packs live outside this tree and are built on top of the crates
+here — nothing in this tree may depend on them. See the
 [README](README.md#open-source-and-what-is-not) for the boundary.
 
 ## Setup

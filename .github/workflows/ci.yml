@@ -9,8 +9,7 @@
 # never reports because the workflow was skipped.
 #
 # Read-only, no secrets, no artifacts: this answers "is it formatted, does it compile, do the
-# tests pass". Packaging the shipped binary happens in the private repository that welds this
-# tree together with the daemon.
+# tests pass". Packaging a shipped binary is not this workflow's job.
 
 name: CI
 
