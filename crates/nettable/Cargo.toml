@@ -24,7 +24,8 @@ license.workspace = true
 [dependencies]
 
 [target.'cfg(windows)'.dependencies]
-# 停在 `0.61`：Tauri 那一侧尚未迁移，两代 `windows` 并存会把同一套生成绑定编两遍。
+# Stays on `0.61`: the Tauri side has not migrated yet, and having both generations of `windows`
+# side by side compiles the same set of generated bindings twice.
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",

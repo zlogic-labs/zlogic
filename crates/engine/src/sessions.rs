@@ -416,9 +416,12 @@ impl Sessions {
              * answer to a question nobody asked. A notification injected later (the turn was
              * already replying) is left to the detail — the turn was not woken by it. */
             let mut wakes: Vec<TurnWake> = Vec::new();
-            /* 这一轮写了几段正文。`detail_kinds` 里没有 Text：纯问答的轮除了答复没有过程，
-               但模型仍可能先写一段叙述再写答复（没有工具调用时就是这样）—— 只剩一段时折叠行
-               已经把它全画出来了，多于一段时折叠行就该有「展开详情」的入口。 */
+            /* How many prose segments this round wrote. There is no `Text` in `detail_kinds`: a
+               plain question-and-answer round has no process beyond the reply, but the model may
+               still write a narrative first and the reply after (that is exactly what happens
+               when there are no tool calls) — with a single segment left the collapsed row has
+               already drawn all of it, so with more than one it needs an "expand details" entry
+               point. */
             let mut text_segments = 0usize;
             let mut before_any_content = true;
             for entry in entries {
@@ -484,9 +487,11 @@ impl Sessions {
                             summary_tokens: *summary_tokens,
                         });
                     }
-                    /* 非最终答复的正文段（工具调用之间的那些叙述）：也算"这一轮写过文字"，
-                       否则一段纯叙述会被最终答复那一条盖掉。必须放在上面那条 `if is_final`
-                       之后 —— 反过来会让它永远匹配不到。 */
+                    /* A prose segment that is not the final reply (the narration between tool
+                       calls): it still counts as "this round wrote text", otherwise a purely
+                       narrative segment would get covered up by the final-reply entry. This arm
+                       has to sit **after** that `if is_final` above — put it first and it would
+                       never match. */
                     TranscriptBody::Text { .. } => text_segments += 1,
                     _ => {}
                 }

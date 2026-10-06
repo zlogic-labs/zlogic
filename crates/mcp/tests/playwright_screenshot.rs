@@ -1,12 +1,12 @@
-//! 端到端验证：真的起一个 playwright MCP server，`browser_take_screenshot` 的结果必须是
-//! image kind。
+//! End-to-end verification: really start a playwright MCP server, and require that
+//! `browser_take_screenshot` returns an image kind.
 //!
-//! 单元测试用的是构造出来的字节；这里走完整链路 —— `Catalog` 真的 spawn 出 `npx` 子进程、
-//! 真的握手、真的发 `tools/call`，再断言 `zlogic_mcp::content::to_result` 把返回的图片变成了
-//! `ToolDisplay::Image`。
+//! The unit tests work from hand-built bytes; this walks the whole chain — `Catalog` really
+//! spawns an `npx` child process, really handshakes, really sends `tools/call`, then asserts
+//! that `zlogic_mcp::content::to_result` turns the image it returns into `ToolDisplay::Image`.
 //!
-//! 需要 `npx` 和 playwright 的 chromium。缺了就跳过：CI 上没有浏览器是常态，让它红没有意义。
-//! 设置 `ZLOGIC_PLAYWRIGHT_E2E=1` 才会尝试。
+//! Needs `npx` and playwright's chromium. Skipped when they are missing: CI having no browser
+//! is the norm, so turning red there means nothing. Set `ZLOGIC_PLAYWRIGHT_E2E=1` to opt in.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

@@ -14,8 +14,9 @@ tokio = { workspace = true, features = ["process", "time"] }
 # `process-wrap` owns the Win32 job-object FFI, which this workspace forbids writing directly.
 # The feature set is exactly what the two platforms need — job object on Windows, process
 # group on Unix — so the process-session and tracing wrappers stay off.
-# `process-wrap` 从 10 起、从 9.0.1 起都要求 `windows ^0.62`，而 Tauri 那一侧仍在 0.61；
-# 两代并存会把同一套生成绑定编两遍。`=` 是必要的 —— `~9.0.0` 仍会选到 9.0.1。
+# `process-wrap` requires `windows ^0.62` from version 10 onwards, and so does 9.0.1, while the
+# Tauri side is still on 0.61; having both generations compiles the same set of generated
+# bindings twice. `=` is necessary — `~9.0.0` would still pick 9.0.1.
 process-wrap = { version = "=9.0.0", default-features = false, features = [
     "tokio1",
     "creation-flags",

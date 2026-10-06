@@ -1,21 +1,27 @@
-# OSS 版 CLI 的 macOS 构建 —— 只用公开仓自己的源码。
+# macOS build of the OSS CLI — built from the public repository's own source only.
 #
-# 为什么它住在公开仓而不是私有仓：`-no-daemon` 那个二进制就是 crates.io 上 `cargo install
-# zlogic` 装到的东西，源码 100% 在这个仓里。放在这里编有三个好处：
+# Why it lives in the public repository rather than the private one: the `-no-daemon` binary is
+# exactly what `cargo install zlogic` from crates.io puts on a machine, and its source is 100%
+# in this repository. Building it here has three benefits:
 #
-#   - **公开仓的 Actions 分钟免费**（标准 runner 对公开仓不计入额度），不烧私有仓的配额；
-#   - 不占发版关键路径 —— 它只等自己的版本号 PR 合入，不用等私有仓那个 PR；
-#   - 产物可追溯到公开仓的某个 run，比"闭源 CI 编出来的、声称等于公开源码"更可审计。
+#   - **Actions minutes are free for a public repository** (standard runners on a public repo do
+#     not count against a quota), so it does not burn the private repo's allowance;
+#   - it stays off the release critical path — it only waits for its own version-number PR to
+#     merge, not for the private repo's PR;
+#   - the artifact is traceable to a specific run of the public repository, which is more
+#     auditable than "built by closed-source CI, claimed to equal the public source".
 #
-# **这个 workflow 里永远不要出现 secret。** 公开仓的 Actions context 拿得到 workflow 里
-# 写的每一个 env 和每一个 input；签名私钥放进来是最坏的情况。同理不要 checkout 任何
-# 私有仓 —— 这个二进制按定义不依赖闭源 crate，将来真加了私有 path 依赖，这里会响亮地
-# 编译失败，那正是我们想要的失败方式。
+# **A secret must never appear in this workflow.** A public repository's Actions context can
+# read every env value and every input written in the workflow; putting a signing private key
+# here is the worst case. For the same reason, never check out any private repository — this
+# binary does not depend on a closed crate by definition, and if a private path dependency is
+# ever added, this will fail to compile loudly, which is exactly the failure we want.
 #
-# 手动触发（发版脚本会代劳）：
+# Manual trigger (the release script does it for you):
 #   gh workflow run build-oss-cli.yml --ref main
 #
-# 产物名 zlogic-oss-macos-latest-{arch} 被 scripts/release/stages/build.mjs 按名下载。
+# The artifact name zlogic-oss-macos-latest-{arch} is what scripts/release/stages/build.mjs
+# downloads by name.
 
 name: Build OSS CLI
 
@@ -37,8 +43,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # aarch64 原生、x86_64 交叉编译；两个条目并行，所以总时长取决于交叉编译那一条。
-        # 换更大的 runner 要 GitHub Team/Enterprise，且不能用赠送额度 —— 见 README。
+        # aarch64 native, x86_64 cross-compiled; the two entries run in parallel, so the
+        # total wall clock is whatever the cross-compile costs. A larger runner needs GitHub
+        # Team/Enterprise and cannot use free credits — see the README.
         include:
           - os: macos-latest
             artifact_arch: aarch64
@@ -47,15 +54,16 @@ jobs:
             artifact_arch: x86_64
             rust_target: x86_64-apple-darwin
     steps:
-      # 不带 submodules: —— 这个仓没有 submodule，也不该有。
+      # No `submodules:` — this repository has no submodule, and should not have one.
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_target }}
 
-      # 默认的 `. -> target` 对这个仓就是对的：仓根**就是**那个 workspace。
-      # （私有仓里同样的构建要指到 oss-target/，不在默认范围内，每次都是冷编译。）
+      # The default `. -> target` is exactly right for this repository: the repo root **is**
+      # that workspace. (In the private repository the same build has to point at oss-target/,
+      # which is outside the default range, so it is a cold compile every time.)
       - uses: Swatinem/rust-cache@v2
 
       - name: Build

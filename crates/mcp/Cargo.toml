@@ -39,8 +39,9 @@ base64 = "0.22.1"
 http = "1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider"] }
 url = "2.5"
-# `=` 钉在 3.2.0：3.3.0 起改要 `process-wrap ^10`，那一版要求 `windows ^0.62`，依赖图就会分裂成
-# 两代 `windows`。解除钉住之前先确认 Tauri 侧已经迁移。
+# `=` pinned to 3.2.0: from 3.3.0 onwards it needs `process-wrap ^10`, and that version requires
+# `windows ^0.62`, which would split the dependency graph into two generations of `windows`.
+# Confirm the Tauri side has migrated before unpinning.
 rmcp = { version = "=3.2.0", default-features = false, features = [
     "client",
     "auth",
