@@ -10,13 +10,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
+use tracing::Instrument;
 use zlogic_core::{
     CancellationToken, Core, CoreServices, CoreSpawner, EventSink, SharedStore, TurnInput, TurnPlan,
 };
 use zlogic_hooks::HookRunner;
 use zlogic_objects::ObjectId;
 use zlogic_protocol::input::{Delivery as InputDelivery, MessagePart};
-use zlogic_protocol::query::{ApiResult, PendingInteraction, TurnPhase, TurnState};
+use zlogic_protocol::query::{ApiResult, PendingInteraction, SessionForkReq, TurnPhase, TurnState};
 use zlogic_protocol::stream::{
     NoticeLevel, StateChange, StateNotice, StreamEvent, TurnStats, TurnStatus,
 };
@@ -233,6 +234,10 @@ pub struct Dispatcher {
     /// would probe the platform again and could land on a different backend than the registry's,
     /// so the tool, its definition text and the policy dialect would disagree.
     shell: Option<zlogic_tools::Shell>,
+    /// The walking tools bootstrap resolved, carried so a workspace can rebudget them. Same reason
+    /// as the shell: the registry's copies are the ones a turn runs, so the override replaces them
+    /// rather than editing the config the registry was already built from.
+    search: Option<zlogic_tools::SearchTools>,
 }
 
 #[derive(Default)]
@@ -291,6 +296,7 @@ impl Dispatcher {
             auxiliary: None,
             dirs: None,
             shell: None,
+            search: None,
         }
     }
 
@@ -301,6 +307,11 @@ impl Dispatcher {
 
     pub fn with_shell(mut self, shell: zlogic_tools::Shell) -> Self {
         self.shell = Some(shell);
+        self
+    }
+
+    pub fn with_search_tools(mut self, search: zlogic_tools::SearchTools) -> Self {
+        self.search = Some(search);
         self
     }
 
@@ -529,36 +540,63 @@ impl Dispatcher {
         root: &Path,
     ) -> (zlogic_tools::ToolRegistry, Vec<String>) {
         let mut tools = tools.unwrap_or_else(|| self.services.tools.clone());
-        let warnings = self.apply_workspace_shell(&mut tools, root);
+        let mut warnings = self.apply_workspace_shell(&mut tools, root);
+        warnings.extend(self.workspace_env_warnings(root));
         (tools, warnings)
     }
 
-    /// Swaps in a copy of the shell tool carrying this workspace's budgets. Returns the reasons a
-    /// workspace's numbers were not used, so the caller can tell the user instead of leaving them
-    /// to find out when a suite is killed at the default.
+    /// Names this workspace declared that the rules will not let it contribute.
+    ///
+    /// A repository's `settings.yaml` arrives with `git clone`, so a variable in it defines the
+    /// environment of every command anyone runs in that repository. The rules in
+    /// [`crate::env::reject_reason`] are what stand between that and a redirected loader, and a
+    /// refusal the user never hears about is a `settings.yaml` that looks right and does nothing.
+    fn workspace_env_warnings(&self, root: &Path) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let env = crate::shell_budgets::load_env(root, &mut warnings);
+        for (name, reason) in
+            crate::env::rejections(&env, zlogic_protocol::settings::EnvScope::Workspace)
+        {
+            warnings.push(format!(
+                "workspace variable {name} was not applied: {reason} \
+                 (edit {}/.zlogic/settings.yaml)",
+                root.display()
+            ));
+        }
+        warnings
+    }
+
+    /// Swaps in copies of the shell and search tools carrying this workspace's budgets. Returns the
+    /// reasons a workspace's numbers were not used, so the caller can tell the user instead of
+    /// leaving them to find out when a suite is killed at the default.
     fn apply_workspace_shell(
         &self,
         tools: &mut zlogic_tools::ToolRegistry,
         root: &Path,
     ) -> Vec<String> {
-        let Some(shell) = &self.shell else {
-            return Vec::new();
-        };
         let (overrides, mut warnings) = crate::shell_budgets::load(root);
-        let Some(overrides) = overrides else {
-            return warnings;
-        };
-        let merged = overrides.apply(&self.router.config().tools.shell);
-        if let Err(error) = merged.validate() {
-            warnings.push(format!(
-                "shell budgets in {}/.zlogic/settings.yaml are inconsistent and were not applied: \
-                 {error}",
-                root.display()
-            ));
-            return warnings;
+        if let Some(shell) = &self.shell
+            && let Some(shell_overrides) = overrides.shell
+        {
+            let merged = shell_overrides.apply(&self.router.config().tools.shell);
+            if let Err(error) = merged.validate() {
+                warnings.push(format!(
+                    "shell budgets in {}/.zlogic/settings.yaml are inconsistent and were not \
+                     applied: {error}",
+                    root.display()
+                ));
+            } else {
+                tools.add(Arc::new(shell.with_budgets(zlogic_tools::ShellBudgets::from(&merged))));
+            }
         }
-        let budgets = zlogic_tools::ShellBudgets::from(&merged);
-        tools.add(Arc::new(shell.with_budgets(budgets)));
+        if self.search.is_some()
+            && let Some(search_overrides) = overrides.search
+        {
+            let budgets = search_overrides.apply(&zlogic_tools::SearchBudgets::from(
+                &self.router.config().tools,
+            ));
+            zlogic_tools::SearchTools::with_budgets(budgets).register(tools);
+        }
         warnings
     }
 
@@ -569,7 +607,11 @@ impl Dispatcher {
             .into_iter()
             .map(|message| zlogic_core::PlanNotice {
                 level: NoticeLevel::Warn,
-                code: "shell_budgets_ignored".into(),
+                code: if message.starts_with("workspace variable ") {
+                    "workspace_env_ignored".into()
+                } else {
+                    "shell_budgets_ignored".into()
+                },
                 message,
                 args: Default::default(),
             })
@@ -582,6 +624,7 @@ impl Dispatcher {
         tools: Option<&zlogic_tools::ToolRegistry>,
         workspace_id: WorkspaceId,
         session_id: SessionId,
+        turn_id: TurnId,
         root: &Path,
         exec_cwd: &Path,
         unavailable_mcp: &[String],
@@ -638,6 +681,7 @@ impl Dispatcher {
         plan.system = prompts.build(crate::PromptRequest {
             workspace_id,
             session_id: Some(session_id),
+            turn_id: Some(turn_id),
             root,
             exec_cwd,
             tools: &names,
@@ -746,6 +790,7 @@ impl Dispatcher {
                 tools.as_ref(),
                 workspace_id,
                 session_id,
+                turn_id,
                 &root,
                 &exec_dir,
                 &unavailable_mcp,
@@ -961,13 +1006,23 @@ impl Dispatcher {
         let skill_library = self.skills.clone();
         let exec_dir = target_dir.clone();
         let next_dispatch = self.clone();
-        tokio::spawn(async move {
-            tracing::info!(
-                target: "zlogic::engine",
-                %session_ref,
-                %turn_id,
-                "turn task started"
-            );
+        // Everything this turn logs lands under one span, so a single `grep turn_id=` returns the
+        // turn instead of the one line that happened to name it. Without it every line in
+        // `error.log` is unattributed and a bug report has nothing to quote back.
+        let turn_span = tracing::info_span!(
+            target: "zlogic::engine",
+            "turn",
+            session_id = %session_id.to_string(),
+            turn_id = %turn_id.to_string(),
+        );
+        tokio::spawn(
+            async move {
+                tracing::info!(
+                    target: "zlogic::engine",
+                    %session_ref,
+                    %turn_id,
+                    "turn task started"
+                );
             let mut plan = plan;
             let mut unavailable_mcp: Vec<String> = Vec::new();
             let assembled = match &extensions {
@@ -993,15 +1048,37 @@ impl Dispatcher {
             plan.notices.extend(Self::shell_notices(shell_warnings));
             let tools = Some(tools);
 
+            // Read from the router's snapshot, which `Config::reload_inner` replaces on every save:
+            // the setting lives in config.yaml and the next turn picks it up without a restart.
+            let plan_mode = next_dispatch.router.config().session.plan_mode;
+            if plan_mode
+                && let Some(registry) = tools.as_ref()
+            {
+                plan.tools_allow = Some(read_only_intersection(
+                    plan.tools_allow.take(),
+                    registry.read_only_names(),
+                ));
+            }
+
             next_dispatch.assemble_turn_prompt(
                 &mut plan,
                 tools.as_ref(),
                 workspace_id,
                 session_id,
+                turn_id,
                 &root,
                 &exec_dir,
                 &unavailable_mcp,
             );
+            // After the assembly, which assigns `plan.system` outright. Read off the narrowed
+            // allowlist rather than the config: `assemble_turn_prompt` is what decides the model can
+            // see a given tool, and this section has to describe what it actually sees.
+            if plan_mode {
+                plan.system.push(plan_mode_section(
+                    plan.tools_allow.as_deref().unwrap_or_default(),
+                    tools.as_ref(),
+                ));
+            }
 
             let budget = Arc::new(next_dispatch.turn_budget(&root, session_id, &mut plan));
             plan.budget = Some(budget.clone());
@@ -1191,7 +1268,9 @@ impl Dispatcher {
                     .arg("error", error.to_string()),
                 );
             }
-        });
+            }
+            .instrument(turn_span),
+        );
 
         Ok(Some(turn_id))
     }
@@ -1288,6 +1367,8 @@ mod tests {
             interaction: None,
             tasks: None,
             runtime_paths: None,
+            env: None,
+            computer: None,
             model_resolver: None,
             limits: zlogic_core::Limits::default(),
             context: zlogic_core::ContextPolicy::default(),
@@ -1558,6 +1639,9 @@ impl crate::task::ScheduledAgentFactory for Dispatcher {
             system = prompts.build(crate::PromptRequest {
                 workspace_id,
                 session_id: Some(parent_session_id),
+                // A sub-agent's turn id is minted by the spawner, after this prompt exists, so
+                // there is no folder to name. Its own turns name theirs.
+                turn_id: None,
                 root: &root,
                 exec_cwd: cwd.map_or(root.as_path(), std::path::Path::new),
                 tools: &names,
@@ -2119,35 +2203,16 @@ impl TurnService for Dispatcher {
                 let session: SessionId = session_id.parse().map_err(|_| {
                     EngineError::Invalid(format!("invalid session id: {session_id}"))
                 })?;
-                let forked = self
-                    .store
-                    .with(|db| {
-                        let src = db.sessions().get(session)?;
-                        let mut new = zlogic_store::NewSession::root(src.workspace_id);
-                        new.exec_cwd = src.exec_cwd.clone();
-                        new.model_ref = src.model_ref.clone();
-                        new.effort = src.effort.clone();
-                        let created = db.sessions().create(new)?;
-                        db.entries().copy_through(
-                            session,
-                            created.session_id,
-                            keep_through_turn as i64,
-                        )?;
-                        if let Some(title) = &src.title {
-                            db.sessions().set_title(
-                                created.session_id,
-                                &format!("{title} (fork)"),
-                                zlogic_store::TitleSource::User,
-                            )?;
-                        }
-                        Ok::<_, zlogic_store::StoreError>(created)
-                    })
-                    .map_err(EngineError::from)?;
-                self.hub.notify(StateNotice {
-                    session_id: forked.session_id.to_string(),
-                    turn_id: None,
-                    change: StateChange::TurnStateChanged,
-                });
+                // Same routine the `session_fork` op runs, minus the summary: a command has
+                // nowhere to return it, which is why hosts that need the new id call the op.
+                crate::sessions::Sessions::fork_session(
+                    &self.store,
+                    &self.hub,
+                    &SessionForkReq {
+                        session_id: session,
+                        keep_through_turn,
+                    },
+                )?;
                 Ok(())
             }
         }
@@ -2196,6 +2261,50 @@ fn is_blank(part: &MessagePart) -> bool {
 
 fn normalize_mime(value: &str) -> String {
     zlogic_tools::normalize_mime(value)
+}
+
+/// Plan mode's tool set: the workspace's own capability boundary narrowed to what only reads.
+/// A `None` boundary (every tool allowed) becomes the read-only set rather than staying `None` —
+/// leaving it `None` would hand plan mode every tool.
+///
+/// Narrowing rather than replacing: a workspace that already forbids a read-only tool still
+/// forbids it here.
+fn read_only_intersection(workspace: Option<Vec<String>>, read_only: Vec<String>) -> Vec<String> {
+    match workspace {
+        Some(allow) => allow
+            .into_iter()
+            .filter(|name| read_only.contains(name))
+            .collect(),
+        None => read_only,
+    }
+}
+
+/// The system-prompt section for a plan-mode turn.
+///
+/// Names the tools the turn actually has rather than promising "read-only" in the abstract: the
+/// model has to plan with the affordances it was given, and listing them is what makes the plan
+/// checkable against what it could actually have done itself.
+fn plan_mode_section(visible: &[String], registry: Option<&zlogic_tools::ToolRegistry>) -> String {
+    let available = registry
+        .map(|registry| registry.available_names())
+        .unwrap_or_default();
+    let names: Vec<&str> = visible
+        .iter()
+        .filter(|name| available.contains(name))
+        .map(String::as_str)
+        .collect();
+    let mut text = String::from(
+        "<plan_mode>\n\
+         Plan mode is on. This turn only reads: the tools that could change a file, run a command, \
+         or otherwise alter the workspace are not available to you, and nothing you say can change \
+         anything. Investigate as far as you need to, then propose the change — what to do, where, \
+         and why — and let the user carry it out or turn plan mode off.\n",
+    );
+    if !names.is_empty() {
+        text.push_str(&format!("Tools available this turn: {}.\n", names.join(", ")));
+    }
+    text.push_str("</plan_mode>");
+    text
 }
 
 fn attachment_name_with_extension(name: &str, mime_type: &str) -> String {

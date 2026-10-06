@@ -48,7 +48,7 @@ Verifying a download (SHA-256 / minisign): [Verify downloads](https://zlogic.run
 ### Build from source
 
 ```sh
-cargo build --release -p zlogic-cli    # target/release/zlogic
+cargo build --release -p zlogic    # target/release/zlogic
 cargo test --workspace
 ```
 
@@ -151,8 +151,8 @@ Starting smaller? Adding a tool is the most direct entry point, adding a provide
 No Node, no Python, no vendored toolchain — a recent stable Rust is all you need.
 
 ```sh
-cargo build --release -p zlogic-cli
-cargo run -p zlogic-cli -- --prompt "hello"
+cargo build --release -p zlogic
+cargo run -p zlogic -- --prompt "hello"
 cargo test --workspace
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked

@@ -131,12 +131,11 @@ impl Extensions {
         config: PoolConfig,
         limits: zlogic_mcp::catalog::RefreshLimits,
     ) -> Arc<Self> {
-        let pool = Arc::new(McpPool::new(config));
+        let catalog_dirs = CatalogDirs::under(dirs);
+        let pool = Arc::new(McpPool::new(config, catalog_dirs.shared.clone()));
         Arc::new(Self {
             dirs: dirs.clone(),
-            catalog: Arc::new(
-                Catalog::new(CatalogDirs::under(dirs), pool.clone()).with_limits(limits),
-            ),
+            catalog: Arc::new(Catalog::new(catalog_dirs, pool.clone()).with_limits(limits)),
             plugins: PluginDirs::under(dirs),
             pool,
             told: Mutex::new(HashSet::new()),

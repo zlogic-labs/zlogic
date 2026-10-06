@@ -16,6 +16,7 @@ use serde_json::json;
 use zlogic_protocol::llm::ToolDefinition;
 
 use crate::search::ignores::Ignores;
+use crate::search::SearchBudgets;
 use crate::{Recovery, Result, Tool, ToolCtx, ToolExecResult, ToolMeta, ToolRisk, parse_args};
 
 const DEFAULT_MAX_DEPTH: usize = 3;
@@ -37,7 +38,22 @@ struct Args {
     include_ignored: bool,
 }
 
-pub struct ListDir;
+#[derive(Debug, Clone)]
+pub struct ListDir {
+    budgets: SearchBudgets,
+}
+
+impl Default for ListDir {
+    fn default() -> Self {
+        Self::with_budgets(SearchBudgets::default())
+    }
+}
+
+impl ListDir {
+    pub fn with_budgets(budgets: SearchBudgets) -> Self {
+        Self { budgets }
+    }
+}
 
 #[async_trait]
 impl Tool for ListDir {
@@ -103,6 +119,7 @@ impl Tool for ListDir {
 
         let mut printed = 0usize;
         let mut body = String::new();
+        let mut walk = Walk::new(self.budgets.deadline());
         if a.recursive {
             body.push_str(&format!("{} (depth {max_depth}):\n", root.display()));
             if let Err(e) = tree(
@@ -114,6 +131,7 @@ impl Tool for ListDir {
                 "",
                 &mut printed,
                 &mut body,
+                &mut walk,
             ) {
                 return Ok(ToolExecResult::failed(format!(
                     "cannot read {}: {e}",
@@ -122,7 +140,7 @@ impl Tool for ListDir {
             }
         } else {
             body.push_str(&format!("{}:\n", root.display()));
-            let rows = match read_children(&root, &ignores) {
+            let rows = match read_children(&root, &ignores, &mut walk) {
                 Ok(r) => r,
                 Err(e) => {
                     return Ok(ToolExecResult::failed(format!(
@@ -144,10 +162,16 @@ impl Tool for ListDir {
         }
 
         if printed == 0 {
-            return Ok(ToolExecResult::success(format!(
-                "{} is empty",
-                root.display()
-            )));
+            return Ok(ToolExecResult::success(if walk.expired {
+                format!(
+                    "{}: nothing listed before the {}s limit, so this says nothing about what the \
+                     directory holds",
+                    root.display(),
+                    self.budgets.timeout.as_secs()
+                )
+            } else {
+                format!("{} is empty", root.display())
+            }));
         }
         if a.recursive && printed >= max_entries {
             body.push_str(&format!(
@@ -155,7 +179,41 @@ impl Tool for ListDir {
                  subdirectory\n"
             ));
         }
+        if walk.expired {
+            body.push_str(&format!(
+                "… stopped at the {}s limit with the tree only partly read\n",
+                self.budgets.timeout.as_secs()
+            ));
+        }
         ctx.offload_if_large(body.trim_end(), Recovery::Narrow)
+    }
+}
+
+/// The deadline, plus whether it fired.
+///
+/// A struct rather than a bare `Option<Instant>` because every level of the recursion needs both:
+/// checking the clock is the cheap part, reporting that it fired is what stops an empty listing
+/// from reading as an empty directory.
+struct Walk {
+    deadline: Option<std::time::Instant>,
+    expired: bool,
+}
+
+impl Walk {
+    fn new(deadline: Option<std::time::Instant>) -> Self {
+        Self {
+            deadline,
+            expired: false,
+        }
+    }
+
+    /// Latches rather than returning the answer, so the caller can keep asking cheaply and read
+    /// the outcome once at the end.
+    fn check(&mut self) -> bool {
+        if !self.expired && self.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            self.expired = true;
+        }
+        self.expired
     }
 }
 
@@ -194,9 +252,12 @@ impl Row {
 /// Direct children, directories first then alphabetical.
 /// Directories first because it is the order every file manager uses, and because a model reading
 /// a listing to decide where to look next wants the navigable entries together.
-fn read_children(dir: &Path, ignores: &Ignores) -> std::io::Result<Vec<Row>> {
+fn read_children(dir: &Path, ignores: &Ignores, walk: &mut Walk) -> std::io::Result<Vec<Row>> {
     let mut rows = Vec::new();
     for entry in std::fs::read_dir(dir)? {
+        if walk.check() {
+            break;
+        }
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         // Hidden entries are listed — unlike glob and grep, which search. Someone asking what is
@@ -239,11 +300,15 @@ fn tree(
     prefix: &str,
     printed: &mut usize,
     body: &mut String,
+    walk: &mut Walk,
 ) -> std::io::Result<()> {
-    let rows = read_children(dir, ignores)?;
+    if walk.check() {
+        return Ok(());
+    }
+    let rows = read_children(dir, ignores, walk)?;
     let last_index = rows.len().saturating_sub(1);
     for (i, row) in rows.iter().enumerate() {
-        if *printed >= max_entries {
+        if *printed >= max_entries || walk.check() {
             return Ok(());
         }
         let last = i == last_index;
@@ -265,6 +330,7 @@ fn tree(
                 &child_prefix,
                 printed,
                 &mut nested,
+                walk,
             );
             for line in nested.lines() {
                 body.push_str(&format!("{child_prefix}{line}\n"));
@@ -293,7 +359,7 @@ mod tests {
     #[tokio::test]
     async fn lists_direct_children_with_sizes_directories_first() {
         let (_d, ctx) = setup();
-        let out = ListDir.execute(&ctx, r#"{"path":"."}"#).await.unwrap();
+        let out = ListDir::default().execute(&ctx, r#"{"path":"."}"#).await.unwrap();
         assert_eq!(out.status, ToolExecStatus::Success);
 
         let text = out.model_text();
@@ -306,7 +372,7 @@ mod tests {
     #[tokio::test]
     async fn recursive_prints_a_tree() {
         let (_d, ctx) = setup();
-        let out = ListDir
+        let out = ListDir::default()
             .execute(&ctx, r#"{"path":".","recursive":true}"#)
             .await
             .unwrap();
@@ -322,7 +388,7 @@ mod tests {
     #[tokio::test]
     async fn the_tree_stops_at_max_depth() {
         let (_d, ctx) = setup();
-        let out = ListDir
+        let out = ListDir::default()
             .execute(&ctx, r#"{"path":".","recursive":true,"max_depth":1}"#)
             .await
             .unwrap();
@@ -341,7 +407,7 @@ mod tests {
         for i in 0..20 {
             std::fs::write(d.path().join(format!("f{i}")), "x").unwrap();
         }
-        let out = ListDir
+        let out = ListDir::default()
             .execute(&ctx, r#"{"path":".","max_entries":5}"#)
             .await
             .unwrap();
@@ -358,7 +424,7 @@ mod tests {
         for i in 0..20 {
             std::fs::write(d.path().join(format!("f{i}")), "x").unwrap();
         }
-        let out = ListDir
+        let out = ListDir::default()
             .execute(&ctx, r#"{"path":".","recursive":true,"max_entries":4}"#)
             .await
             .unwrap();
@@ -374,7 +440,7 @@ mod tests {
     async fn hidden_entries_are_listed() {
         let (d, ctx) = setup();
         std::fs::write(d.path().join(".env"), "K=V").unwrap();
-        let out = ListDir.execute(&ctx, r#"{"path":"."}"#).await.unwrap();
+        let out = ListDir::default().execute(&ctx, r#"{"path":"."}"#).await.unwrap();
         assert!(out.model_text().contains(".env"), "{}", out.model_text());
     }
 
@@ -385,7 +451,7 @@ mod tests {
         std::fs::create_dir(d.path().join(".git")).unwrap();
         std::fs::create_dir(d.path().join("node_modules")).unwrap();
 
-        let out = ListDir.execute(&ctx, r#"{"path":"."}"#).await.unwrap();
+        let out = ListDir::default().execute(&ctx, r#"{"path":"."}"#).await.unwrap();
         let text = out.model_text();
         assert!(!text.contains(".git"), "{text}");
         assert!(!text.contains("node_modules"), "{text}");
@@ -395,7 +461,7 @@ mod tests {
     async fn opting_out_shows_the_dependencies_again() {
         let (d, ctx) = setup();
         std::fs::create_dir(d.path().join("node_modules")).unwrap();
-        let out = ListDir
+        let out = ListDir::default()
             .execute(&ctx, r#"{"path":".","include_ignored":true}"#)
             .await
             .unwrap();
@@ -410,7 +476,7 @@ mod tests {
     async fn an_empty_directory_says_so() {
         let (d, ctx) = setup();
         std::fs::create_dir(d.path().join("empty")).unwrap();
-        let out = ListDir.execute(&ctx, r#"{"path":"empty"}"#).await.unwrap();
+        let out = ListDir::default().execute(&ctx, r#"{"path":"empty"}"#).await.unwrap();
         assert_eq!(out.status, ToolExecStatus::Success);
         assert!(out.model_text().contains("is empty"));
     }
@@ -419,11 +485,11 @@ mod tests {
     #[tokio::test]
     async fn a_missing_path_and_a_file_path_are_reported_differently() {
         let (_d, ctx) = setup();
-        let missing = ListDir.execute(&ctx, r#"{"path":"nope"}"#).await.unwrap();
+        let missing = ListDir::default().execute(&ctx, r#"{"path":"nope"}"#).await.unwrap();
         assert_eq!(missing.status, ToolExecStatus::Failed);
         assert!(missing.model_text().contains("does not exist"));
 
-        let file = ListDir
+        let file = ListDir::default()
             .execute(&ctx, r#"{"path":"README.md"}"#)
             .await
             .unwrap();
@@ -437,7 +503,7 @@ mod tests {
     async fn a_symlink_is_reported_as_a_link() {
         let (d, ctx) = setup();
         std::os::unix::fs::symlink(d.path().join("nowhere"), d.path().join("dangling")).unwrap();
-        let out = ListDir.execute(&ctx, r#"{"path":"."}"#).await.unwrap();
+        let out = ListDir::default().execute(&ctx, r#"{"path":"."}"#).await.unwrap();
         assert!(
             out.model_text().contains("dangling"),
             "{}",
@@ -448,9 +514,36 @@ mod tests {
     #[tokio::test]
     async fn a_missing_path_defaults_to_the_working_directory() {
         let (_d, ctx) = setup();
-        let out = ListDir.execute(&ctx, "{}").await.unwrap();
+        let out = ListDir::default().execute(&ctx, "{}").await.unwrap();
         assert_eq!(out.status, ToolExecStatus::Success);
         assert!(out.model_text().contains("README.md"));
-        assert!(ListDir.execute(&ctx, "not json").await.is_err());
+        assert!(ListDir::default().execute(&ctx, "not json").await.is_err());
+    }
+
+    fn expired() -> ListDir {
+        ListDir::with_budgets(SearchBudgets {
+            timeout: std::time::Duration::from_nanos(1),
+        })
+    }
+
+    /// The empty-listing case is the one that misleads: "…is empty" reads as a fact about the
+    /// directory, when the walk was abandoned before it read any of it.
+    #[tokio::test]
+    async fn a_listing_that_ran_out_of_budget_does_not_say_the_directory_is_empty() {
+        let (_d, ctx) = setup();
+        let out = expired().execute(&ctx, "{}").await.unwrap();
+        let text = out.model_text();
+        assert!(!text.contains("is empty"), "{text}");
+        assert!(text.contains("says nothing about"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_zero_budget_is_off_rather_than_instantly_expired() {
+        let (_d, ctx) = setup();
+        let unlimited = ListDir::with_budgets(SearchBudgets {
+            timeout: std::time::Duration::ZERO,
+        });
+        let out = unlimited.execute(&ctx, "{}").await.unwrap();
+        assert!(out.model_text().contains("README.md"));
     }
 }

@@ -39,7 +39,10 @@ base64 = "0.22.1"
 http = "1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider"] }
 url = "2.5"
-rmcp = { version = "3.0.0", default-features = false, features = [
+# `=` pinned to 3.2.0: from 3.3.0 onwards it needs `process-wrap ^10`, and that version requires
+# `windows ^0.62`, which would split the dependency graph into two generations of `windows`.
+# Confirm the Tauri side has migrated before unpinning.
+rmcp = { version = "=3.2.0", default-features = false, features = [
     "client",
     "auth",
     "transport-child-process",
@@ -51,5 +54,5 @@ rmcp = { version = "3.0.0", default-features = false, features = [
 zlogic-mcp = { path = ".", features = ["test-server"] }
 zlogic-objects = { path = "../objects" }
 tempfile.workspace = true
-rmcp = { version = "3.0.0", default-features = false, features = ["server"] }
+rmcp = { version = "=3.2.0", default-features = false, features = ["server"] }
 tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "time"] }

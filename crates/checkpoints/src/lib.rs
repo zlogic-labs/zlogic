@@ -9,6 +9,7 @@
 //! holds the working tree, minus what git ignores, and the staging area is not part of it. A
 //! restore is a checkout, not a reconciliation.
 
+pub mod maintenance;
 pub mod restore;
 pub mod retention;
 pub mod store;
@@ -23,7 +24,10 @@ pub use restore::{
     StepDiff,
 };
 pub use retention::SweepReport;
-pub use store::{Capture, CheckpointError, Checkpoints, Config, Page, Snapshot, Trigger, now};
+pub use store::{
+    Capture, CheckpointError, Checkpoints, ClearReport, Config, Page, Snapshot, Trigger, now,
+    HEAD_REF, REPO_DIR,
+};
 
 /// The agent loop's half of the contract. Every trigger is best-effort by design: a checkpoint
 /// that cannot be taken is a warning in the transcript, never a failed tool call and never a failed
@@ -48,6 +52,12 @@ impl CheckpointHost for Checkpoints {
             Ok(snapshot) => Ok(CheckpointReceipt::captured(snapshot.id, snapshot.at)),
             Err(CheckpointError::NotARepository(path)) => Ok(CheckpointReceipt::skipped(format!(
                 "{path} is not a git repository, so it has no checkpoints"
+            ))),
+            // Skipped rather than failed for the same reason: a repository zlogic may not open is
+            // a standing condition, not something that went wrong on this turn.
+            Err(CheckpointError::NotOwned(path)) => Ok(CheckpointReceipt::skipped(format!(
+                "{path} is a git repository zlogic is not allowed to open: its .git is not owned \
+                 by the user zlogic runs as"
             ))),
             Err(error) => Ok(CheckpointReceipt::failed(format!(
                 "checkpoint could not be taken: {error}"

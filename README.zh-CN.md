@@ -48,7 +48,7 @@ irm https://install.zlogic.run | iex
 ### 从源码构建
 
 ```sh
-cargo build --release -p zlogic-cli    # target/release/zlogic
+cargo build --release -p zlogic    # target/release/zlogic
 cargo test --workspace
 ```
 
@@ -152,8 +152,8 @@ TUI 中输入 `/` 可以打开命令面板，包括 `/model`、`/session`、`/re
 不需要 Node、Python 或 vendored 工具链，一个较新的 stable Rust 就够了。
 
 ```sh
-cargo build --release -p zlogic-cli
-cargo run -p zlogic-cli -- --prompt "hello"
+cargo build --release -p zlogic
+cargo run -p zlogic -- --prompt "hello"
 cargo test --workspace
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked

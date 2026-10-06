@@ -89,12 +89,101 @@ pub fn sweep(repo: &Repository, config: &Config, now: i64) -> Result<SweepReport
     for (oid, _) in chain.iter() {
         let _ = remove_loose(repo, *oid);
     }
+    // The dropped snapshots' own blobs are not on that list: a blob no kept tree names is a loose
+    // file nothing else knows about, and it is most of what a busy repository accumulated. Nothing
+    // else ever reclaims those — no `git gc` runs here — so the sweep does it itself.
+    if let Err(error) = prune_loose(repo, &reachable(repo, &chain[..keep])) {
+        tracing::warn!(target: "zlogic::checkpoints", %error, "checkpoint prune failed");
+    }
 
     Ok(SweepReport {
         kept: keep,
         dropped: chain.len() - keep,
         bytes: unique_blob_bytes(repo, &chain[..keep]),
     })
+}
+
+/// Every object the kept snapshots can still reach: their commits, their trees, and the blobs
+/// under those trees. An object outside this set is unreachable from the store's only ref, so
+/// removing it cannot change what a restore reads.
+fn reachable(repo: &Repository, chain: &[(Oid, Snapshot)]) -> HashSet<Oid> {
+    let mut seen = HashSet::new();
+    let mut stack = Vec::new();
+    // The private index is the one other reference to a blob: a path the walker decides it
+    // already has is not re-read, so an object the index still names has to outlive the sweep
+    // even when no kept tree does.
+    if let Ok(index) = repo.index() {
+        for entry in index.iter() {
+            seen.insert(entry.id);
+        }
+    }
+    for (oid, snapshot) in chain {
+        seen.insert(*oid);
+        if let Ok(hex) = Oid::from_str(&snapshot.tree)
+            && seen.insert(hex)
+        {
+            stack.push(hex);
+        }
+    }
+    while let Some(oid) = stack.pop() {
+        let Ok(tree) = repo.find_tree(oid) else { continue };
+        for entry in tree.iter() {
+            match entry.kind() {
+                Some(git2::ObjectType::Tree) => {
+                    if seen.insert(entry.id()) {
+                        stack.push(entry.id());
+                    }
+                }
+                Some(git2::ObjectType::Blob) => {
+                    seen.insert(entry.id());
+                }
+                _ => {}
+            }
+        }
+    }
+    seen
+}
+
+/// Deletes the loose object files no kept tree reaches, and returns how many went.
+///
+/// Everything this store writes is loose — a commit, a tree and a blob per changed file — so
+/// dropping the files is the whole of the compaction and no repack pass is needed over the objects
+/// that are staying. `pack` is left alone for the same reason as everywhere else: those objects are
+/// shared, and pruning inside a pack is `git gc`'s business.
+fn prune_loose(repo: &Repository, keep: &HashSet<Oid>) -> Result<usize, CheckpointError> {
+    let objects = repo.path().join("objects");
+    let mut removed = 0usize;
+    for fanout in std::fs::read_dir(&objects)?.flatten() {
+        let name = fanout.file_name();
+        let Some(hex) = name.to_str().filter(|hex| is_hex(hex, 2)) else {
+            continue;
+        };
+        if !fanout.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        for file in std::fs::read_dir(fanout.path())?.flatten() {
+            let Some(rest) = file.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !is_hex(&rest, 38) {
+                continue;
+            }
+            let Ok(oid) = Oid::from_str(&format!("{hex}{rest}")) else {
+                continue;
+            };
+            if keep.contains(&oid) {
+                continue;
+            }
+            if std::fs::remove_file(file.path()).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn is_hex(text: &str, len: usize) -> bool {
+    text.len() == len && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Newest first.
@@ -175,7 +264,7 @@ fn blobs(repo: &Repository, tree: &git2::Tree<'_>) -> Vec<Oid> {
     out
 }
 
-fn directory_size(path: &Path) -> u64 {
+pub(crate) fn directory_size(path: &Path) -> u64 {
     let mut total = 0u64;
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;

@@ -1,0 +1,33 @@
+[package]
+name = "zlogic-nettable"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Reads the OS TCP listen table and the process parent map, the only way to learn which port a spawned server actually bound"
+license.workspace = true
+
+# Note the deliberate absence of `[lints] workspace = true`.
+#
+# The workspace-wide `unsafe_code = "forbid"` is right for the pure-Rust crates, but nothing safe
+# in std or in the dependency set can answer "which process is listening on this port". Windows
+# exposes it only through `GetExtendedTcpTable`, which is an `unsafe extern` call; the Linux
+# equivalent is a hand-rolled `/proc` walk.
+#
+# The alternative was rejected rather than overlooked: shelling out to `netstat -ano` keeps the
+# lint but costs a process spawn per read, and this is read on a poll. Preferring a dependency
+# that encapsulates the FFI (the reason `sysinfo` is used for process names) is not available
+# either — no such crate enumerates the listen table.
+#
+# `unsafe` appears in exactly one module (`win`), in this file's `mod win`, and nowhere else in
+# the crate.
+
+[dependencies]
+
+[target.'cfg(windows)'.dependencies]
+# Stays on `0.61`: the Tauri side has not migrated yet, and having both generations of `windows`
+# side by side compiles the same set of generated bindings twice.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_System_Diagnostics_ToolHelp",
+] }

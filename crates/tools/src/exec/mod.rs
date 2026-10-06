@@ -5,6 +5,7 @@
 //! filtered before it is handed over. None of that is shared with the file or search tools, and
 //! all of it will be shared with whatever runs a process next.
 
+pub(crate) mod decode;
 pub mod shell;
 
 use std::sync::Arc;

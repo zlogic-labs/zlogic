@@ -7,6 +7,7 @@ use crate::ids::{RoundId, SessionId, TranslationId, TurnId, WorkspaceId};
 use crate::interaction::{InteractionBody, InteractionDecision};
 use crate::llm::Effort;
 use crate::stream::{ToolDisplay, ToolStatus, TurnStats, TurnStatus};
+use crate::usage::Purpose;
 use crate::usage::{CostTotal, TokenUsage};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -46,10 +47,31 @@ pub enum WorkspaceKind {
     Chat,
     Custom,
     MobileAndroid,
+    /// Structured investigation: web search and page fetching over a folder that holds research
+    /// output. Distinct from Chat because it keeps the filesystem tools — the outline, the field
+    /// schema and the per-item results are files on disk, not conversation.
+    Research,
 }
 
 pub fn chat_workspace_tools() -> Vec<String> {
     vec!["time".into(), "web_fetch".into(), "web_search".into()]
+}
+
+/// A research workspace is Chat's search pair plus the tools that read and write its own output.
+pub fn research_workspace_tools() -> Vec<String> {
+    vec![
+        "time".into(),
+        "web_fetch".into(),
+        "web_search".into(),
+        "read_file".into(),
+        "write_file".into(),
+        "edit".into(),
+        "list_dir".into(),
+        "glob".into(),
+        "grep".into(),
+        "shell".into(),
+        "create_agent".into(),
+    ]
 }
 
 impl WorkspaceKind {
@@ -57,9 +79,10 @@ impl WorkspaceKind {
         match tools {
             None => Self::Coding,
             Some(list) => {
-                let chat = chat_workspace_tools();
-                if list.len() == chat.len() && chat.iter().all(|t| list.contains(t)) {
+                if matches_preset(list, &chat_workspace_tools()) {
                     Self::Chat
+                } else if matches_preset(list, &research_workspace_tools()) {
+                    Self::Research
                 } else {
                     Self::Custom
                 }
@@ -69,7 +92,7 @@ impl WorkspaceKind {
 
     pub fn from_record(tools: Option<&[String]>, persisted: Self) -> Self {
         match persisted {
-            Self::MobileAndroid | Self::Chat | Self::Custom => persisted,
+            Self::MobileAndroid | Self::Chat | Self::Custom | Self::Research => persisted,
             Self::Coding => Self::of_tools(tools),
         }
     }
@@ -78,8 +101,14 @@ impl WorkspaceKind {
         match self {
             Self::Coding | Self::Custom | Self::MobileAndroid => None,
             Self::Chat => Some(chat_workspace_tools()),
+            Self::Research => Some(research_workspace_tools()),
         }
     }
+}
+
+/// Whether a stored allowlist is exactly this preset. Order is the user's, membership is not.
+fn matches_preset(tools: &[String], preset: &[String]) -> bool {
+    tools.len() == preset.len() && preset.iter().all(|t| tools.contains(t))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -103,10 +132,27 @@ pub struct WorkspaceSummary {
     pub managed: bool,
 }
 
+/// A repository that exists at this workspace but that the engine is not allowed to open. It is
+/// reported alongside `is_git: false` rather than folded into it, because the two need different
+/// words in the UI: one is a folder to put a repository in, the other is a repository whose
+/// ownership has to change, and offering `git init` for the second can only fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum GitRefusal {
+    /// The `.git` directory is not owned by the user the engine runs as, so libgit2 refuses to
+    /// open it. The repository itself is intact — `git` the CLI accepts one owned by
+    /// Administrators when the user is an administrator, and libgit2 has no such exemption — so
+    /// this is a limit on what zlogic can do, not a verdict on the user's repository.
+    OwnerMismatch,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct WorkspaceGitInfo {
     pub is_git: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<GitRefusal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -334,6 +380,16 @@ pub struct WorkspaceGitInitReq {
     pub workspace: WorkspaceSelector,
 }
 
+/// Add the workspace root to git's `safe.directory` list, which is what makes a repository whose
+/// `.git` belongs to another account openable — the same answer git itself gives, and the one
+/// libgit2 honours, so one entry serves both. This is a trust decision about a repository, so it
+/// is only ever done on an explicit request, never as a side effect of reading the workspace.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceGitTrustReq {
+    pub workspace: WorkspaceSelector,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -481,6 +537,12 @@ pub struct WorkspaceCheckpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     pub session: String,
+    /// The session's display title, joined in when the list is read: the snapshot itself only
+    /// records the id. Resolved live rather than frozen at capture, so a renamed conversation
+    /// renames its own history — the timeline is asking which conversation this was, and that
+    /// answer changing with a rename is the correct one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<String>,
     pub trigger: CheckpointTriggerKind,
@@ -645,6 +707,38 @@ pub struct WorkspaceCheckpointStepReq {
     pub checkpoint: String,
 }
 
+/// One step's numbers without the files behind them. The card shows a count per row and refetches
+/// whenever the list does, so sending up to 200 file rows per row to render a single integer is
+/// the wrong trade; a caller that wants the rows asks for them by opening the row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpointStepSummary {
+    pub checkpoint: String,
+    /// The snapshot this one is compared against, absent for the first point in a store — which has
+    /// nothing before it, and whose count would otherwise read as "this step changed nothing".
+    pub previous: Option<String>,
+    pub files: usize,
+    pub deletions: usize,
+    pub lines: CheckpointLineStats,
+}
+
+/// Several steps' summaries in one call, because the card asks for its rows together and a card
+/// that costs a round trip per row is a card that renders its numbers one at a time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpointStepsReq {
+    pub workspace: WorkspaceSelector,
+    /// Checkpoint ids as the list returns them. Clamped server-side: this is a per-row summary,
+    /// and a client that wants every number in a long chain is asking for a diff each.
+    pub checkpoints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpointSteps {
+    pub steps: Vec<WorkspaceCheckpointStepSummary>,
+}
+
 /// The browsing half of a plan: what changed between one point in the timeline and the one before
 /// it. `writes`/`deletes` above answer the restore question and are only read once someone is
 /// about to restore; these answer "what happened here", which is what the row is for.
@@ -745,6 +839,24 @@ pub struct WorkspaceCheckpointCaptureReq {
     /// so it is grouped with the work it was made for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+}
+
+/// Emptying one workspace's checkpoint store. There is no `what` to narrow it by: the store is a
+/// directory of every snapshot taken of that repository, and keeping some of them while asking to
+/// delete it is not a request anybody makes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpointClearReq {
+    pub workspace: WorkspaceSelector,
+}
+
+/// What the deletion took, for the message the user reads afterwards. The numbers are the ones
+/// only the store knew: the confirmation can say what will go, but not how much disk it was using.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct WorkspaceCheckpointCleared {
+    pub dropped: usize,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -999,6 +1111,40 @@ pub struct TextTranslateReq {
     pub model_ref: Option<String>,
 }
 
+/// One streamed completion on the auxiliary model path.
+///
+/// Same shape as a collected auxiliary call, with the answer arriving as pieces. The caller is
+/// something that cannot wait: a spoken reply is synthesised sentence by sentence while the model
+/// is still writing, so the pieces are the feature and not a transport detail.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TextCompleteStreamReq {
+    /// Usage is accounted against this session. A live call has no session of its own and
+    /// passes the one it interrupted, or nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    /// How the call is routed and billed. `voice` is the one a call should use.
+    #[serde(default = "default_purpose")]
+    pub purpose: Purpose,
+    /// Model to answer with; absent means the role's own chain (the session model, then the
+    /// light tier).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ref: Option<String>,
+    /// The only system prompt this call gets. The agent's global one is not in scope here.
+    #[serde(default)]
+    pub system: String,
+    pub input: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+}
+
+fn default_purpose() -> Purpose {
+    Purpose::Voice
+}
+
+/// One piece of a streamed answer. A failing call sends one `Err` and then stops.
+pub type TextDelta = Result<String, ApiError>;
+
 /// One translation, as answered.
 ///
 /// `cached` is the honest half: the same text into the same language was translated before, so the
@@ -1125,6 +1271,11 @@ pub struct SessionSummary {
     pub workspace_id: WorkspaceId,
     pub agent_paths: Vec<String>,
     pub root_session_id: SessionId,
+    /// The session this one was spawned from. `root_session_id` flattens the whole tree onto one
+    /// key, which answers "what tree is this in" but not "who is my parent" — and with two
+    /// children of the same profile the agent path cannot tell them apart either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1142,6 +1293,14 @@ pub struct SessionSummary {
     pub live_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub awaiting_input: bool,
+    /// The session's **last** turn ended unfinished — the user stopped it (`cancelled`), it was cut
+    /// off mid-flight (`incomplete: interrupted`) or it errored out (`failed`). Those are exactly
+    /// the endings the chat view can continue from, so this is what the sidebar marks. A
+    /// `limit_reached` turn is not this: that is a budget the user set, not a half-said turn.
+    ///
+    /// Derived from the last `turn_end` entry, so the next turn that ends normally clears it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interrupted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
 }
@@ -1188,6 +1347,37 @@ pub struct SessionOpened {
     pub pending_submissions: Vec<PendingSubmission>,
     pub model: ModelSelection,
     pub edit_protection: EditProtection,
+    /// Servers this conversation's background runs are listening on right now.
+    ///
+    /// Neither declared in the command nor parsed out of the output: the ports are read from the
+    /// operating system's listen table and matched back to the run that started it. Recomputed on
+    /// every read rather than remembered, because a port that outlives the process that reported
+    /// it is worse than no port at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<SessionService>,
+}
+
+/// One listening server, attributed to the background run that started it.
+///
+/// The attribution is what makes this worth more than a line of scraped output. A `vite` dev
+/// server prints its own URL and is still wrong often enough to matter — `--port 0`, a host
+/// override, a line in a build log that merely mentions `localhost` — and a wrapper that never
+/// binds anything has nothing to print in the first place.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SessionService {
+    pub task_id: String,
+    /// Which session in the tree started it. A delegated run reports the sub-agent's own id, so
+    /// this differs from the conversation the caller asked about.
+    pub session_id: SessionId,
+    /// `main/researcher` for a delegated run, `None` for the conversation itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_path: Option<String>,
+    /// The command line, as the task list renders it.
+    pub title: String,
+    /// Sorted ascending and free of duplicates: one service bound on both address families
+    /// reports one port.
+    pub ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1223,6 +1413,15 @@ pub enum EditProtection {
 pub struct SessionRenameReq {
     pub session_id: SessionId,
     pub title: String,
+}
+
+/// Fork a new session from a turn. The handle is `turn_seq` (see the rewind request): the fork
+/// keeps every turn up to and including it, and the original session is left untouched.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SessionForkReq {
+    pub session_id: SessionId,
+    pub keep_through_turn: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1332,6 +1531,13 @@ pub enum TranscriptBody {
         status: crate::stream::TurnStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// What the turn left in its delivery directory. Timeline-only: the model is never told,
+        /// because it wrote the files and has nothing to learn from being told they exist.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        deliverables: Vec<crate::stream::TurnDeliverable>,
+        /// Files this turn wrote and then removed, so the client stops offering rows for them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        gone: Vec<String>,
     },
     /// A background task reached a terminal state and woke this conversation.
     TaskUpdate {
@@ -1565,6 +1771,28 @@ pub struct ObjectData {
     pub total_bytes: u64,
 }
 
+/// A byte range of an object in the content-addressed store.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ObjectRangeReq {
+    pub object: String,
+    pub start: u64,
+    /// `None` reads to the end; `Some(0)` reads nothing and only reports `total`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<u64>,
+}
+
+/// The bytes [`ObjectRangeReq`] asked for. Raw, not base64, for the reason
+/// [`WorkspaceFileRange::data`] gives.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ObjectRange {
+    pub start: u64,
+    pub bytes: u64,
+    pub total: u64,
+    pub data: Vec<u8>,
+}
+
 /// Result of uploading raw bytes into the content-addressed object store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1781,6 +2009,7 @@ pub struct SettingsView {
     pub checkpoints: crate::settings::CheckpointsConfig,
     pub auto_detect_env: bool,
     pub keychain: bool,
+    pub env: crate::settings::EnvConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1822,6 +2051,12 @@ pub struct ConfigUpdateReq {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub checkpoints: Option<crate::settings::CheckpointsConfig>,
+    /// The global `env:` block. Written through the same path as every other section so the
+    /// global layer needs no second write route; the workspace and session layers are not
+    /// expressible in a config file the process owns, so they go through `env_set` instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub env: Option<crate::settings::EnvConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub auto_detect_env: Option<bool>,
@@ -1836,6 +2071,84 @@ pub struct ConfigUpdateReq {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub expected_revision: Option<u64>,
+}
+
+// ═══════════════════════════════════ env ═══════════════════════════════════
+
+/// One variable as one layer states it. `rejected` is set instead of the entry being dropped: a
+/// name the layer may not contribute has to stay visible, or the user edits a file that has no
+/// effect and finds out from the wrong symptom.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct EnvEntry {
+    pub name: String,
+    pub value: String,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub rejected: Option<String>,
+}
+
+/// One layer, as it is written down — never merged with the others.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct EnvLayer {
+    pub scope: crate::settings::EnvScope,
+    pub entries: Vec<EnvEntry>,
+    /// The file or store this layer lives in, so the table can say where an edit will land.
+    pub location: String,
+    /// `false` when the caller named no context for this layer — the settings page, with no
+    /// workspace open, can read the global layer and nothing else.
+    pub available: bool,
+    /// The layer's own master switch.
+    pub enabled: bool,
+}
+
+/// What a shell call would actually see, and which layer each name came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct EnvEffective {
+    pub name: String,
+    pub value: String,
+    pub source: crate::settings::EnvSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct EnvView {
+    pub layers: Vec<EnvLayer>,
+    pub effective: Vec<EnvEffective>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(default)]
+pub struct EnvGetReq {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub workspace_id: Option<WorkspaceId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub session_id: Option<SessionId>,
+}
+
+/// Replaces one layer whole, which is the same contract `config_update` has for every other
+/// section: a partial write would have to invent a merge rule, and the merge is already what the
+/// three layers mean to each other.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct EnvSetReq {
+    pub scope: crate::settings::EnvScope,
+    pub variables: std::collections::BTreeMap<String, crate::settings::EnvVarDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub workspace_id: Option<WorkspaceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub session_id: Option<SessionId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

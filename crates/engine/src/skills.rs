@@ -12,7 +12,7 @@ use zlogic_config::Dirs;
 use zlogic_plugins::{DISABLED_MARKER, PluginDirs};
 use zlogic_protocol::WorkspaceId;
 
-use crate::extensions::{Kind as ExtensionKind, Origin as ExtensionOrigin, state::States};
+use crate::extensions::{Kind as ExtensionKind, Origin, Origin as ExtensionOrigin, state::States};
 
 /// Discovery reads frontmatter and loading snapshots the body into the object store. A multi-MB
 /// procedure should do neither on the request path.
@@ -22,18 +22,57 @@ const MAX_SKILLS: usize = 100;
 
 const MAX_DESCRIPTION_CHARS: usize = 300;
 
-/// The guide to zlogic itself, compiled in rather than installed. It is the one skill a user needs
-/// before they have installed anything, and a product that cannot explain its own configuration
-/// makes every configuration question a support ticket.
+/// The skills compiled into the binary rather than installed.
+///
+/// Exactly one ships, and it ships for a reason particular to itself: `zlogic-guide` **is** this
+/// program's manual, so what a user reads has to describe the build they are holding. Freezing it
+/// here is what makes that true. Everything else is maintained in its own repository and reaches
+/// users through the install path, where changing it does not wait on an app release — a workflow
+/// bundled in the binary would drift from the copy its own documentation points at.
+///
+/// A bundled skill has no directory, so no disable marker can sit in one: its switch is a key in
+/// the extension state file, and it ships **off** until someone flips it in Runtime → Skills.
 struct BuiltinSkill {
     name: &'static str,
     text: &'static str,
+    enabled_by_default: bool,
 }
 
-const BUILTIN_SKILL: BuiltinSkill = BuiltinSkill {
+const GUIDE: BuiltinSkill = BuiltinSkill {
     name: "zlogic-guide",
     text: include_str!("../defaults/skills/zlogic-guide/SKILL.md"),
+    enabled_by_default: false,
 };
+
+/// A second entry, under test only. The bundled path is otherwise carried entirely by the guide,
+/// whose text changes whenever the product does — so every assertion about *how a bundled skill
+/// behaves* would be an assertion about a document. This one never changes.
+#[cfg(test)]
+const EXAMPLE: BuiltinSkill = BuiltinSkill {
+    name: "bundled-example",
+    text: concat!(
+        "---\n",
+        "name: bundled-example\n",
+        "description: a skill that had to be compiled in\n",
+        "descriptions:\n",
+        "  zh-CN: 只能编译进来的 skill\n",
+        "  en-US: a skill that had to be compiled in\n",
+        "---\n\n",
+        "the body a bundled skill would carry\n",
+    ),
+    enabled_by_default: false,
+};
+
+#[cfg(not(test))]
+const BUILTIN_SKILLS: &[BuiltinSkill] = &[GUIDE];
+
+#[cfg(test)]
+const BUILTIN_SKILLS: &[BuiltinSkill] = &[GUIDE, EXAMPLE];
+
+/// The name the bundled-path tests refer to, so renaming the test entry does not mean rewriting
+/// each assertion. `prompt`'s tests read it from there.
+#[cfg(test)]
+pub(crate) const TEST_BUILTIN: &str = "bundled-example";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillOrigin {
@@ -46,11 +85,15 @@ pub enum SkillOrigin {
 pub struct SkillDef {
     pub name: String,
     pub description: String,
-    /// Per-locale descriptions for surfaces that know the reader's language. `description` stays
-    /// the one the model sees, so it is written in the language the skill itself is written in.
+    /// Client-facing only: a UI that knows the reader's language picks from it (the graphical
+    /// clients' built-in skill cards do). It is deliberately **not** part of the skill format and
+    /// never reaches the model, which reads `description` and the frontmatter-free body.
     pub descriptions: BTreeMap<String, String>,
     pub path: PathBuf,
     pub origin: SkillOrigin,
+    /// Whether this skill may be listed to the model and loaded. An installed skill is on unless
+    /// its folder carries the disable marker; a built-in is off until someone switches it on.
+    pub enabled: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -63,17 +106,20 @@ pub struct Skills {
 struct Frontmatter {
     name: Option<String>,
     description: Option<String>,
-    when_to_use: Option<String>,
     #[serde(default)]
     descriptions: BTreeMap<String, String>,
 }
 
 /// The compiled-in skills alone, for callers with no workspace to scan: a machine-wide settings
 /// page has no root, and the guide is the one skill that still has to be visible there.
-pub fn builtin_skills() -> Skills {
+pub fn builtin_skills(dirs: &Dirs, workspace: Option<WorkspaceId>) -> Skills {
     let mut by_name: BTreeMap<String, SkillDef> = BTreeMap::new();
     let mut problems = Vec::new();
-    seed_builtin(&mut by_name, &mut problems);
+    seed_builtin(
+        &States::load_for(dirs, workspace),
+        &mut by_name,
+        &mut problems,
+    );
     Skills {
         found: by_name.into_values().collect(),
         problems,
@@ -84,7 +130,11 @@ pub fn discover(dirs: &Dirs, root: &Path, workspace: Option<WorkspaceId>) -> Ski
     let mut by_name: BTreeMap<String, SkillDef> = BTreeMap::new();
     let mut problems = Vec::new();
 
-    seed_builtin(&mut by_name, &mut problems);
+    seed_builtin(
+        &States::load_for(dirs, workspace),
+        &mut by_name,
+        &mut problems,
+    );
 
     let sources = [
         (dirs.data.join("skills"), SkillOrigin::User),
@@ -225,20 +275,35 @@ fn read_skill(file: &Path, fallback_name: &str, origin: SkillOrigin) -> Result<S
 
 /// Seeded first so a user or workspace skill of the same name still wins: overriding the guide is
 /// a legitimate thing to want, and the conflict is reported like any other.
-fn seed_builtin(by_name: &mut BTreeMap<String, SkillDef>, problems: &mut Vec<String>) {
-    match parse_skill(
-        BUILTIN_SKILL.text,
-        BUILTIN_SKILL.name,
-        SkillOrigin::Builtin,
-        builtin_path(BUILTIN_SKILL.name),
-    ) {
-        Ok(def) => {
-            by_name.insert(def.name.clone(), def);
+///
+/// A built-in carries no folder, so the switch that turns one off is the state file's skill map
+/// rather than a marker on disk. `Origin::Global` is what a built-in is — it never came from the
+/// repository — which is also what lets a machine-wide switch reach it.
+fn seed_builtin(
+    states: &States,
+    by_name: &mut BTreeMap<String, SkillDef>,
+    problems: &mut Vec<String>,
+) {
+    for skill in BUILTIN_SKILLS {
+        match parse_skill(
+            skill.text,
+            skill.name,
+            SkillOrigin::Builtin,
+            builtin_path(skill.name),
+        ) {
+            Ok(mut def) => {
+                def.enabled = states
+                    .verdict(
+                        ExtensionKind::Skill,
+                        &def.name,
+                        &Origin::Global,
+                        Some(skill.enabled_by_default),
+                    )
+                    .enabled;
+                by_name.insert(def.name.clone(), def);
+            }
+            Err(why) => problems.push(format!("built-in skill {} is malformed: {why}", skill.name)),
         }
-        Err(why) => problems.push(format!(
-            "built-in skill {} is malformed: {why}",
-            BUILTIN_SKILL.name
-        )),
     }
 }
 
@@ -262,12 +327,11 @@ fn parse_skill(
 
     let description = parsed
         .description
-        .or(parsed.when_to_use)
         .map(|d| trim_to(&fold_whitespace(d.trim()), MAX_DESCRIPTION_CHARS))
         .filter(|d| !d.is_empty())
         .ok_or(
-            "no description in the frontmatter (the model uses it to decide when to load the \
-        skill)",
+            "no `description` in the frontmatter — the skill format is `name` plus `description`, \
+        and the model uses the description to decide when to load it",
         )?;
     reject_invisible(&description, "description")?;
 
@@ -296,6 +360,9 @@ fn parse_skill(
         descriptions,
         path,
         origin,
+        // A file that got this far was not skipped by its disable marker, so it is on. Only the
+        // built-ins carry a switch that lives somewhere other than the folder.
+        enabled: true,
     })
 }
 
@@ -375,6 +442,7 @@ fn trim_to(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zlogic_tools::SkillHost;
 
     fn write_skill(dir: &Path, name: &str, body: &str) {
         let d = dir.join(name);
@@ -384,6 +452,32 @@ mod tests {
 
     fn dirs_under(base: &Path) -> Dirs {
         Dirs::under(base)
+    }
+
+    /// A built-in ships switched off, so a test that wants to load one turns it on the way a
+    /// user would — one boolean in the state file.
+    fn with_builtins_on(base: &Path) -> Dirs {
+        let dirs = dirs_under(base);
+        for skill in BUILTIN_SKILLS {
+            crate::extensions::state::set_global(
+                &dirs,
+                ExtensionKind::Skill,
+                skill.name,
+                Some(true),
+            )
+            .unwrap();
+        }
+        dirs
+    }
+
+    /// Look a skill up by name. `found[0]` is not a skill under test: built-ins are seeded first,
+    /// so the first entry is whatever they are called today.
+    fn by_name<'a>(skills: &'a Skills, name: &str) -> &'a SkillDef {
+        skills
+            .found
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("{name} was not discovered"))
     }
 
     fn write_plugin_skill(dirs: &Dirs, plugin: &str, skill: &str) {
@@ -454,8 +548,11 @@ mod tests {
         );
     }
 
+    /// The format is `name` plus `description`. Another ecosystem's spelling of the second field is
+    /// not read, so a skill carrying only that one is skipped and the report says which key is
+    /// missing.
     #[test]
-    fn when_to_use_stands_in_for_a_missing_description() {
+    fn a_when_to_use_field_is_not_a_description() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = dirs_under(tmp.path());
         write_skill(
@@ -463,8 +560,13 @@ mod tests {
             "x",
             "---\nname: x\nwhen_to_use: after a release\n---\nbody\n",
         );
-        let skills = discover(&dirs, &tmp.path().join("repo"), None);
-        assert_eq!(skills.found[0].description, "after a release");
+        let skills = installed(discover(&dirs, &tmp.path().join("repo"), None));
+        assert!(skills.found.is_empty());
+        assert!(
+            skills.problems[0].contains("description"),
+            "{:?}",
+            skills.problems
+        );
     }
 
     #[test]
@@ -477,9 +579,9 @@ mod tests {
             "---\nname: x\ndescription: the model reads this\ndescriptions:\n  zh-CN: 界面读这一句\n---\nbody\n",
         );
         let skills = discover(&dirs, &tmp.path().join("repo"), None);
-        assert_eq!(skills.found[0].description, "the model reads this");
+        assert_eq!(by_name(&skills, "x").description, "the model reads this");
         assert_eq!(
-            skills.found[0]
+            by_name(&skills, "x")
                 .descriptions
                 .get("zh-CN")
                 .map(String::as_str),
@@ -488,19 +590,172 @@ mod tests {
     }
 
     #[test]
-    fn the_built_in_guide_carries_both_languages() {
-        let skills = builtin_skills();
-        let guide = &skills.found[0];
-        assert_eq!(guide.name, "zlogic-guide");
+    fn a_bundled_skill_carries_both_languages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = builtin_skills(&dirs_under(tmp.path()), None);
+        let bundled = skills
+            .found
+            .iter()
+            .find(|s| s.name == TEST_BUILTIN)
+            .expect("the test entry is compiled in");
         assert!(
-            guide.descriptions.contains_key("zh-CN"),
+            bundled.descriptions.contains_key("zh-CN"),
             "{:?}",
-            guide.descriptions
+            bundled.descriptions
         );
         assert!(
-            guide.descriptions.contains_key("en-US"),
+            bundled.descriptions.contains_key("en-US"),
             "{:?}",
-            guide.descriptions
+            bundled.descriptions
+        );
+    }
+
+    #[test]
+    fn every_built_in_skill_parses_and_says_when_to_load_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        for skill in BUILTIN_SKILLS {
+            let found = builtin_skills(&dirs_under(tmp.path()), None);
+            assert!(
+                found.problems.is_empty(),
+                "{}: {:?}",
+                skill.name,
+                found.problems
+            );
+            let def = found
+                .found
+                .iter()
+                .find(|s| s.name == skill.name)
+                .unwrap_or_else(|| panic!("{} is not listed", skill.name));
+            assert!(
+                !def.description.is_empty(),
+                "{} has no description, so the model never loads it",
+                skill.name
+            );
+            assert!(
+                unsupported_fields(skill.text).is_empty(),
+                "{} declares fields this build cannot honour: {:?}",
+                skill.name,
+                unsupported_fields(skill.text)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn loading_a_bundled_skill_returns_its_own_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = SessionSkills {
+            dirs: with_builtins_on(tmp.path()),
+            root: tmp.path().join("repo"),
+            workspace: WorkspaceId::new(),
+        };
+        let loaded = host.load(TEST_BUILTIN).await.unwrap();
+        assert!(
+            loaded
+                .raw_body
+                .contains("the body a bundled skill would carry"),
+            "{}",
+            loaded.raw_body
+        );
+        let guide = host.load("zlogic-guide").await.unwrap();
+        assert_ne!(
+            guide.raw_body, loaded.raw_body,
+            "each bundled skill loads its own text, not one shared body"
+        );
+    }
+
+    /// Bundled skills carry a `descriptions:` map so the clients can show a translated card. That
+    /// is the client's business: the model reads `description` and a frontmatter-free body.
+    #[tokio::test]
+    async fn the_client_only_translations_never_reach_the_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = SessionSkills {
+            dirs: with_builtins_on(tmp.path()),
+            root: tmp.path().join("repo"),
+            workspace: WorkspaceId::new(),
+        };
+        for skill in BUILTIN_SKILLS {
+            let loaded = host.load(skill.name).await.unwrap();
+            assert!(
+                !loaded.raw_body.starts_with("---"),
+                "{}: frontmatter is not model-facing",
+                skill.name
+            );
+            for leaked in ["descriptions:", "zh-CN:"] {
+                assert!(
+                    !loaded.raw_body.contains(leaked),
+                    "{}: {leaked} reached the model",
+                    skill.name
+                );
+            }
+        }
+        assert!(
+            builtin_skills(&host.dirs, Some(host.workspace))
+                .found
+                .iter()
+                .find(|s| s.name == TEST_BUILTIN)
+                .unwrap()
+                .descriptions
+                .contains_key("zh-CN"),
+            "the clients still get their translated card"
+        );
+    }
+
+    /// A bundled skill nobody asked for spends a user's context the moment the model can see it,
+    /// so it ships off: listed for the switch to offer, never offered to the model, not loadable.
+    #[tokio::test]
+    async fn a_bundled_skill_is_off_until_it_is_switched_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let off = SessionSkills {
+            dirs: dirs_under(tmp.path()),
+            root: tmp.path().join("repo"),
+            workspace: WorkspaceId::new(),
+        };
+        assert!(
+            off.available().await.is_empty(),
+            "the model must not be told about a skill that is switched off"
+        );
+        assert!(
+            off.load(TEST_BUILTIN).await.is_err(),
+            "and loading it by name has to fail too"
+        );
+
+        let on = SessionSkills {
+            dirs: with_builtins_on(tmp.path()),
+            root: tmp.path().join("repo"),
+            workspace: off.workspace,
+        };
+        assert!(
+            on.available().await.contains(&TEST_BUILTIN.to_string()),
+            "{:?}",
+            on.available().await
+        );
+        assert!(on.load(TEST_BUILTIN).await.is_ok());
+    }
+
+    /// One workspace turning it on must not turn it on everywhere, and the other way round: the
+    /// same three layers a server or a plugin lives on.
+    #[test]
+    fn a_bundled_skills_switch_follows_the_state_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = dirs_under(tmp.path());
+        let elsewhere = WorkspaceId::new();
+        let here = WorkspaceId::new();
+        crate::extensions::state::set_personal(
+            &dirs,
+            here,
+            ExtensionKind::Skill,
+            TEST_BUILTIN,
+            Some(true),
+        )
+        .unwrap();
+
+        assert!(
+            by_name(&discover(&dirs, tmp.path(), Some(here)), TEST_BUILTIN).enabled,
+            "switched on for this workspace"
+        );
+        assert!(
+            !by_name(&discover(&dirs, tmp.path(), Some(elsewhere)), TEST_BUILTIN).enabled,
+            "another workspace did not ask for it"
         );
     }
 
@@ -514,7 +769,7 @@ mod tests {
             "---\ndescription: d\n---\n",
         );
         let skills = discover(&dirs, &tmp.path().join("repo"), None);
-        assert_eq!(skills.found[0].name, "release-notes");
+        assert_eq!(by_name(&skills, "release-notes").name, "release-notes");
     }
 
     #[test]
@@ -653,7 +908,8 @@ mod tests {
             "long",
             &format!("---\ndescription: {long}\n---\n"),
         );
-        let d = &discover(&dirs, &tmp.path().join("repo"), None).found[0].description;
+        let skills = discover(&dirs, &tmp.path().join("repo"), None);
+        let d = &by_name(&skills, "long").description;
         assert_eq!(
             d.chars().count(),
             MAX_DESCRIPTION_CHARS + 1,
@@ -700,6 +956,7 @@ impl zlogic_tools::SkillHost for SessionSkills {
         discover(&self.dirs, &self.root, Some(self.workspace))
             .found
             .into_iter()
+            .filter(|s| s.enabled)
             .map(|s| s.name)
             .collect()
     }
@@ -710,10 +967,17 @@ impl zlogic_tools::SkillHost for SessionSkills {
             .into_iter()
             .find(|s| s.name == name)
             .ok_or_else(|| format!("skill {name} is no longer in the library"))?;
+        if !found.enabled {
+            return Err(format!("skill {name} is switched off"));
+        }
 
         // A built-in's `path` is a label, not a file, so its body comes from the binary.
         let text = match found.origin {
-            SkillOrigin::Builtin => BUILTIN_SKILL.text.to_string(),
+            SkillOrigin::Builtin => BUILTIN_SKILLS
+                .iter()
+                .find(|s| s.name == found.name)
+                .map(|s| s.text.to_string())
+                .ok_or_else(|| format!("built-in skill {} is not compiled in", found.name))?,
             _ => std::fs::read_to_string(&found.path)
                 .map_err(|e| format!("cannot read {}: {e}", found.path.display()))?,
         };
@@ -728,6 +992,10 @@ impl zlogic_tools::SkillHost for SessionSkills {
     }
 }
 
+/// Everything the model gets, which is the body alone.
+///
+/// The frontmatter is cut here, not merely ignored while parsing: it carries the client-only
+/// `descriptions` map, and the standard format the guide documents is `name` plus `description`.
 fn body_after_frontmatter(text: &str) -> &str {
     split_frontmatter(text)
         .map(|(_, body)| body)

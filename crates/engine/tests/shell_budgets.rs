@@ -150,6 +150,8 @@ impl Rig {
             interaction: Some(interactions.clone()),
             tasks: None,
             runtime_paths: None,
+            env: None,
+            computer: None,
             model_resolver: None,
             limits: Limits::default(),
             context: ContextPolicy::default(),

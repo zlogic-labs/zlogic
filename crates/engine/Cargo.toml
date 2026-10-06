@@ -25,6 +25,7 @@ zlogic-store = { path = "../store" }
 zlogic-tools = { path = "../tools" }
 zlogic-task = { path = "../task" }
 zlogic-proctree = { path = "../proctree" }
+zlogic-nettable = { path = "../nettable" }
 zlogic-policy = { path = "../policy" }
 serde.workspace = true
 serde_json.workspace = true

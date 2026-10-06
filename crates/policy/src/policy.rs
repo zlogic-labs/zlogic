@@ -54,6 +54,78 @@ pub struct ScriptRule {
     pub effect: Effect,
 }
 
+/// One rule about the `computer` tool.
+///
+/// **Substring matching, not regex, and that is a decision about this crate rather than about
+/// policy.** `zlogic-policy` is std-only so that the offline policy tooling builds with nothing
+/// fetched; a regex engine would be the first dependency it ever had. What a user actually writes
+/// here — `1password`, `keepass`, `slack` — is a substring, so substring is what it is, case
+/// insensitively. A rule whose target is unknown does not match: a window the backend could not
+/// identify must not silently fall under a rule about `keepass`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComputerRule {
+    pub id: String,
+    /// Empty covers every action.
+    #[serde(default)]
+    pub actions: Vec<String>,
+    /// Case-insensitive substring of the target process name.
+    pub process_contains: Option<String>,
+    /// Case-insensitive substring of the target window title.
+    pub title_contains: Option<String>,
+    pub effect: Effect,
+    /// Shown in the approval prompt when this rule is the reason for it.
+    pub message: Option<String>,
+}
+
+/// What the tool knows about the window it is about to act on.
+#[derive(Debug, Clone, Default)]
+pub struct ComputerTarget {
+    pub process: Option<String>,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComputerDecision {
+    pub effect: Effect,
+    pub matched_rule_ids: Vec<String>,
+    pub reason: String,
+    /// The most specific message any matching rule asked to be shown. Not the strictest rule's
+    /// message: a user who wrote a note about credential windows wants to read it even when the
+    /// verdict came from the catch-all.
+    pub message: Option<String>,
+}
+
+impl ComputerRule {
+    fn matches(&self, action: &str, target: &ComputerTarget) -> bool {
+        if !self.actions.is_empty()
+            && !self
+                .actions
+                .iter()
+                .any(|candidate| candidate.trim().eq_ignore_ascii_case(action))
+        {
+            return false;
+        }
+        if let Some(needle) = &self.process_contains
+            && !contains_ci(target.process.as_deref(), needle)
+        {
+            return false;
+        }
+        if let Some(needle) = &self.title_contains
+            && !contains_ci(target.title.as_deref(), needle)
+        {
+            return false;
+        }
+        true
+    }
+}
+
+fn contains_ci(haystack: Option<&str>, needle: &str) -> bool {
+    let needle = needle.trim();
+    needle.is_empty()
+        || haystack.is_some_and(|value| value.to_lowercase().contains(&needle.to_lowercase()))
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
@@ -74,6 +146,10 @@ pub struct Policy {
     pub paths: Vec<PathRule>,
     #[serde(default)]
     pub scripts: Vec<ScriptRule>,
+    /// Rules about the `computer` tool. Empty in the default policy, which means every action is
+    /// asked about rather than allowed — see [`Policy::evaluate_computer`].
+    #[serde(default)]
+    pub computer: Vec<ComputerRule>,
     /// Concrete directories that must survive deletion. A Delete is denied
     /// when its target is the protected path, is inside it, or is an ancestor
     /// that would recursively remove it.
@@ -96,6 +172,7 @@ impl Default for Policy {
             exec: Vec::new(),
             paths: Vec::new(),
             scripts: Vec::new(),
+            computer: Vec::new(),
             protected_delete: Vec::new(),
             protected_write: Vec::new(),
         }
@@ -217,6 +294,17 @@ impl Policy {
                 )));
             }
         }
+        for r in &self.computer {
+            if r.id.is_empty() {
+                return Err(PolicyError("computer rule id must not be empty".into()));
+            }
+            if r.actions.iter().any(|a| a.trim().is_empty()) {
+                return Err(PolicyError(format!(
+                    "computer rule '{}' has an empty action name",
+                    r.id
+                )));
+            }
+        }
         for (field, list) in [
             ("protected_delete", &self.protected_delete),
             ("protected_write", &self.protected_write),
@@ -246,6 +334,63 @@ impl Policy {
             effect,
             ops,
             op_decisions,
+        })
+    }
+
+    /// Decides one `computer` call.
+    ///
+    /// Strictest wins, exactly like every other family, with one deliberate difference from
+    /// `evaluate_ops`: **no matching rule is Ask, not Allow.** A mouse is not an operation on a
+    /// path, so there is no uncertainty floor to fall on, and a tool whose safety depends on the
+    /// user having written a rule down is not safe. The empty default policy therefore means "ask
+    /// about everything", which is the honest starting point.
+    pub fn evaluate_computer(
+        &self,
+        action: &str,
+        target: &ComputerTarget,
+    ) -> Result<ComputerDecision, PolicyError> {
+        self.validate()?;
+        let matched: Vec<&ComputerRule> = self
+            .computer
+            .iter()
+            .filter(|rule| rule.matches(action, target))
+            .collect();
+        if matched.is_empty() {
+            return Ok(ComputerDecision {
+                effect: Effect::Ask,
+                matched_rule_ids: Vec::new(),
+                reason: format!("no policy rule covers the computer action {action:?}"),
+                message: None,
+            });
+        }
+        // Deny > Ask > Allow is the enum's own order, so the maximum is the strictest verdict.
+        let effect = matched.iter().map(|rule| rule.effect).max().unwrap();
+        let deny = matched
+            .iter()
+            .find(|rule| rule.effect == Effect::Deny)
+            .map(|rule| rule.id.clone())
+            .unwrap_or_default();
+        let reason = if effect == Effect::Deny {
+            format!("policy rule {deny:?} denies the computer action {action:?}")
+        } else {
+            let named: Vec<String> = matched
+                .iter()
+                .filter(|rule| rule.effect == effect)
+                .map(|rule| format!("{:?}", rule.id))
+                .collect();
+            format!(
+                "policy rule(s) {} apply to the computer action {action:?}",
+                named.join(", ")
+            )
+        };
+        Ok(ComputerDecision {
+            effect,
+            matched_rule_ids: matched.iter().map(|rule| rule.id.clone()).collect(),
+            reason,
+            message: matched
+                .iter()
+                .find_map(|rule| rule.message.clone())
+                .filter(|message| !message.trim().is_empty()),
         })
     }
 
@@ -537,6 +682,26 @@ impl Policy {
             }
             out.push_str(&format!("      effect: {}\n", effect_yaml(r.effect)));
         }
+        if !self.computer.is_empty() {
+            out.push_str("  computer:\n");
+        }
+        for r in &self.computer {
+            out.push_str(&format!("    - id: {}\n", yaml_quote(&r.id)));
+            write_yaml_list(&mut out, "actions", &r.actions);
+            if let Some(process) = &r.process_contains {
+                out.push_str(&format!(
+                    "      process_contains: {}\n",
+                    yaml_quote(process)
+                ));
+            }
+            if let Some(title) = &r.title_contains {
+                out.push_str(&format!("      title_contains: {}\n", yaml_quote(title)));
+            }
+            out.push_str(&format!("      effect: {}\n", effect_yaml(r.effect)));
+            if let Some(message) = &r.message {
+                out.push_str(&format!("      message: {}\n", yaml_quote(message)));
+            }
+        }
         out
     }
 }
@@ -610,6 +775,9 @@ pub fn default_workspace_policy(workspace: &Path, home: &Path, app_name: &str) -
             glob: None,
             effect: Effect::Allow,
         }],
+        // Deliberately empty. Every computer action asks until the user writes a rule down, which
+        // is the only defensible default for a tool that drives the mouse.
+        computer: Vec::new(),
         protected_delete: vec![
             workspace.join(".git"),
             home.join(format!(".{app_name}")),
@@ -641,6 +809,13 @@ fn yaml_quote(value: &str) -> String {
 }
 
 fn write_yaml_list(out: &mut String, name: &str, values: &[String]) {
+    // An empty list has to be written as `[]`. A bare `name:` parses as null, which is not a
+    // sequence, so the round trip this function exists for would fail on the one rule that has
+    // nothing in that field.
+    if values.is_empty() {
+        out.push_str(&format!("      {name}: []\n"));
+        return;
+    }
     out.push_str(&format!("      {name}:\n"));
     for value in values {
         out.push_str(&format!("        - {}\n", yaml_quote(value)));
@@ -793,6 +968,163 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn target(process: Option<&str>, title: Option<&str>) -> ComputerTarget {
+        ComputerTarget {
+            process: process.map(str::to_string),
+            title: title.map(str::to_string),
+        }
+    }
+
+    fn rule(id: &str, actions: &[&str], process: Option<&str>, effect: Effect) -> ComputerRule {
+        ComputerRule {
+            id: id.to_string(),
+            actions: actions.iter().map(|a| (*a).to_string()).collect(),
+            process_contains: process.map(str::to_string),
+            title_contains: None,
+            effect,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn a_computer_action_no_rule_covers_asks_rather_than_being_allowed() {
+        // The empty default policy has to mean "ask about the mouse". A tool whose safety depends
+        // on the user having written a rule down is not safe, and there is no uncertainty floor to
+        // fall on the way `evaluate_ops` has one.
+        let decision = Policy::default()
+            .evaluate_computer("mouse", &target(Some("notepad.exe"), None))
+            .unwrap();
+        assert_eq!(decision.effect, Effect::Ask);
+        assert!(decision.matched_rule_ids.is_empty());
+    }
+
+    #[test]
+    fn the_strictest_matching_computer_rule_wins() {
+        let policy = Policy {
+            computer: vec![
+                rule(
+                    "allow-notes",
+                    &["mouse"],
+                    Some("notepad.exe"),
+                    Effect::Allow,
+                ),
+                rule("deny-all", &[], None, Effect::Deny),
+            ],
+            ..Policy::default()
+        };
+        assert_eq!(
+            policy
+                .evaluate_computer("mouse", &target(Some("notepad.exe"), None))
+                .unwrap()
+                .effect,
+            Effect::Deny,
+            "an allow for one app does not survive a blanket deny"
+        );
+        assert_eq!(
+            policy
+                .evaluate_computer("key", &target(Some("chrome.exe"), None))
+                .unwrap()
+                .effect,
+            Effect::Deny
+        );
+    }
+
+    #[test]
+    fn a_computer_rule_matches_a_process_case_insensitively_and_anywhere_in_the_name() {
+        let policy = Policy {
+            computer: vec![rule(
+                "allow-notepad",
+                &["mouse", "key"],
+                Some("notepad"),
+                Effect::Allow,
+            )],
+            ..Policy::default()
+        };
+        for process in [
+            "notepad.exe",
+            "Notepad.EXE",
+            "C:\\Program Files\\Notepad\\notepad.exe",
+        ] {
+            assert_eq!(
+                policy
+                    .evaluate_computer("mouse", &target(Some(process), None))
+                    .unwrap()
+                    .effect,
+                Effect::Allow,
+                "{process}"
+            );
+        }
+        assert_eq!(
+            policy
+                .evaluate_computer("type", &target(Some("notepad.exe"), None))
+                .unwrap()
+                .effect,
+            Effect::Ask,
+            "the rule names two actions, and `type` is not one of them"
+        );
+    }
+
+    #[test]
+    fn a_computer_rule_is_scoped_to_the_process_it_names() {
+        let policy = Policy {
+            computer: vec![rule(
+                "allow-notepad",
+                &["mouse"],
+                Some("notepad"),
+                Effect::Allow,
+            )],
+            ..Policy::default()
+        };
+        // Same title, different program: a document called "Budget.xlsx" is not the same thing in
+        // Excel as in a text editor, and a rule that could not tell them apart would be one click
+        // away from the wrong one.
+        let decision = policy
+            .evaluate_computer(
+                "mouse",
+                &target(Some("excel.exe"), Some("Budget.xlsx - Excel")),
+            )
+            .unwrap();
+        assert_eq!(decision.effect, Effect::Ask);
+    }
+
+    #[test]
+    fn computer_rules_round_trip_through_yaml() {
+        let policy = Policy {
+            computer: vec![ComputerRule {
+                id: "allow-notes".into(),
+                actions: vec!["mouse".into(), "scroll".into()],
+                process_contains: Some("notepad.exe".into()),
+                title_contains: None,
+                effect: Effect::Allow,
+                message: Some("notes is fine".into()),
+            }],
+            ..Policy::default()
+        };
+        let text = policy.to_yaml();
+        let reloaded = Policy::from_yaml(&text).expect("a computer rule survives the round trip");
+        assert_eq!(reloaded.computer.len(), 1, "{text}");
+        assert_eq!(reloaded.computer[0].id, "allow-notes");
+        assert_eq!(reloaded.computer[0].actions, ["mouse", "scroll"]);
+        assert_eq!(
+            reloaded.computer[0].process_contains.as_deref(),
+            Some("notepad.exe")
+        );
+        assert_eq!(
+            reloaded.computer[0].message.as_deref(),
+            Some("notes is fine")
+        );
+    }
+
+    #[test]
+    fn an_empty_computer_list_survives_the_round_trip_as_a_list() {
+        // Written as nothing at all, this parses back as a null rather than a sequence, and the
+        // whole file then fails to load.
+        let text = Policy::default().to_yaml();
+        let reloaded = Policy::from_yaml(&text).expect("the default policy round-trips");
+        assert!(reloaded.computer.is_empty());
+        assert!(reloaded.commands.is_empty());
+    }
 
     #[cfg(not(windows))]
     fn abs(p: &str) -> String {

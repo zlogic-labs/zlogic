@@ -7,6 +7,7 @@ mod common;
 use zlogic_protocol::TurnId;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use async_trait::async_trait;
 use common::*;
@@ -819,6 +820,105 @@ async fn a_slow_tool_is_stopped_at_its_budget() {
     assert_eq!(out.stats.tools.timed_out, 1);
     assert_eq!(out.stats.tools.succeeded, 0);
     assert!(h.tool_results()[0].1.contains("budget"));
+}
+
+/// The bug this test exists for: a tool on `spawn_blocking` outlives the timeout that abandoned it.
+///
+/// `Sleeper` above sleeps on the executor, so dropping its future is enough to stop it and the test
+/// would pass even with no budget signal at all. A blocking tool is different — the drop leaves a
+/// thread running with nobody waiting for it, which is how a timed-out search kept reading the disk
+/// for hours. So this one goes through `spawn_blocking`, polls the budget token the way grep and the
+/// archive tools do, and reports back how it ended.
+#[tokio::test]
+async fn a_blocking_tool_is_stopped_at_its_budget_and_not_merely_abandoned() {
+    // The worker reports how it ended. Waiting for this rather than for a flag is what makes the
+    // test able to fail: with no budget signal the worker runs its full 5s and sends nothing until
+    // then, so a receive that has to time out here really is the buggy behaviour.
+    let (ended_tx, mut ended_rx) = tokio::sync::mpsc::unbounded_channel();
+    let ran_to_completion = Arc::new(AtomicBool::new(false));
+
+    struct BlockingSleeper {
+        ran_to_completion: Arc<AtomicBool>,
+        ended: tokio::sync::mpsc::UnboundedSender<&'static str>,
+    }
+    #[async_trait]
+    impl zlogic_tools::Tool for BlockingSleeper {
+        fn meta(&self) -> zlogic_tools::ToolMeta {
+            zlogic_tools::ToolMeta {
+                name: "block".into(),
+                source: "test",
+                risk: zlogic_tools::ToolRisk::Read,
+            }
+        }
+        fn definition(&self) -> zlogic_protocol::llm::ToolDefinition {
+            zlogic_protocol::llm::ToolDefinition {
+                name: "block".into(),
+                description: "blocks".into(),
+                parameters: serde_json::json!({ "type": "object" }),
+            }
+        }
+        async fn execute(
+            &self,
+            ctx: &zlogic_tools::ToolCtx,
+            _args: &str,
+        ) -> zlogic_tools::Result<zlogic_tools::ToolExecResult> {
+            let ran_to_completion = self.ran_to_completion.clone();
+            let ended = self.ended.clone();
+            let cancel = ctx.cancel.clone();
+            let budget = ctx.budget.clone();
+            tokio::task::spawn_blocking(move || {
+                // Poll the way the real blocking tools do. The loop is far longer than the test's
+                // one-second ceiling, so only a working signal ends this early.
+                for _ in 0..500 {
+                    if budget.is_cancelled() {
+                        let _ = ended.send("budget");
+                        return;
+                    }
+                    if cancel.is_cancelled() {
+                        let _ = ended.send("cancelled");
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                ran_to_completion.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = ended.send("ran to completion");
+            })
+            .await
+            .map_err(|error| zlogic_tools::ToolError::Failed(error.to_string()))?;
+            Ok(zlogic_tools::ToolExecResult::success("finished"))
+        }
+    }
+
+    let h = Harness::new()
+        .tool(Arc::new(BlockingSleeper {
+            ran_to_completion: ran_to_completion.clone(),
+            ended: ended_tx,
+        }))
+        .limits(Limits {
+            tool_timeout_secs: 1,
+            ..Default::default()
+        });
+
+    let client = Scripted::new(vec![call("block", "{}"), MockScript::text("gave up")]);
+    let out = h
+        .core()
+        .run(TurnId::new(), h.plan(client), user("block"), h.token())
+        .await
+        .unwrap();
+
+    assert_eq!(out.stats.tools.timed_out, 1);
+
+    // The worker has to actually unwind, and it has to do it because it was told to.
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(3), ended_rx.recv())
+        .await
+        .expect("the blocking task was abandoned rather than stopped")
+        .expect("the blocking task never reported how it ended");
+
+    assert_eq!(ended, "budget", "stopped for the wrong reason");
+    assert!(
+        !ran_to_completion.load(std::sync::atomic::Ordering::SeqCst),
+        "the worker ran to completion after the runtime reported it stopped"
+    );
 }
 
 /// Large output goes to the object store, and the entry keeps a reference to it.

@@ -340,6 +340,11 @@ impl<'a> EntryStore<'a> {
     ) -> Result<EntryRecord> {
         let entry_id = EntryId::new();
 
+        // Read before `new.data` moves into the row: a `turn_end` payload is the one entry that
+        // says something about the session rather than about the turn, and it is what maintains
+        // `session.interrupted`.
+        let interrupted = turn_end_interrupted(&new.data);
+
         // Offloaded rows keep a null placeholder inline; the content is in the object store.
         let data = if offloaded { Value::Null } else { new.data };
 
@@ -391,6 +396,19 @@ impl<'a> EntryStore<'a> {
                     ":turn_seq": new.turn_seq,
                     ":turn_id": new.turn_id,
                     ":created_at": created_at,
+                },
+            )?;
+        }
+
+        // How a turn ended is the one thing an event entry does say about the session, and only
+        // a `turn_end` carries it. Recorded here, in the same transaction, because a session list
+        // that had to re-derive it would walk every turn of every session it returns.
+        if let Some(interrupted) = interrupted {
+            self.conn.execute(
+                "UPDATE session SET interrupted = :interrupted WHERE session_id = :session_id",
+                named_params! {
+                    ":session_id": new.session_id,
+                    ":interrupted": i64::from(interrupted),
                 },
             )?;
         }
@@ -630,6 +648,31 @@ impl<'a> EntryStore<'a> {
         let rows: Vec<EntryRecord> = st
             .query_map(
                 named_params! { ":session_id": session_id, ":turn_seq": turn_seq },
+                map_row,
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        self.attach_objects(rows)
+    }
+
+    /// One turn addressed by its id — which is what a lock row hands you.
+    ///
+    /// `turn_seq` is the cheaper way to say this and the one used everywhere else in the engine,
+    /// because a turn is normally loaded by position. This exists for the session in a shared
+    /// workspace that has to read a *concurrent* session's live turn to tell whose output it is
+    /// looking at: `session_locks` carries `turn_id`. `idx_entry_turn_id` answers it from the index;
+    /// without that index this scans the whole session — measured at 94 ms on a 12,187-entry one.
+    pub fn list_turn_by_id(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Result<Vec<EntryRecord>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM session_entry
+             WHERE session_id = :session_id AND turn_id = :turn_id ORDER BY seq"
+        ))?;
+        let rows: Vec<EntryRecord> = st
+            .query_map(
+                named_params! { ":session_id": session_id, ":turn_id": turn_id },
                 map_row,
             )?
             .collect::<rusqlite::Result<_>>()?;
@@ -1317,12 +1360,13 @@ impl<'a> EntryStore<'a> {
         Ok(old_ids.len())
     }
 
-    /// Re-derives a session's `turn_count` / `last_message_at` from `session_entry`, taking the
-    /// current live lock (if any) into account.
+    /// Re-derives a session's `turn_count` / `last_message_at` / `interrupted` from
+    /// `session_entry`, taking the current live lock (if any) into account.
     /// The columns are maintained incrementally on [`EntryStore::append`] and on lock steal /
     /// release; this authoritative rebuild is used by `rewind`, fork copy and by callers that
     /// insert rows directly. It is safe to call for sessions with no rows (writes the defaults).
     pub fn recompute_stats(&self, session_id: SessionId) -> Result<()> {
+        let interrupted = self.last_turn_interrupted(session_id)?;
         self.conn.execute(
             "UPDATE session SET
                  turn_count = (
@@ -1336,11 +1380,39 @@ impl<'a> EntryStore<'a> {
                        SELECT 1 FROM session_locks l
                        WHERE l.session_id = :session_id AND l.turn_id = e.turn_id
                      )
-                 )
+                 ),
+                 interrupted = :interrupted
                WHERE session_id = :session_id",
-            named_params! { ":session_id": session_id },
+            named_params! { ":session_id": session_id, ":interrupted": i64::from(interrupted) },
         )?;
         Ok(())
+    }
+
+    /// What `session.interrupted` must read after a rebuild: the **last** `turn_end` in the
+    /// session, and whether it was interrupted. Descending, so the first hit is the latest —
+    /// a turn that was interrupted and then followed by a normal one is not marked.
+    ///
+    /// Matching is done in Rust as everywhere else in this store; the `LIKE` is a pre-filter on
+    /// serde's compact encoding, so only a turn_end-shaped row is ever parsed. This is the one
+    /// place a rebuild pays for that scan, and it runs on rewind / fork, not on a list.
+    fn last_turn_interrupted(&self, session_id: SessionId) -> Result<bool> {
+        let data = self
+            .conn
+            .query_row(
+                "SELECT data FROM session_entry
+             WHERE session_id = :session_id AND kind = 'event'
+               AND data LIKE '%\"type\":\"turn_end\"%'
+             ORDER BY seq DESC LIMIT 1",
+                named_params! { ":session_id": session_id },
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(data
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .as_ref()
+            .and_then(turn_end_interrupted)
+            .unwrap_or(false))
     }
 
     /// Every object still referenced by this session — what a cleanup pass must keep.
@@ -1401,6 +1473,26 @@ fn interaction_id_of(e: &EntryRecord) -> Option<String> {
     e.data.get("interaction_id")?.as_str().map(str::to_string)
 }
 
+/// Whether an entry payload is a `turn_end` reporting a turn that ended without finishing —
+/// stopped by the user (`"cancelled"`), cut off mid-flight (`{"incomplete": "interrupted"}`) or
+/// errored out (`"failed"`).
+///
+/// `None` when the payload is not a `turn_end` at all, which is what tells the append path to
+/// leave `session.interrupted` alone. `limit_reached` and a `completed` turn are not this: the
+/// first is a budget the user set, the second is the ordinary ending. Every status counted here
+/// is one the chat view can pick the conversation back up from.
+fn turn_end_interrupted(data: &Value) -> Option<bool> {
+    if data.get("type")?.as_str()? != "turn_end" {
+        return None;
+    }
+    let status = data.get("status")?;
+    Some(match status {
+        Value::String(status) => status == "cancelled" || status == "failed",
+        Value::Object(_) => status.get("incomplete").and_then(Value::as_str) == Some("interrupted"),
+        _ => false,
+    })
+}
+
 fn derived_asset_kind(obj: &ObjectRef) -> &'static str {
     match obj.role {
         ObjectRole::Diff => "diff",
@@ -1446,6 +1538,46 @@ mod tests {
     use serde_json::json;
     use zlogic_objects::MemoryObjectStore;
     use zlogic_protocol::WorkspaceId;
+
+    /// The two ways of asking for a turn have to agree, because the engine uses whichever it
+    /// happens to be holding: `turn_seq` when it drove the turn itself, `turn_id` when it read a
+    /// concurrent session's live turn out of a lock row.
+    #[test]
+    fn a_turn_can_be_read_by_id_as_well_as_by_position() {
+        let (db, session) = setup();
+        let store = crate::SharedStore::new(db);
+        let first = zlogic_protocol::TurnId::new();
+        let second = zlogic_protocol::TurnId::new();
+        for (turn_seq, turn_id) in [(1, first), (2, second)] {
+            store
+                .with(|db| {
+                    db.entries().append(NewEntry::new(
+                        session,
+                        turn_id,
+                        turn_seq,
+                        EntryKind::AssistantText,
+                        json!({ "turn": turn_seq }),
+                    ))
+                })
+                .unwrap();
+        }
+
+        let by_seq = store.with(|db| db.entries().list_turn(session, 2)).unwrap();
+        let by_id = store
+            .with(|db| db.entries().list_turn_by_id(session, second))
+            .unwrap();
+        assert_eq!(by_seq.len(), 1, "the second turn has one entry");
+        assert_eq!(by_id.len(), 1, "and it is the same one by id");
+        assert_eq!(by_id[0].entry_id, by_seq[0].entry_id);
+        assert_eq!(
+            store
+                .with(|db| db.entries().list_turn_by_id(session, first))
+                .unwrap()[0]
+                .turn_seq,
+            1,
+            "and the first turn's id finds the first turn, not the second"
+        );
+    }
 
     fn setup() -> (Db, SessionId) {
         let db = Db::open_in_memory().unwrap();
@@ -1764,6 +1896,100 @@ mod tests {
         ))
         .unwrap();
         assert!(e.awaiting_interactions_in(&[a]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_turn_end_maintains_the_interrupted_column() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = WorkspaceId::new();
+        let mut sessions = Vec::new();
+        for _ in 0..3 {
+            sessions.push(
+                db.sessions()
+                    .create(NewSession::root(ws))
+                    .unwrap()
+                    .session_id,
+            );
+        }
+        let [stopped, cut_off, errored] = sessions[..] else {
+            unreachable!()
+        };
+        let e = db.entries();
+        let turn = TurnId::new();
+        let ended = |status: Value| json!({ "type": "turn_end", "status": status, "reason": null });
+        let interrupted =
+            |session: SessionId| db.sessions().find(session).unwrap().unwrap().interrupted;
+
+        for (session, status) in [
+            (stopped, json!("cancelled")),
+            (cut_off, json!({ "incomplete": "interrupted" })),
+            (errored, json!("failed")),
+        ] {
+            e.append(NewEntry::new(
+                session,
+                turn,
+                1,
+                EntryKind::Event,
+                ended(status),
+            ))
+            .unwrap();
+        }
+        assert!(interrupted(stopped), "stopped by the user");
+        assert!(interrupted(cut_off), "cut off mid-flight");
+        assert!(interrupted(errored), "errored out — the chat view continues from it too");
+
+        e.append(NewEntry::new(
+            stopped,
+            turn,
+            2,
+            EntryKind::Event,
+            ended(json!("completed")),
+        ))
+        .unwrap();
+        assert!(!interrupted(stopped), "the next normal turn clears it");
+    }
+
+    /// Rewind drops the turns after the cut, including their `turn_end` — the column has to
+    /// follow the timeline back, not keep reporting an ending that is no longer there.
+    #[test]
+    fn rewinding_past_an_interrupted_turn_clears_the_column() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = WorkspaceId::new();
+        let sid = db
+            .sessions()
+            .create(NewSession::root(ws))
+            .unwrap()
+            .session_id;
+        let e = db.entries();
+        let turn = TurnId::new();
+
+        for t in 0..2 {
+            e.append(NewEntry::new(sid, turn, t, EntryKind::User, json!("hi")))
+                .unwrap();
+            e.append(NewEntry::new(
+                sid,
+                turn,
+                t,
+                EntryKind::Event,
+                json!({ "type": "turn_end", "status": "completed", "reason": null }),
+            ))
+            .unwrap();
+        }
+        e.append(NewEntry::new(
+            sid,
+            turn,
+            2,
+            EntryKind::Event,
+            json!({ "type": "turn_end", "status": "cancelled", "reason": null }),
+        ))
+        .unwrap();
+        assert!(db.sessions().find(sid).unwrap().unwrap().interrupted);
+
+        e.rewind(sid, 0).unwrap();
+        assert!(
+            !db.sessions().find(sid).unwrap().unwrap().interrupted,
+            "only completed turns are left"
+        );
     }
 
     /// Interactions never reach the model; everything else does.

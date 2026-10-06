@@ -10,7 +10,7 @@
 //! wrong one the moment an object is shared.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use zlogic_config::Dirs;
@@ -42,6 +42,9 @@ const SESSION_BATCH: usize = 200;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SweepReport {
     pub cache_dirs_removed: usize,
+    /// Turn folders out of the workspaces' own caches. Not in `cache_dirs_removed`, which counts
+    /// day folders in the shared cache: two different layouts, two numbers in the log.
+    pub turn_dirs_removed: usize,
     pub log_dirs_removed: usize,
     pub sessions_deleted: usize,
     pub bytes_freed: u64,
@@ -58,6 +61,9 @@ impl SweepReport {
         }
         if self.cache_dirs_removed > 0 {
             parts.push(format!("{} cache day(s)", self.cache_dirs_removed));
+        }
+        if self.turn_dirs_removed > 0 {
+            parts.push(format!("{} turn cache(s)", self.turn_dirs_removed));
         }
         if self.log_dirs_removed > 0 {
             parts.push(format!("{} log day(s)", self.log_dirs_removed));
@@ -103,6 +109,27 @@ pub fn sweep(
     if claim(store, CACHE_SWEEP, SWEEP_INTERVAL, now) {
         let cutoff = day_cutoff(now, config.cache_days);
         report.cache_dirs_removed = sweep_day_dirs(&dirs.cache, cutoff, &mut report.bytes_freed);
+        // The workspace caches are not under `dirs.cache` — they live in each workspace, under its
+        // own `.zlogic` — so the day sweep above never sees a turn folder. A failure here costs
+        // space, not correctness, which is why the roots are fetched separately and never fatal.
+        let since: std::time::SystemTime =
+            (now - chrono::Duration::days(i64::from(config.cache_days))).into();
+        match store.with(|db| {
+            db.workspaces()
+                .list(true)
+                .map_err(|e| e.to_string())
+                .map(|workspaces| {
+                    workspaces
+                        .iter()
+                        .map(|w| {
+                            sweep_turn_dirs(Path::new(&w.path), since, &mut report.bytes_freed)
+                        })
+                        .sum()
+                })
+        }) {
+            Ok(removed) => report.turn_dirs_removed = removed,
+            Err(e) => tracing::warn!(target: "zlogic::retention", "turn cache sweep failed: {e}"),
+        }
     } else {
         report.skipped.push("cache: too soon");
     }
@@ -178,8 +205,8 @@ fn sweep_sessions(
     Ok(ids.len())
 }
 
-/// The temp files a turn's model wrote live in `<workspace>/.zlogic/cache/<session prefix>`; the
-/// prompt is what tells it to put them there. Deleting the session without them would leave the
+/// The temp files a turn's model wrote live in `<workspace>/.zlogic/cache/<session>`; the prompt is
+/// what tells it to put them there. Deleting the session without them would leave the
 /// project's only regenerable-garbage directory growing forever, which is the thing this whole
 /// module exists to stop.
 fn remove_session_cache(root: &Path, session_id: SessionId) {
@@ -189,25 +216,79 @@ fn remove_session_cache(root: &Path, session_id: SessionId) {
     }
 }
 
-/// Where a turn's temporary files go: the workspace cache, under a folder named for the session.
+/// The folder layout is defined once, in the crate that reads it at the end of every turn. Re-
+/// exported under its old name because this is where the prompt, the environment and the sweeper
+/// all reach for it.
+pub use zlogic_core::turndir::session_cache_dir;
+
+/// Removes the turn folders of a workspace's cache that no turn has touched since the cutoff.
 ///
-/// One folder per session because a shared one is not a cache but a race — a script written by one
-/// turn could be overwritten by the next, and nothing in the tree said whose it was.
+/// Separate from [`sweep_day_dirs`] because that one removes a folder by *reading its name as a
+/// date*, and a turn folder is named after a turn. No depth setting makes it match: the shape here
+/// is age, and it is the same age the day folders get.
 ///
-/// The folder is named with the **whole** id, not a prefix of it. A session id is a v7 UUID, and
-/// its first twelve hex digits are the millisecond clock — thirteen of its thirty-six characters
-/// — so a 6-to-10 character prefix is pure timestamp and every session opened in the same
-/// millisecond lands in the same folder. Measured: 64 ids minted in a tight loop collapsed to 2
-/// distinct names. Shortening this name needs a hash, and a hash is worse than the id: the id
-/// already sorts by creation time and already appears verbatim in the session list, so a folder
-/// called `019ad8c4-6279-7c30-8a20-9f3b2c1d4e5f` can be traced by eye and by copy-paste, and
-/// cannot collide.
-pub fn session_cache_dir(root: &Path, session_id: Option<SessionId>) -> PathBuf {
-    let cache = root.join(".zlogic").join("cache");
-    match session_id {
-        Some(id) => cache.join(id.to_string()),
-        None => cache,
+/// Skipped while the session lives: a turn folder is small next to a day of logs, and a session
+/// being used is a session whose cache folder is the wrong one to be tidying. Deleting the session
+/// takes its whole subtree with it regardless.
+fn sweep_turn_dirs(root: &Path, cutoff: std::time::SystemTime, bytes_freed: &mut u64) -> usize {
+    let cache = session_cache_dir(root, None);
+    let Ok(sessions) = std::fs::read_dir(&cache) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for session in sessions.flatten() {
+        if !session.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Ok(turns) = std::fs::read_dir(session.path()) else {
+            continue;
+        };
+        for turn in turns.flatten() {
+            let path = turn.path();
+            if !turn.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            if touched_since(&path, cutoff) {
+                continue;
+            }
+            // Counted before the delete: afterwards there is nothing left to measure, and the log
+            // line would report zero for a sweep that just freed something.
+            let size = dir_size(&path);
+            if remove_dir_all(&path) {
+                removed += 1;
+                *bytes_freed += size;
+                tracing::debug!(target: "zlogic::retention", dir = %path.display(), "removed");
+            }
+        }
     }
+    removed
+}
+
+/// Whether anything in the folder was written at or after the cutoff.
+///
+/// The folder's own mtime is not the answer, and neither is its children's: writing a file inside a
+/// directory updates that directory only when entries are *added or removed*, so a turn that
+/// overwrote one file an hour ago — a script, a chart — looks untouched a level down, and the
+/// folder would be deleted out from under it. So the whole subtree is asked. It is a turn's own
+/// scratch, so the walk is a handful of entries; a file that cannot be read counts as touched,
+/// because the alternative is deleting a folder on the strength of a permission error.
+fn touched_since(dir: &Path, cutoff: std::time::SystemTime) -> bool {
+    let Ok(meta) = std::fs::metadata(dir) else {
+        return true;
+    };
+    if meta.modified().is_ok_and(|m| m >= cutoff) {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return true;
+    };
+    entries.flatten().any(|entry| {
+        let Ok(meta) = entry.metadata() else {
+            return true;
+        };
+        meta.modified().is_ok_and(|m| m >= cutoff)
+            || (meta.is_dir() && touched_since(&entry.path(), cutoff))
+    })
 }
 
 /// The oldest day a folder may still carry. Equal to the cutoff, not before it: a folder named for
@@ -266,17 +347,24 @@ fn sweep_day_dirs_at(
     removed
 }
 
-/// A day's contents counted after the fact, for the log line. The folder is already gone, so this
-/// is the number that would have been freed; a failure here changes nothing.
+/// A folder's contents, recursively, for the log line.
+///
+/// Recursive because a directory's own length is 0 on every platform that matters, so a flat count
+/// reports the bytes of a cache folder's *top level* — which for both layouts here is a handful of
+/// subfolders, and therefore zero. Counted before the delete, since afterwards there is nothing
+/// left to measure; a failure here changes nothing.
 fn dir_size(path: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
     };
-    let mut total = 0;
-    for entry in entries.flatten() {
-        total += entry.metadata().map(|m| m.len()).unwrap_or(0);
-    }
-    total
+    entries
+        .flatten()
+        .map(|entry| match entry.metadata() {
+            Ok(meta) if meta.is_dir() => dir_size(&entry.path()),
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        })
+        .sum()
 }
 
 fn remove_dir_all(path: &Path) -> bool {
@@ -388,6 +476,43 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::path::PathBuf;
+
+    /// Turn folders are reclaimed by age, not by a name that parses as a date — so this is the only
+    /// rule that can ever touch one, and a turn that is still writing must survive it.
+    ///
+    /// The cutoff is taken *between* the two folders rather than set to some past date: Windows
+    /// cannot stamp a directory with a chosen mtime, so the test orders its writes instead. What
+    /// was written before the cutoff is stale, what was written after it is not.
+    #[test]
+    fn a_turn_folder_nothing_has_touched_goes_and_a_recent_one_stays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let session = SessionId::new();
+        let turn_of = || zlogic_protocol::TurnId::new();
+        let stale = zlogic_core::turndir::turn_cache_dir(root, session, turn_of());
+        std::fs::create_dir_all(stale.join("deliverables")).unwrap();
+        std::fs::write(stale.join("deliverables").join("chart.png"), b"old").unwrap();
+
+        let cutoff = std::time::SystemTime::now();
+
+        let fresh = zlogic_core::turndir::turn_cache_dir(root, session, turn_of());
+        std::fs::create_dir_all(fresh.join("deliverables")).unwrap();
+        std::fs::write(fresh.join("deliverables").join("chart.png"), b"new").unwrap();
+        // Eight hex characters of the turn id's tail, which is what makes this test able to assert
+        // the layout rather than trust it.
+        assert_ne!(stale, fresh);
+
+        let mut freed = 0;
+        let removed = sweep_turn_dirs(root, cutoff, &mut freed);
+
+        assert_eq!(
+            removed, 1,
+            "only the folder nothing has touched since the cutoff"
+        );
+        assert!(!stale.exists(), "the stale turn folder is gone");
+        assert!(fresh.exists(), "a turn that wrote after the cutoff is not");
+        assert!(freed > 0, "what it took is counted for the log line");
+    }
 
     struct DayDirs {
         root: PathBuf,
@@ -520,12 +645,14 @@ mod tests {
     }
 
     #[test]
-    fn the_cache_folder_is_named_after_the_whole_session_id() {
+    fn the_cache_folder_is_named_after_the_session_id() {
         let root = Path::new("/work");
         let id = SessionId::new();
+        let raw = id.to_string();
+        let tail = raw.chars().skip(raw.chars().count() - 8).collect::<String>();
         assert_eq!(
             session_cache_dir(root, Some(id)),
-            root.join(".zlogic").join("cache").join(id.to_string())
+            root.join(".zlogic").join("cache").join(tail)
         );
         assert_eq!(
             session_cache_dir(root, None),
@@ -535,10 +662,17 @@ mod tests {
 
     #[test]
     fn two_sessions_created_at_the_same_moment_get_different_folders() {
-        // The reason the folder is named with the whole id: a v7 id's first twelve hex digits are
-        // the millisecond clock, so a short prefix collapses every session opened in one millisecond.
+        // The folder is named with the id's tail, not its head: a v7 id's first twelve hex digits
+        // are the millisecond clock, so a leading 8 collapses every session opened inside one
+        // 65.5-second window.
         let ids: Vec<SessionId> = (0..64).map(|_| SessionId::new()).collect();
-        let names: HashSet<String> = ids.iter().map(|id| id.to_string()).collect();
+        let names: HashSet<String> = ids
+            .iter()
+            .map(|id| {
+                let raw = id.to_string();
+                raw.chars().skip(raw.chars().count() - 8).collect::<String>()
+            })
+            .collect();
         assert_eq!(
             names.len(),
             ids.len(),

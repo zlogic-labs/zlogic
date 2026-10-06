@@ -28,7 +28,7 @@ use crate::retention::{self, SweepReport};
 /// `git branch`, `git push` and every other ordinary git command cannot see it.
 pub const HEAD_REF: &str = "refs/zlogic/checkpoints/current";
 
-const REPO_DIR: &str = "repo.git";
+pub const REPO_DIR: &str = "repo.git";
 const FORMAT: &str = "zlogic-checkpoint 1";
 const SIGNATURE_NAME: &str = "Zlogic Checkpoint";
 const SIGNATURE_EMAIL: &str = "checkpoint@zlogic.invalid";
@@ -37,6 +37,11 @@ const SIGNATURE_EMAIL: &str = "checkpoint@zlogic.invalid";
 pub enum CheckpointError {
     #[error("{0} is not inside a git repository, so it cannot be checkpointed")]
     NotARepository(String),
+    #[error(
+        "{0} is a git repository zlogic is not allowed to open: its .git is not owned by the user \
+         zlogic runs as"
+    )]
+    NotOwned(String),
     #[error("git: {0}")]
     Git(#[from] git2::Error),
     #[error("io: {0}")]
@@ -187,6 +192,14 @@ pub struct Page {
     /// whole chain — a partial count on a card holding three rows is a wrong number, not a rough
     /// one.
     pub other_branches: usize,
+}
+
+/// What an explicit empty-the-store left behind. Both numbers are the ones the confirmation
+/// needed and could not know: what the user is about to lose, and what it costs on disk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClearReport {
+    pub dropped: usize,
+    pub bytes: u64,
 }
 
 pub struct Checkpoints {
@@ -430,6 +443,26 @@ impl Checkpoints {
     pub async fn sweep(&self, workspace: PathBuf, at: i64) -> Result<SweepReport, CheckpointError> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || inner.sweep(&workspace, at))
+            .await
+            .map_err(join_error)?
+    }
+
+    /// Sweeps every store under the root rather than the one a capture just touched. Retention
+    /// that only runs on a snapshot never reaches a repository the user has walked away from,
+    /// which is exactly the one holding the largest number of copies of code nobody is editing.
+    pub async fn sweep_all(&self, at: i64) -> Result<SweepReport, CheckpointError> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || inner.sweep_all(at))
+            .await
+            .map_err(join_error)?
+    }
+
+    /// Deletes every snapshot of this workspace, and the directory that holds them. Nothing here
+    /// is recoverable afterwards — no snapshot survives to restore from and the timeline starts
+    /// empty — which is why the caller is expected to have asked.
+    pub async fn clear(&self, workspace: PathBuf) -> Result<ClearReport, CheckpointError> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || inner.clear(&workspace))
             .await
             .map_err(join_error)?
     }
@@ -678,9 +711,91 @@ impl Inner {
         retention::sweep(&repo, &self.config(), at)
     }
 
+    fn sweep_all(&self, at: i64) -> Result<SweepReport, CheckpointError> {
+        let mut total = SweepReport::default();
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return Ok(total);
+        };
+        let config = self.config();
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if !kind.is_dir() {
+                continue;
+            }
+            // One repository's failure is not the pass's: a store that cannot be opened is left
+            // exactly as it is, and the rest are still swept.
+            match self.sweep_directory(&entry.path(), &config, at) {
+                Ok(report) => {
+                    total.kept += report.kept;
+                    total.dropped += report.dropped;
+                    total.bytes += report.bytes;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "zlogic::checkpoints",
+                        %error,
+                        path = %entry.path().display(),
+                        "checkpoint sweep failed for one store"
+                    );
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    fn clear(&self, workspace: &Path) -> Result<ClearReport, CheckpointError> {
+        let located = self.locate(workspace)?;
+        let _held = self.hold(&located.user);
+        let id = repo_id(&located.user);
+        if !located.directory.join(REPO_DIR).exists() {
+            return Ok(ClearReport::default());
+        }
+        let dropped = Repository::open(located.directory.join(REPO_DIR))
+            .map(|repo| walk_from_tip(&repo).map(|chain| chain.len()).unwrap_or(0))
+            .unwrap_or(0);
+        let bytes = retention::directory_size(&located.directory);
+        std::fs::remove_dir_all(&located.directory)?;
+        self.swept
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&id);
+        Ok(ClearReport { dropped, bytes })
+    }
+
+    fn sweep_directory(
+        &self,
+        directory: &Path,
+        config: &Config,
+        at: i64,
+    ) -> Result<SweepReport, CheckpointError> {
+        let name = directory
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let _held = self.hold_id(&name);
+        let report = retention::sweep(
+            &Repository::open(directory.join(REPO_DIR))?,
+            config,
+            at,
+        )?;
+        self.swept
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(name, at);
+        Ok(report)
+    }
+
     fn locate(&self, workspace: &Path) -> Result<Located, CheckpointError> {
-        let user = Repository::discover(workspace)
-            .map_err(|_| CheckpointError::NotARepository(workspace.display().to_string()))?;
+        let path = workspace.display().to_string();
+        // A repository zlogic may not open is not an absent one: saying "not a repository" here
+        // is what offered the user `git init` for a checkout that already had one.
+        let user = Repository::discover(workspace).map_err(|error| {
+            if error.code() == git2::ErrorCode::Owner {
+                CheckpointError::NotOwned(path)
+            } else {
+                CheckpointError::NotARepository(path)
+            }
+        })?;
         let directory = self.root.join(repo_id(&user));
         Ok(Located { user, directory })
     }
@@ -731,10 +846,16 @@ impl Inner {
     }
 
     fn hold(&self, user: &Repository) -> Arc<Mutex<()>> {
-        let id = repo_id(user);
+        self.hold_id(&repo_id(user))
+    }
+
+    /// The same lock keyed by the store directory's name, which is the repository id the capture
+    /// path derives. A sweep that only walks the root never opens the user's repository, so this
+    /// is how it still serialises against a capture in flight.
+    fn hold_id(&self, id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.locks.lock().unwrap_or_else(|error| error.into_inner());
         locks
-            .entry(id)
+            .entry(id.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }

@@ -357,6 +357,8 @@ impl Harness {
             interaction: self.interaction.clone(),
             tasks: self.tasks.clone(),
             runtime_paths: None,
+            env: None,
+            computer: None,
             model_resolver: None,
             limits: self.limits.clone(),
             context: self.context.clone(),

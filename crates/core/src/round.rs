@@ -573,9 +573,10 @@ impl RoundCtx<'_> {
             // dropped rather than closed — half-parsed arguments are a guaranteed 400 on replay.
             FinishReason::Length | FinishReason::ContentFilter => RoundOutcome::Truncated,
             _ if !calls.is_empty() => {
-                let (tools, stopped) = self.run_batch(response_round_id, &calls).await?;
-                stats.tools = tools;
-                if stopped {
+                let (batch_stats, batch_stopped) =
+                    self.run_batch(response_round_id, &calls).await?;
+                stats.tools = batch_stats;
+                if batch_stopped {
                     let mut result = self.stopped(response_round_id, started, stats);
                     result.text = text;
                     return Ok(result);
@@ -754,19 +755,33 @@ impl RoundCtx<'_> {
                 && first_err.is_none()
                 && !self.cancel.is_cancelled()
             {
-                let i = started;
+                let call = &calls[started];
                 started += 1;
-                in_flight.push(async move { (i, self.run_one(round_id, &calls[i]).await) });
+                // A shell command is the only tool whose output the entries cannot account for, so
+                // it is the only one that earns a walk of the workspace at the end of the turn.
+                // `write_file` and `edit` carry their diff and the generators carry a file
+                // display: those are parsed where they are rendered, and parsing them twice would
+                // only add a second, vaguer answer.
+                if call.name == "shell" {
+                    // The raw argument JSON, not the command extracted from it: what the
+                    // footprint searches for is a file *name*, and the name is in there whether or
+                    // not it is the value of `command` — `{"command": "render.py --name out/icon"}`
+                    // and a shell tool taking a script under another key both name the file.
+                    self.emitter.note_shell_command(&call.args);
+                }
+                in_flight.push(self.run_one(round_id, call));
             }
             if in_flight.is_empty() {
                 break;
             }
-            let (_, result) = in_flight
+            let result = in_flight
                 .next()
                 .await
                 .expect("loop only exits when in_flight is empty");
             match result {
-                Ok(r) => stats.record(wire_status(r.status)),
+                Ok(r) => {
+                    stats.record(wire_status(r.status));
+                }
                 Err(e) => {
                     if first_err.is_none() {
                         first_err = Some(e);
@@ -1010,6 +1025,13 @@ impl RoundCtx<'_> {
                 zlogic_tools::ToolDisplay::Output { .. } => {
                     (zlogic_objects::ObjectRole::Output, None)
                 }
+                // A screenshot. No key: the label is a sentence about the screen, and two of them
+                // in one turn ("Whole desktop…", "Region (0, 0 800×600)…") are as likely to
+                // collide as to be unique. The reference is the same object id the `ToolFile`
+                // half already carries, so the bytes are reachable either way.
+                zlogic_tools::ToolDisplay::Image { .. } => {
+                    (zlogic_objects::ObjectRole::Output, None)
+                }
                 zlogic_tools::ToolDisplay::Text { .. }
                 | zlogic_tools::ToolDisplay::Table { .. }
                 | zlogic_tools::ToolDisplay::Agent { .. }
@@ -1065,9 +1087,33 @@ impl RoundCtx<'_> {
             name: call.name.clone(),
         });
 
+        // Diagnostics: nothing used to be logged between a call being emitted and its result being
+        // persisted, so a call that stalled anywhere inside `execute` left no trace to find it by.
+        tracing::info!(
+            target: "zlogic::core",
+            turn_id = %self.turn_id,
+            turn_seq = self.turn_seq,
+            round_seq = self.round_seq,
+            call_id = %call.id,
+            tool = %call.name,
+            "tool call starting"
+        );
+
         let started = Instant::now();
         let result = self.execute(call).await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        tracing::info!(
+            target: "zlogic::core",
+            turn_id = %self.turn_id,
+            turn_seq = self.turn_seq,
+            round_seq = self.round_seq,
+            call_id = %call.id,
+            tool = %call.name,
+            status = ?result.status,
+            elapsed_ms,
+            "tool call finished"
+        );
 
         if !result.dangling_display_objects().is_empty() {
             // The persistence boundary repairs structured file references, but this still catches
@@ -1081,6 +1127,19 @@ impl RoundCtx<'_> {
         }
 
         self.persist_result(round_id, call, &result, elapsed_ms)?;
+
+        // What this call's cards name is something the turn can account for, which is what settles
+        // a scanned file's ownership when another session shares the workspace. A path is also kept
+        // as a path, so that a file cleaned up later in the turn can be recognised as gone.
+        for display in &result.display {
+            match display {
+                zlogic_tools::ToolDisplay::File { path, .. } | zlogic_tools::ToolDisplay::Diff { path, .. } => {
+                    self.emitter.note(path);
+                    self.emitter.note_path(std::path::Path::new(path));
+                }
+                _ => {}
+            }
+        }
 
         self.emitter.send(StreamPayload::ToolExecEnd {
             call_id: call.id.clone(),
@@ -1198,6 +1257,9 @@ impl RoundCtx<'_> {
             )
             .await;
 
+        // Created before the ctx so the timeout arm below can cancel it. A child of the
+        // conversation token, so Esc stops this call through both paths.
+        let budget = self.cancel.child_token();
         let ctx = ToolCtx {
             exec_cwd,
             root: self.core.root().to_path_buf(),
@@ -1216,6 +1278,7 @@ impl RoundCtx<'_> {
                 .clone()
                 .map(|port| self.interaction_port(port)),
             output: Some(self.emitter.tool_output(&effective.id)),
+            display: Some(self.emitter.tool_display(&effective.id)),
             max_result_chars: self.core.services().limits.max_result_chars,
             runtime_paths: self
                 .core
@@ -1224,9 +1287,16 @@ impl RoundCtx<'_> {
                 .as_ref()
                 .map(|provider| provider.bin_dirs())
                 .unwrap_or_default(),
+            env: self.core.services().env.clone(),
+            computer: self.core.services().computer.clone(),
             // The same token, not a child: a tool that spawns work of its own must be stoppable by
             // the one thing the user pressed.
             cancel: self.cancel.clone(),
+            // A child of the above, so Esc reaches this call through *both*: cancelling the parent
+            // cancels every child. What only this arm does is cancel the child *alone*, which is
+            // what lets a tool tell "the user stopped me" from "I ran too long" — see the field's
+            // docs for why that distinction has to survive to the result.
+            budget: budget.clone(),
         };
 
         let limit = self.core.services().limits.tool_timeout_secs;
@@ -1241,10 +1311,18 @@ impl RoundCtx<'_> {
             match tokio::time::timeout(std::time::Duration::from_secs(limit), tool_fut).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(panic)) => Ok(Self::panic_result(&effective, panic)),
-                Err(_) => Ok(ToolExecResult::timeout(format!(
-                    "`{}` exceeded its {limit}s budget and was stopped",
-                    effective.name
-                ))),
+                Err(_) => {
+                    // Tell the tool to stop before reporting the timeout. Dropping the future is
+                    // not enough: a tool on `spawn_blocking` keeps its thread, and an abandoned one
+                    // goes on reading or writing with no result ever recorded — the caller is told
+                    // it was stopped while the work is still happening. A tool that observes the
+                    // token returns cleanly; one that does not is no worse off than before.
+                    budget.cancel();
+                    Ok(ToolExecResult::timeout(format!(
+                        "`{}` exceeded its {limit}s budget and was stopped",
+                        effective.name
+                    )))
+                }
             }
         };
 
@@ -1285,6 +1363,32 @@ impl RoundCtx<'_> {
     }
 
     async fn gate(&self, meta: &ToolMeta, call: &ToolCall) -> Gate {
+        // Diagnostics: a gate that takes seconds is indistinguishable from a hung call without
+        // an entry line, so both ends are logged rather than only the decision.
+        tracing::info!(
+            target: "zlogic::core",
+            turn_id = %self.turn_id,
+            round_seq = self.round_seq,
+            call_id = %call.id,
+            tool = %call.name,
+            "gate evaluating"
+        );
+        let started = Instant::now();
+        let decision = self.gate_decide(meta, call).await;
+        tracing::info!(
+            target: "zlogic::core",
+            turn_id = %self.turn_id,
+            round_seq = self.round_seq,
+            call_id = %call.id,
+            tool = %call.name,
+            decision = ?decision,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "gate decided"
+        );
+        decision
+    }
+
+    async fn gate_decide(&self, meta: &ToolMeta, call: &ToolCall) -> Gate {
         let request = PolicyRequest {
             session_id: self.core.session_id(),
             turn_id: self.turn_id,
@@ -1412,6 +1516,7 @@ impl RoundCtx<'_> {
 /// What the permission gate decided.
 /// `Cancelled` is separate from `Refused` because the audit trail and the model are both misled by
 /// conflating them: nobody refused the call, the user stopped the work.
+#[derive(Debug)]
 enum Gate {
     Allow,
     Refused(String),

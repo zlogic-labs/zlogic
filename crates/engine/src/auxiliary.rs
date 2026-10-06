@@ -6,17 +6,19 @@
 //! sent. Titles are part of the engine because the turn path drafts them; the closed half uses the
 //! same path for its own prompts instead of opening a second one.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use futures_util::StreamExt;
 use serde_json::json;
+use tokio::sync::mpsc;
 use zlogic_core::SharedStore;
 use zlogic_protocol::llm::{
-    CacheSpec, LlmEvent, LlmRequest, RequestMeta, ResponseFormat, SystemPart, ThinkingIntent,
-    ThinkingMode,
+    CacheSpec, LlmEvent, LlmRequest, PartKind, RequestMeta, ResponseFormat, SystemPart,
+    ThinkingIntent, ThinkingMode,
 };
 use zlogic_protocol::message::{ContentPart, Message, TextPart};
+use zlogic_protocol::query::{ApiError, TextDelta};
 use zlogic_protocol::stream::{StateChange, StateNotice};
 use zlogic_protocol::usage::Purpose;
 use zlogic_protocol::{RoundId, SessionId, TurnId};
@@ -25,6 +27,168 @@ use zlogic_store::{NewUsage, TitleSource};
 use crate::hub::EventHub;
 use crate::router::{ModelRouter, Routed};
 use crate::{EngineError, Result};
+
+/// The request every auxiliary call sends: one user message, no tools, no transcript.
+///
+/// **No turn.** The ids only correlate the request in the provider log; the usage row
+/// deliberately stores no `turn_id` — see [`NewUsage::in_detached_round`].
+fn auxiliary_request(
+    session_id: SessionId,
+    round_id: RoundId,
+    purpose: Purpose,
+    routed: &Routed,
+    system: Vec<SystemPart>,
+    prompt: String,
+    max_tokens: Option<u64>,
+    response_format: Option<ResponseFormat>,
+) -> LlmRequest {
+    let mut params = routed.model.default_params.clone();
+    if let Some(max_tokens) = max_tokens {
+        params.insert("max_tokens".into(), json!(max_tokens));
+    }
+    LlmRequest {
+        model: routed.model.wire_model.clone(),
+        // Supplied by this auxiliary task only; the agent's global system prompt is absent.
+        system,
+        messages: vec![Message::user(vec![ContentPart::Text(TextPart {
+            text: prompt,
+            raw: None,
+            truncated: false,
+        })])],
+        // They also cannot act. In particular, commit-message drafting must not run git commit.
+        tools: Vec::new(),
+        thinking: ThinkingIntent {
+            mode: ThinkingMode::Off,
+            ..Default::default()
+        },
+        params,
+        response_format,
+        cache: CacheSpec::off(),
+        meta: RequestMeta {
+            session_id: session_id.to_string(),
+            turn_id: TurnId::new().to_string(),
+            round_id: round_id.to_string(),
+            purpose,
+        },
+    }
+}
+
+/// One auxiliary call's identity: which conversation it is charged to, and as what.
+struct DetachedRound {
+    session_id: SessionId,
+    round_id: RoundId,
+    purpose: Purpose,
+}
+
+/// Forward a completion's text to `sink` as it arrives, and account for it like any other
+/// auxiliary round.
+///
+/// A part that streamed deltas is sent delta by delta; a provider that only reports the part
+/// at its end is sent the whole part then. Reasoning is never forwarded — it is not something
+/// to read aloud, and a call has no use for it.
+async fn stream_into_sink(
+    routed: &Routed,
+    request: LlmRequest,
+    sink: &mpsc::UnboundedSender<TextDelta>,
+    store: &SharedStore,
+    round: DetachedRound,
+) -> Result<()> {
+    let mut text_parts: HashMap<u32, bool> = HashMap::new();
+    let mut saw_text = false;
+    let mut stream = routed.client.stream(request).await.map_err(|error| {
+        tracing::error!(
+            target: "zlogic::auxiliary",
+            purpose = %round.purpose.as_wire(),
+            model = %routed.model_ref(),
+            kind = ?error.kind,
+            status = error.status,
+            request_id = ?error.request_id,
+            "auxiliary model call failed: {error}"
+        );
+        EngineError::Invalid(format!(
+            "auxiliary model call failed (model {}): {}",
+            routed.model_ref(),
+            zlogic_llm::error::provider_text(&error.message)
+        ))
+    })?;
+    while let Some(event) = stream.next().await {
+        match event.map_err(|error| {
+            tracing::error!(
+                target: "zlogic::auxiliary",
+                purpose = %round.purpose.as_wire(),
+                model = %routed.model_ref(),
+                kind = ?error.kind,
+                status = error.status,
+                request_id = ?error.request_id,
+                "auxiliary model response failed: {error}"
+            );
+            EngineError::Invalid(format!(
+                "auxiliary model response failed (model {}): {}",
+                routed.model_ref(),
+                zlogic_llm::error::provider_text(&error.message)
+            ))
+        })? {
+            LlmEvent::PartStart { index, kind } => {
+                text_parts.insert(index, kind == PartKind::Text);
+            }
+            LlmEvent::PartDelta { index, delta } => {
+                if *text_parts.get(&index).unwrap_or(&false) {
+                    saw_text = true;
+                    if sink.send(Ok(delta)).is_err() {
+                        // The caller stopped listening; there is nobody left to talk to.
+                        return Ok(());
+                    }
+                }
+            }
+            LlmEvent::PartEnd { index, part } => {
+                if let ContentPart::Text(text) = part {
+                    let streamed = text_parts.insert(index, true).unwrap_or(false);
+                    if !streamed {
+                        saw_text = true;
+                        if sink.send(Ok(text.text)).is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            LlmEvent::Usage(report) => record_auxiliary_usage(store, &round, routed, report),
+            _ => {}
+        }
+    }
+    if !saw_text {
+        return Err(EngineError::Invalid(format!(
+            "auxiliary model returned an empty response (model: {})",
+            routed.model_ref()
+        )));
+    }
+    Ok(())
+}
+
+/// The usage half of an auxiliary round, shared by the collected and streamed paths so a
+/// streamed call is billed exactly like a collected one.
+fn record_auxiliary_usage(
+    store: &SharedStore,
+    round: &DetachedRound,
+    routed: &Routed,
+    report: zlogic_protocol::usage::UsageReport,
+) {
+    let mut usage = NewUsage::new(
+        round.session_id.clone(),
+        round.purpose.clone(),
+        report.tokens,
+    )
+    .in_detached_round(round.round_id.clone());
+    usage.model_ref = Some(routed.model_ref());
+    if let Some(cost) = zlogic_core::cost::cost_of(&report, routed.model.pricing.as_ref()) {
+        usage = usage.with_cost(cost.amount, &cost.currency, cost.source);
+    }
+    if let Err(error) = store.with(|db| db.usage().upsert_round(usage)) {
+        tracing::warn!(
+            target: "zlogic::auxiliary",
+            "failed to persist auxiliary model usage: {error}"
+        );
+    }
+}
 
 pub struct Auxiliary {
     store: SharedStore,
@@ -71,6 +235,52 @@ impl Auxiliary {
             response_format,
         )
         .await
+    }
+
+    /// The same path as [`Self::ask`], with the answer handed over as it arrives.
+    ///
+    /// A caller that speaks to a person cannot wait for the whole sentence before it starts
+    /// reacting to the first half of one, so the deltas are the point. Everything else is
+    /// deliberately identical to `ask`: same resolution, same detached-round accounting, no
+    /// transcript, no tools.
+    ///
+    /// Returns a receiver of text pieces. An error inside the model call arrives as the last
+    /// item, after whatever text had already been sent — a partial answer is still an answer.
+    pub async fn ask_stream(
+        &self,
+        session_id: SessionId,
+        purpose: Purpose,
+        model_ref: Option<&str>,
+        system: Vec<SystemPart>,
+        prompt: String,
+        max_tokens: Option<u64>,
+    ) -> Result<mpsc::UnboundedReceiver<TextDelta>> {
+        let routed = self.router.resolve(&purpose, model_ref)?;
+        let max_tokens = max_tokens.or(routed.model.max_output_tokens);
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let round = DetachedRound {
+            session_id: session_id.clone(),
+            round_id: RoundId::new(),
+            purpose,
+        };
+        let request = auxiliary_request(
+            session_id,
+            round.round_id.clone(),
+            round.purpose.clone(),
+            &routed,
+            system,
+            prompt,
+            max_tokens,
+            None,
+        );
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            let outcome = stream_into_sink(&routed, request, &sender, &store, round).await;
+            if let Err(error) = outcome {
+                let _ = sender.send(Err(ApiError::from(error)));
+            }
+        });
+        Ok(receiver)
     }
 
     pub fn draft_session_title(&self, session_id: SessionId, text: &str) -> Result<()> {
@@ -188,39 +398,17 @@ impl Auxiliary {
         max_tokens: Option<u64>,
         response_format: Option<ResponseFormat>,
     ) -> Result<String> {
-        // **This call has no turn.** The id below only correlates the request in the provider log;
-        // the usage row deliberately stores no `turn_id` — see `NewUsage::in_detached_round`.
-        let trace_turn = TurnId::new();
         let round_id = RoundId::new();
-        let mut params = routed.model.default_params.clone();
-        if let Some(max_tokens) = max_tokens {
-            params.insert("max_tokens".into(), json!(max_tokens));
-        }
-        let mut request = LlmRequest {
-            model: routed.model.wire_model.clone(),
-            // Supplied by this auxiliary task only; the agent's global system prompt is absent.
+        let mut request = auxiliary_request(
+            session_id,
+            round_id,
+            purpose.clone(),
+            routed,
             system,
-            messages: vec![Message::user(vec![ContentPart::Text(TextPart {
-                text: prompt,
-                raw: None,
-                truncated: false,
-            })])],
-            // They also cannot act. In particular, commit-message drafting must not run git commit.
-            tools: Vec::new(),
-            thinking: ThinkingIntent {
-                mode: ThinkingMode::Off,
-                ..Default::default()
-            },
-            params,
+            prompt,
+            max_tokens,
             response_format,
-            cache: CacheSpec::off(),
-            meta: RequestMeta {
-                session_id: session_id.to_string(),
-                turn_id: trace_turn.to_string(),
-                round_id: round_id.to_string(),
-                purpose: purpose.clone(),
-            },
-        };
+        );
 
         let mut tried_without_format = false;
         loop {

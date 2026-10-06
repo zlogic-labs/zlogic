@@ -9,11 +9,13 @@
 //! - [`RuntimeHandle`] is process-local and disappears on restart.
 
 mod ids;
+mod instance;
 mod model;
 mod runtime;
 mod store;
 
 pub use ids::{JobId, TaskId};
+pub use instance::{EngineInstance, HEARTBEAT_INTERVAL, STALE_AFTER, live_cutoff, new_instance_id};
 pub use model::{
     AgentResult, AgentSpec, ConcurrencyPolicy, ExecutorSpec, JobDefinition, JobOwner, NewJob,
     NewTask, PermissionPolicy, ProcessResult, ProcessSpec, Schedule, TaskResult, TaskRun,

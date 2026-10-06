@@ -19,11 +19,13 @@
 //! **A tool records a server id, never a connection.** Which connection serves a call is decided at
 //! call time by hashing the resolved launch parameters. Reconnecting after a crash, or discarding the
 //! whole pool, is invisible to the registry and to the model. See [`resolve`] and [`pool`].
-//! **Sharing is derived, not declared.** There is no `scope: global | workspace` field. A server
-//! whose parameters mention the workspace gets one connection per workspace because its parameters
-//! differ; one whose parameters are identical everywhere is shared because they are not. The single
-//! exception — a server keeping state inside its tools, which MCP gives us no way to detect — is
-//! [`def::Binding::Session`].
+//! **Sharing is derived by default, and a definition may override it.** A server whose parameters
+//! mention the workspace gets one connection per workspace because its parameters differ; one whose
+//! parameters are identical everywhere is shared because they are not. [`def::Binding`] is the
+//! exception, for the two things parameters cannot express: a server that keeps state inside its
+//! tools (a browser), and a user who wants one connection for the whole app rather than one per
+//! workspace. `workspace` and `global` also cost the connection the ability to ask the user
+//! anything mid-call — see [`def::Binding`].
 //! **A failing server is a failing call, never a failing turn.** A server that will not start, a
 //! credential that is not set, a call that times out: each comes back as a tool result the model can
 //! read and work around. Nothing here aborts a turn.
@@ -106,6 +108,9 @@ pub(crate) fn test_ctx_in(root: impl Into<PathBuf>) -> zlogic_tools::ToolCtx {
         skills: None,
         max_result_chars: 2_000,
         runtime_paths: Vec::new(),
+        env: None,
+        computer: None,
         cancel: zlogic_tools::CancellationToken::new(),
+        budget: zlogic_tools::CancellationToken::new(),
     }
 }

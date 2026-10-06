@@ -28,6 +28,7 @@ pub mod memory;
 pub mod resource;
 pub mod schema;
 pub mod session;
+pub mod session_env;
 pub mod translation;
 pub mod usage;
 pub mod workspace;
@@ -51,6 +52,7 @@ pub use resource::{NewResource, ResourceRecord, ResourceStore};
 pub use session::{
     AgentPath, NewSession, SessionKind, SessionQuery, SessionRecord, SessionStore, TitleSource,
 };
+pub use session_env::{SessionEnvStore, SessionEnvVar};
 pub use translation::{NewTranslation, TranslationRecord, TranslationStore};
 pub use usage::{
     NewUsage, ToolUsageAggregate, TurnEnvelope, UsageAggregate, UsageAggregatePart, UsageQuery,
@@ -625,6 +627,10 @@ impl Db {
         SessionStore::new(&self.conn)
     }
 
+    pub fn session_env(&self) -> SessionEnvStore<'_> {
+        SessionEnvStore::new(&self.conn)
+    }
+
     pub fn locks(&self) -> SessionLockStore<'_> {
         SessionLockStore::new(&self.conn)
     }
@@ -887,6 +893,7 @@ mod tests {
                 .execute_batch(
                     "DROP INDEX IF EXISTS idx_entry_interaction;
                      ALTER TABLE workspaces DROP COLUMN kind;
+                     ALTER TABLE session DROP COLUMN interrupted;
                      PRAGMA user_version = 20;",
                 )
                 .unwrap();
@@ -978,6 +985,7 @@ mod tests {
                  ALTER TABLE usage_event DROP COLUMN completed_at;
                  ALTER TABLE session DROP COLUMN turn_count;
                  ALTER TABLE session DROP COLUMN last_message_at;
+                 ALTER TABLE session DROP COLUMN interrupted;
                  ALTER TABLE session DROP COLUMN effort;
                  ALTER TABLE mailbox DROP COLUMN thinking;
                  DROP INDEX IF EXISTS idx_entry_object_kind;

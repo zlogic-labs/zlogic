@@ -1,0 +1,75 @@
+# macOS build of the OSS CLI — built from this repository's own source only.
+#
+# The `-no-daemon` binary is exactly what `cargo install zlogic` from crates.io puts on a
+# machine, and its source is 100% in this repository. Building it here buys three things:
+#
+#   - **Actions minutes are free for a public repository** (standard runners on a public repo
+#     do not count against a quota);
+#   - it stays off the release critical path — it only waits for its own version-number PR
+#     to merge;
+#   - the artifact is traceable to a specific run of this repository.
+#
+# **A secret must never appear in this workflow.** A public repository's Actions context can
+# read every env value and every input written in the workflow; putting a signing private key
+# here is the worst case. For the same reason, check out nothing but this repository: a path
+# dependency on a crate that is not in here fails to compile loudly, which is exactly the
+# failure we want.
+#
+# Manual trigger (the release script does it for you):
+#   gh workflow run build-oss-cli.yml --ref main
+#
+# The artifact name zlogic-oss-macos-latest-{arch} is what scripts/release/stages/build.mjs
+# downloads by name.
+
+name: Build OSS CLI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-oss-cli-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  oss-cli:
+    name: OSS CLI (${{ matrix.artifact_arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # aarch64 native, x86_64 cross-compiled; the two entries run in parallel, so the
+        # total wall clock is whatever the cross-compile costs. A larger runner needs GitHub
+        # Team/Enterprise and cannot use free credits — see the README.
+        include:
+          - os: macos-latest
+            artifact_arch: aarch64
+            rust_target: aarch64-apple-darwin
+          - os: macos-latest
+            artifact_arch: x86_64
+            rust_target: x86_64-apple-darwin
+    steps:
+      # No `submodules:` — this repository has no submodule, and should not have one.
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      # The default `. -> target` is exactly right for this repository: the repo root **is**
+      # that workspace.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.rust_target }} -p zlogic
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: zlogic-oss-macos-latest-${{ matrix.artifact_arch }}
+          path: target/${{ matrix.rust_target }}/release/zlogic
+          if-no-files-found: error
+          retention-days: 14

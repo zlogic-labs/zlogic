@@ -18,7 +18,7 @@ pub use fs::FileObjectStore;
 pub use git::{GitKind, GitObjectStore, TreeEntry, TreeMode};
 pub use memory::MemoryObjectStore;
 pub use remote::{BlobTransport, RemoteObjectStore};
-pub use repo_facts::{RepoFacts, WorkTreeStatus};
+pub use repo_facts::{RepoFacts, RepoRefusal, WorkTreeStatus};
 pub use router::StoreRouter;
 
 #[derive(Debug, thiserror::Error)]

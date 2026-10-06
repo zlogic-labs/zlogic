@@ -1,4 +1,4 @@
-# zlogic-cli — the Rust TUI front end for zlogic
+# zlogic — the Rust TUI front end for zlogic
 
 A Ratatui/crossterm terminal front end, wired to the real engine.
 
@@ -20,18 +20,18 @@ dependencies (rustls, rusqlite, git2, …) from crates.io.
 
 ## Run
 
-The built binary is called `zlogic` (the package name is `zlogic-cli`, which is what `-p` takes;
-the binary lands in `target/<profile>/zlogic[.exe]`).
+The package is `zlogic` and so is the binary, which lands in `target/<profile>/zlogic[.exe]`.
+The package name is the crates.io name, so `cargo install zlogic` gets you this.
 
 ```sh
-cargo run -p zlogic-cli                          # interactive TUI (needs a real terminal)
-cargo run -p zlogic-cli -- --prompt "hello"      # headless one-shot → stdout
-cargo run -p zlogic-cli -- --prompt hi --print json   # event JSON-lines
-cargo run -p zlogic-cli -- --theme cyberpunk     # pick a theme (8 available)
-cargo run -p zlogic-cli -- --session <id>        # continue a specific session
-cargo run -p zlogic-cli -- --resume               # continue the most recent session
-cargo run -p zlogic-cli -- --resume <id>          # continue a specific session
-cargo run -p zlogic-cli -- daemon doctor         # hand over to zlogic-daemon (see below)
+cargo run -p zlogic                          # interactive TUI (needs a real terminal)
+cargo run -p zlogic -- --prompt "hello"      # headless one-shot → stdout
+cargo run -p zlogic -- --prompt hi --print json   # event JSON-lines
+cargo run -p zlogic -- --theme cyberpunk     # pick a theme (8 available)
+cargo run -p zlogic -- --session <id>        # continue a specific session
+cargo run -p zlogic -- --resume               # continue the most recent session
+cargo run -p zlogic -- --resume <id>          # continue a specific session
+cargo run -p zlogic -- daemon doctor         # hand over to zlogic-daemon (see below)
 ```
 
 `--prompt` ⇒ one-shot (no TUI, no alt-screen, no raw mode). Flags:

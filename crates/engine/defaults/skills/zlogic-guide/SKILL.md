@@ -80,12 +80,7 @@ description: Draft release notes from the changelog between two git tags.
 ```
 
 - The frontmatter must be `---`-delimited YAML at the very start of the file.
-- `description` (or the agent-ecosystem spelling `when_to_use`) is **required**, at most 300
-  characters (longer is trimmed with an ellipsis).
-- `descriptions:` is an optional map of locale to description, for surfaces that know the reader's
-  language (the graphical clients' skill pages pick from it). `description` stays the one the
-  model reads, so write it in the language the skill itself is written in. This very skill is the
-  worked example: English body, English `description`, and a `zh-CN` entry beside it.
+- `description` is **required**, at most 300 characters (longer is trimmed with an ellipsis).
 - Fields this build cannot honour yet — `allowed_tools`, `context: fork`, `model`, `effort` — are
   **reported** at load time rather than silently ignored.
 - Limits: `SKILL.md` ≤ 256 KiB; at most 100 skills listed at once.
@@ -109,11 +104,28 @@ itself, and that call goes through the approval gate like any other.
 
 On a name collision **the later read wins**: `<data>/skills` < `.zlogic/skills` < `.agents/skills`.
 Plugin skills carry a namespace, so they collide with nothing. An override is always reported,
-never silent. The built-in `zlogic-guide` is seeded before all of these, so a user or workspace
-skill of the same name replaces it — that is the supported way to customise it.
+never silent.
 
 A `.zlogic-disabled` marker file in a skill directory skips the whole directory.
 **Disabling a plugin takes its skills with it** (the same switch as its MCP servers).
+
+### 2.2.1 The one skill that ships inside the program
+
+`zlogic-guide` — this document — is compiled into the binary. It is the only skill that is, and
+that is deliberate: it is the manual, so what you are reading has to describe the build you are
+holding. Everything else is maintained separately and reaches users by being installed, which is
+why changing it does not wait on an app release.
+
+Two consequences worth knowing:
+
+- **It has no directory**, so no `.zlogic-disabled` marker can sit in one. Its switch is a key in
+  the extension state file, visible in **Runtime → Skills** in the desktop app, and it is
+  machine-wide rather than per-workspace. **It ships switched off** — you are only reading this
+  because it is switched on. Off means out of the model's reach entirely: not listed in the
+  system prompt, and `skill` refuses the name.
+- **A user or workspace skill named `zlogic-guide` replaces it**, because the bundled entry is
+  seeded before everything else and the later read wins. Doing that makes the model read a manual
+  written for a different build, so leave it alone unless you mean it.
 
 ### 2.3 Invoking one
 
@@ -556,6 +568,8 @@ zlogic daemon                                   # local; a random free port, rec
 zlogic daemon --listen 127.0.0.1:7331            # a fixed port
 zlogic daemon --listen 0.0.0.0:7331 \
   --public-url https://192.168.1.10:7331 --pair  # remote + pairing
+zlogic daemon pair [--scopes read,write] [--daemon PORT]
+                                       # give a *running* daemon another device, no restart
 zlogic daemon devices                           # paired devices
 zlogic daemon revoke <device-id>
 zlogic daemon doctor                            # diagnostics: state writability, device count, port, protocol
@@ -598,6 +612,26 @@ puts the plaintext in the system keychain. Every later request carries
   Devices expire after 90 days, and an expired token always fails closed.
 - **The first remote start must carry `--pair`**: with no paired device the daemon refuses to listen
   externally.
+
+### 7.2b Pairing a running daemon
+
+`--pair` only works at startup, so another device used to mean a restart — which drains the sessions
+in flight. `zlogic daemon pair` asks the **running** daemon for an offer over a local channel instead,
+and prints the same QR code and secret that `--pair` would have.
+
+macOS / Linux only. The channel is a unix socket in a 0700 directory under `$XDG_RUNTIME_DIR/zlogic/`
+(`$TMPDIR` on macOS), named after the listen port, so only the same user can reach it — the same bar as
+being able to restart the daemon. It is not HTTP, listens on no TCP port, and carries exactly two
+operations (`info`, `pair`) as one JSON line each way, capped at 8 KiB. The offer stays in the
+daemon's memory: nothing on disk, no long-lived credential, five-minute expiry, consumed on first use.
+
+Windows has no equivalent "same user only" channel — that needs Win32 DACL calls on a named pipe —
+so no channel is created there and pairing a running daemon stays a restart with `--pair`.
+`zlogic daemon pair` on Windows prints that reason and exits.
+
+With several daemons on one machine, `zlogic daemon pair` lists them (address + paired device count)
+and asks which one; `--daemon <port>` skips the question, and a non-terminal just gets the port list.
+`--scopes` defaults to `full_control`, matching `--pair`; pass `--scopes read` for a read-only device.
 
 ### 7.3 Connecting the desktop app
 
@@ -653,7 +687,7 @@ tools:
 
 limits:                      # guards against getting stuck, not a budget
   max_rounds: 150             # most model calls per submission
-  max_depth: 2                # sub-agent nesting depth
+  max_depth: 1                # sub-agent nesting depth
   max_parallel_tools: 16
   task_wait_secs: 60
 
@@ -695,10 +729,11 @@ The traps worth knowing:
   catalogue fetches). Marketplace downloads, MCP servers, `web_search` and the desktop app talking
   to a remote daemon each have their own client. `web_fetch` deliberately does **not** use the
   proxy (SSRF).
-- A project's `<root>/.zlogic/settings.yaml` can only override the six numbers under
-  `tools.shell.*`; every other block is ignored. A misspelled key inside `shell` invalidates the
-  whole file on purpose (otherwise `test_sec` would be ignored silently and the test suite would be
-  killed at the default ten minutes).
+- A project's `<root>/.zlogic/settings.yaml` carries only two blocks: the six numbers under
+  `tools.shell.*` (see [Environment variables](#environment-variables) for the other), and `env:`.
+  Every other block is ignored. A misspelled key inside `shell` or `env` invalidates that block on
+  purpose (otherwise `test_sec` would be ignored silently and the test suite would be killed at the
+  default ten minutes).
 - An absolute `worktree.dir` means every project shares one pool, and a name clash is refused
   rather than silently reused. Keeping it in the repository means editing `.gitignore`, and
   creating a worktree from inside a worktree nests; the default therefore sits beside the project.
@@ -713,6 +748,55 @@ The traps worth knowing:
 - Otherwise restart the client.
 - Skill changes take effect on the next turn (discovery runs every turn), and policy is re-read
   every turn.
+
+### Environment variables
+
+Every `shell` call runs with its environment rebuilt. The shell reads the user's startup files
+(`tools.shell.read_profile`, on by default), so their `PATH` is already there — a `set -e`, an
+`EXIT` trap or a blocking prompt in that file applies to your command too, which is the user's
+choice to make rather than something to work around. Anything a command needs *beyond* the profile
+has to be declared:
+
+```yaml
+# <config>/config.yaml — every project
+env:
+  enabled: true
+  variables:
+    NODE_ENV: development
+    RUST_LOG: { value: debug, enabled: false }
+```
+
+```yaml
+# <project>/.zlogic/settings.yaml — travels with the repository
+env:
+  variables:
+    CI: "1"
+```
+
+Three layers, lowest to highest: **global** (`config.yaml`) → **workspace** (the project's
+`settings.yaml`) → **session** (the desktop's Variables tab, in `state.db`). A name declared higher
+wins; a higher layer that sets `enabled: false` **masks** the lower one instead of falling back —
+the only way to say "not the global one here". The session layer covers the conversation's
+sub-agents too.
+
+- A command refers to one as `$NAME`. **zlogic never rewrites the command**, so approvals and policy
+  see the command as written.
+- The variables reach the **child process** only. A `*_API_KEY` declared here is not a provider key —
+  that lookup is `zlogic key list`.
+- Built in: `ZLOGIC_WORKSPACE_ROOT`, `ZLOGIC_CWD`, `ZLOGIC_SESSION_ID`, `ZLOGIC_TURN_ID`,
+  `ZLOGIC_CACHE_DIR`, `ZLOGIC_OS`, `ZLOGIC_ARCH`, `ZLOGIC_VERSION`. The prefix is reserved.
+- Refused at every layer: the dangerous names above (`PATH`, `LD_*`, `NODE_OPTIONS`, `BASH_ENV`, …)
+  and the `ZLOGIC_` prefix. A **workspace** variable is also refused if its name looks like a
+  credential, since `git clone` delivers it — and the refusal is reported, never silent.
+- Values are literals. No `${env:}` / `${keyring:}` expansion here.
+- `PATH` is not declarable, and never has to be: one throwaway login shell is asked for its `PATH`
+  and nothing else (into a temp file, 3s timeout, cached, `cygpath -w` on Windows), which reaches a
+  `cmd` or PowerShell session that reads no profile of its own. A failure is silent and falls back
+  to the inherited PATH. Ask bash, so `~/.zshenv` is only picked up where bash is the backend — zsh
+  is not a selectable `default_shell`.
+- The system prompt gets one `env:` line, values omitted for credential-shaped names.
+
+`docs/env-variables.md` has the whole thing, including what is deliberately not done.
 
 ---
 
@@ -750,7 +834,7 @@ local history (checkpoints), connection management, and switching to a remote da
 ## 10. Troubleshooting
 
 **A skill never shows up**
-- No `---` frontmatter, or no `description` / `when_to_use` → skipped and reported.
+- No `---` frontmatter, or no `description` → skipped and reported.
 - A `.zlogic-disabled` file in the directory.
 - Another location overrode it by name (the report says which one was used and which ignored).
 - The plugin contributing it is disabled.

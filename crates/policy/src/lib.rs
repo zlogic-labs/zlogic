@@ -57,8 +57,8 @@ pub use command_rule::CommandRule;
 pub use ops::{Access, Op};
 pub use path::{Cwd, ResolvedPath, Zone};
 pub use policy::{
-    Decision, Effect, ExecRule, OpDecision, PathRule, Policy, PolicyError, ScriptRule,
-    default_workspace_policy, evaluate_command,
+    ComputerDecision, ComputerRule, ComputerTarget, Decision, Effect, ExecRule, OpDecision,
+    PathRule, Policy, PolicyError, ScriptRule, default_workspace_policy, evaluate_command,
 };
 pub use windows::WinAnalyzer;
 

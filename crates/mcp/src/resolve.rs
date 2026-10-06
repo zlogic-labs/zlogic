@@ -1,10 +1,8 @@
 //! From a definition to launch parameters — and to the key that decides which connection serves it.
-//! # The pool key is the resolved parameters, not a declared scope
-//! There is no `scope: global | workspace` field anywhere, because "is it safe to share this
-//! connection" is answerable from the parameters themselves. For a server to behave differently per
-//! workspace, that difference has to reach it somehow — and the only channels are the ones in the
-//! definition: command, args, env and cwd for stdio, url and headers for HTTP. So the key is a hash
-//! of those, after expansion:
+//! # The pool key is the resolved parameters, and a declared scope overrides it
+//! For a server to behave differently per workspace, that difference has to reach it somehow — and
+//! the only channels are the ones in the definition: command, args, env and cwd for stdio, url and
+//! headers for HTTP. So by default the key is a hash of those, after expansion:
 //! - args mention `${workspaceRoot}` → each workspace expands to different parameters → each gets
 //!   its own connection, without anyone declaring that.
 //! - nothing in the parameters varies (a search API, GitHub, a database) → every workspace expands
@@ -13,6 +11,13 @@
 //! first case a rule instead of a heuristic: a stdio server that reads its process directory is
 //! isolated per workspace because the directory is part of the key. Pinning `cwd` in the definition
 //! is how a user says "this one is directory-independent, share it".
+//! [`Binding`] overrides all of that, and exists because derivation gets stateful servers wrong: a
+//! browser is per-workspace *because* of its directory and per-session *because* of elicitation, and
+//! neither is what "one browser for the whole app" means. `global` therefore also decides the launch
+//! directory — `<state>/mcp/<server>`, ours rather than the caller's — and builds its key from the
+//! definition's literal text, since a key that varied with the workspace would not be global. A
+//! `${workspaceRoot}` left in a global server's parameters is a contradiction: the key ignores it and
+//! the launch value takes whichever caller's workspace connected first.
 //! # Secrets are resolved for the launch and excluded from the key
 //! A credential placeholder contributes its **literal text** (`${env:GITHUB_TOKEN}`) to the key, not
 //! the token it resolves to. Otherwise rotating a token would silently split the pool — a second
@@ -43,24 +48,34 @@ pub type Lookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 /// picked up without anything having to be invalidated.
 pub struct Resolver {
     workspace_root: PathBuf,
+    /// `<state>/mcp` — the parent of the per-server directory a [`Binding::Global`] stdio server is
+    /// launched in. See [`Resolver::shared_dir`].
+    shared_root: PathBuf,
     env: Lookup,
     secret: Lookup,
 }
 
 impl Resolver {
     /// The real environment and the OS keychain.
-    pub fn system(workspace_root: impl Into<PathBuf>) -> Self {
+    pub fn system(workspace_root: impl Into<PathBuf>, shared_root: impl Into<PathBuf>) -> Self {
         Self {
             workspace_root: workspace_root.into(),
+            shared_root: shared_root.into(),
             env: Arc::new(|k| std::env::var(k).ok()),
             secret: Arc::new(|name| SystemCredentialStore.resolve(&format!("keyring:{name}"))),
         }
     }
 
     /// Both lookups injected. Tests, and any host that keeps credentials somewhere else.
-    pub fn with_lookups(workspace_root: impl Into<PathBuf>, env: Lookup, secret: Lookup) -> Self {
+    pub fn with_lookups(
+        workspace_root: impl Into<PathBuf>,
+        shared_root: impl Into<PathBuf>,
+        env: Lookup,
+        secret: Lookup,
+    ) -> Self {
         Self {
             workspace_root: workspace_root.into(),
+            shared_root: shared_root.into(),
             env,
             secret,
         }
@@ -70,11 +85,25 @@ impl Resolver {
         &self.workspace_root
     }
 
+    /// Where a [`Binding::Global`] stdio server runs, given no `cwd` of its own.
+    /// A directory of ours rather than the caller's workspace, because the whole point of the scope
+    /// is that the connection outlives any one workspace: a cwd borrowed from whichever workspace
+    /// happened to call first would make the process's idea of "here" depend on a race.
+    pub fn shared_dir(&self, server_id: &str) -> PathBuf {
+        self.shared_root
+            .join(crate::def::sanitize_segment(server_id))
+    }
+
     /// Expands every template in the definition and computes the pool key.
     /// `session` is only read when the definition asks for it ([`Binding::Session`]); passing it
     /// always is correct and has no effect otherwise.
     pub fn resolve(&self, def: &ServerDef, session: Option<SessionId>) -> Result<Resolved> {
         let mut key = Fields::new();
+        // A globally shared connection must hash the same in every workspace, so its key is built
+        // from the definition's *literal* text: `${workspaceRoot}` stays a placeholder instead of
+        // becoming a path, and a rotated credential stays a placeholder too. The value that is
+        // launched with is still resolved, so a missing one fails here rather than at spawn.
+        let literal = def.binding == Binding::Global;
         let transport = match &def.transport {
             TransportDef::Stdio {
                 command,
@@ -83,14 +112,14 @@ impl Resolver {
                 cwd,
             } => {
                 key.field("kind", "stdio");
-                let command = self.expand(command)?;
-                key.field("command", &command.key);
+                let command = self.field(command, literal)?;
+                key.field("command", &command.1);
 
                 let mut out_args = Vec::with_capacity(args.len());
                 for a in args {
-                    let a = self.expand(a)?;
-                    key.field("arg", &a.key);
-                    out_args.push(a.value);
+                    let a = self.field(a, literal)?;
+                    key.field("arg", &a.1);
+                    out_args.push(a.0);
                 }
 
                 let mut out_env = BTreeMap::new();
@@ -98,27 +127,32 @@ impl Resolver {
                 // environment serialised in hash-map order would hash differently run to run and
                 // every launch would look like a new server.
                 for (k, v) in env {
-                    let v = self.expand(v)?;
-                    key.field("env", &format!("{k}={}", v.key));
-                    out_env.insert(k.clone(), v.value);
+                    let v = self.field(v, literal)?;
+                    key.field("env", &format!("{k}={}", v.1));
+                    out_env.insert(k.clone(), v.0);
                 }
 
                 let cwd = match cwd {
                     Some(raw) => {
-                        let expanded = self.expand(raw)?;
-                        let p = PathBuf::from(&expanded.value);
+                        let (value, _) = self.field(raw, literal)?;
+                        let p = PathBuf::from(&value);
                         if p.is_absolute() {
                             p
                         } else {
                             self.workspace_root.join(p)
                         }
                     }
+                    None if literal => self.shared_dir(&def.id),
                     None => self.workspace_root.clone(),
                 };
                 key.field("cwd", &cwd.to_string_lossy());
+                if def.binding == Binding::Workspace {
+                    // Parameters that do not vary still have to split, or the scope is a lie.
+                    key.field("workspace", &self.workspace_root.to_string_lossy());
+                }
 
                 ResolvedTransport::Stdio {
-                    command: command.value,
+                    command: command.0,
                     args: out_args,
                     env: out_env,
                     cwd,
@@ -126,27 +160,27 @@ impl Resolver {
             }
             TransportDef::Http { url, headers, auth } => {
                 key.field("kind", "http");
-                let url = self.expand(url)?;
-                key.field("url", &url.key);
+                let url = self.field(url, literal)?;
+                key.field("url", &url.1);
 
                 let mut out = BTreeMap::new();
                 for (k, v) in headers {
-                    let v = self.expand(v)?;
-                    key.field("header", &format!("{k}={}", v.key));
-                    out.insert(k.clone(), v.value);
+                    let v = self.field(v, literal)?;
+                    key.field("header", &format!("{k}={}", v.1));
+                    out.insert(k.clone(), v.0);
                 }
                 if let Some(HttpAuthDef::Bearer { credential }) = auth {
-                    let literal = credential.to_string();
+                    let literal_ref = credential.to_string();
                     let value = match credential {
                         zlogic_credential::CredentialRef::Env(name) => (self.env)(name),
                         zlogic_credential::CredentialRef::Keyring(name) => (self.secret)(name),
                     }
                     .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| McpError::Template {
-                        placeholder: literal.clone(),
+                        placeholder: literal_ref.clone(),
                         reason: "credential is not set".into(),
                     })?;
-                    key.field("auth", &format!("bearer:{literal}"));
+                    key.field("auth", &format!("bearer:{literal_ref}"));
                     out.insert("Authorization".into(), format!("Bearer {value}"));
                 }
                 let oauth = matches!(auth, Some(HttpAuthDef::OAuth { .. }));
@@ -154,7 +188,7 @@ impl Resolver {
                     key.field("auth", "oauth");
                 }
                 ResolvedTransport::Http {
-                    url: url.value,
+                    url: url.0,
                     headers: out,
                     oauth,
                 }
@@ -166,11 +200,22 @@ impl Resolver {
             key: PoolKey {
                 params: key.finish(),
                 session: match def.binding {
-                    Binding::Params => None,
                     Binding::Session => session,
+                    Binding::Params | Binding::Workspace | Binding::Global => None,
                 },
             },
         })
+    }
+
+    /// One string, two forms: the value to launch with, and the form that enters the key.
+    /// `literal_key` keeps the definition's own text as the key form, which is what a
+    /// [`Binding::Global`] server needs — its key may not vary with the caller's workspace.
+    fn field(&self, raw: &str, literal_key: bool) -> Result<(String, String)> {
+        if !literal_key {
+            let expanded = self.expand(raw)?;
+            return Ok((expanded.value, expanded.key));
+        }
+        Ok((self.expand(raw)?.value, raw.to_string()))
     }
 
     /// One string, expanded twice: the value to launch with and the form that enters the key.
@@ -295,9 +340,11 @@ pub struct Resolved {
 
 /// Which connection serves a call.
 /// Two definitions that resolve to the same parameters share one connection even across sessions and
-/// workspaces — that is the intent, not an accident. The number of distinct keys is bounded by the
-/// closed set of template variables (`${workspaceRoot}` has as many values as there are workspaces;
-/// credential placeholders contribute a constant), so there is no path to unbounded growth.
+/// workspaces — that is the intent, not an accident, and it is what [`Binding::Params`] asks for.
+/// A definition that declares a wider scope gets a key that varies on the thing it named instead:
+/// [`Binding::Workspace`] on the workspace root, [`Binding::Global`] on nothing at all. The number of
+/// distinct keys stays bounded — the closed set of template variables, or one per server — so there
+/// is no path to unbounded growth.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PoolKey {
     params: String,
@@ -361,6 +408,7 @@ mod tests {
             .collect();
         Resolver::with_lookups(
             root,
+            "/shared",
             Arc::new(move |k| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())),
             Arc::new(move |k| secrets.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())),
         )
@@ -600,5 +648,100 @@ mod tests {
             r.resolve(&a, None).unwrap().key,
             r.resolve(&b, None).unwrap().key
         );
+    }
+
+    /// The claim the whole `global` scope rests on: one key, whatever workspace and session asks.
+    #[test]
+    fn a_global_server_resolves_to_one_key_everywhere() {
+        let d = def(
+            json!({ "command": "npx", "args": ["@playwright/mcp@latest", "--root=${workspaceRoot}"], "binding": "global" }),
+        );
+        let r = resolver("/w", &[], &[]);
+        let (s1, s2) = (SessionId::new(), SessionId::new());
+
+        let a = r.resolve(&d, Some(s1)).unwrap();
+        let b = resolver("/other", &[], &[]).resolve(&d, Some(s2)).unwrap();
+        assert_eq!(
+            a.key, b.key,
+            "a global connection cannot vary with its caller"
+        );
+    }
+
+    /// It is launched in a directory of ours, and that directory is the same one every time: a cwd
+    /// borrowed from the first caller's workspace would make "here" depend on a race.
+    #[test]
+    fn a_global_stdio_server_runs_in_a_directory_of_ours() {
+        let mut d = def(json!({ "command": "srv", "binding": "global" }));
+        d.id = "browser".into();
+        let shared = PathBuf::from("/shared").join("browser");
+        for root in ["/w/one", "/w/two"] {
+            let out = resolver(root, &[], &[]).resolve(&d, None).unwrap();
+            let ResolvedTransport::Stdio { cwd, .. } = out.transport else {
+                panic!("expected stdio")
+            };
+            assert_eq!(cwd, shared, "root was {root}");
+        }
+    }
+
+    /// An id from a hand-edited file still cannot escape the shared directory.
+    #[test]
+    fn a_global_directory_name_is_sanitised() {
+        let mut d = def(json!({ "command": "srv", "binding": "global" }));
+        d.id = "../../etc".into();
+        let out = resolver("/w", &[], &[]).resolve(&d, None).unwrap();
+        let ResolvedTransport::Stdio { cwd, .. } = out.transport else {
+            panic!("expected stdio")
+        };
+        assert_eq!(
+            cwd.parent(),
+            Some(Path::new("/shared")),
+            "stayed put: {cwd:?}"
+        );
+        assert!(
+            !cwd.to_string_lossy().contains(".."),
+            "no traversal in {cwd:?}"
+        );
+    }
+
+    /// A `cwd` the definition pins still wins — the scope decides sharing, not where the process runs.
+    #[test]
+    fn a_global_server_keeps_a_directory_it_declares() {
+        let d = def(json!({ "command": "srv", "cwd": "/opt/browser", "binding": "global" }));
+        let out = resolver("/w", &[], &[]).resolve(&d, None).unwrap();
+        let ResolvedTransport::Stdio { cwd, .. } = out.transport else {
+            panic!("expected stdio")
+        };
+        assert_eq!(cwd, PathBuf::from("/opt/browser"));
+    }
+
+    /// The point of the scope: parameters that would share everything now split per workspace.
+    #[test]
+    fn a_workspace_scope_splits_what_the_parameters_would_share() {
+        let d = def(json!({ "command": "srv", "cwd": "/opt/gh", "binding": "workspace" }));
+        let r = resolver("/w", &[], &[]);
+        assert_ne!(
+            r.resolve(&d, None).unwrap().key,
+            resolver("/w/two", &[], &[]).resolve(&d, None).unwrap().key
+        );
+    }
+
+    /// A placeholder that expands differently per workspace must not split a global key — that is
+    /// the difference between the literal form and the expanded one.
+    #[test]
+    fn a_global_key_ignores_a_placeholder_that_varies() {
+        let d =
+            def(json!({ "command": "srv", "env": { "T": "${env:TOKEN}" }, "binding": "global" }));
+        let old = resolver("/w", &[("TOKEN", "aaa")], &[])
+            .resolve(&d, None)
+            .unwrap();
+        let new = resolver("/w", &[("TOKEN", "bbb")], &[])
+            .resolve(&d, None)
+            .unwrap();
+        assert_eq!(old.key, new.key);
+        // …while the launch still gets the current value.
+        let ResolvedTransport::Stdio { env, .. } = new.transport else {
+            panic!("expected stdio")
+        };
+        assert_eq!(env["T"], "bbb");
     }
 }

@@ -13,6 +13,16 @@ use zlogic_objects::ObjectId;
 // stream reuses these verbatim; only the object id changes form (typed here, an id string there).
 pub use zlogic_protocol::stream::{DiffStat, FileChange};
 
+/// Where a tool attaches UI metadata to its own **running** call.
+///
+/// `create_agent` uses it to name the sub-agent's session on its card the moment that session
+/// exists, rather than when the sub-agent is done — a card that cannot say what it is waiting on
+/// is indistinguishable from a hang. Implementations must not block, for the same reason
+/// [`OutputSink`] must not: the tool is mid-turn and the UI is downstream of it.
+pub trait DisplaySink: Send + Sync {
+    fn attach(&self, display: ToolDisplay);
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolDisplay {
@@ -91,6 +101,23 @@ pub enum ToolDisplay {
         truncated: bool,
     },
 
+    /// A screenshot the agent took of the machine it is running on.
+    /// A separate variant rather than a [`ToolDisplay::File`] with a `screen://` path: that path
+    /// would be a fiction the client has to know about, and a screen has a size in pixels and no
+    /// place on disk. The user's need here is transparency — seeing exactly what the model is
+    /// looking at — so the card is the picture and the label says which one.
+    Image {
+        object_id: ObjectId,
+        mime: String,
+        width: u32,
+        height: u32,
+        /// The encoded size, so a client that shows a size next to the picture is not left
+        /// guessing. A PNG of a 4K screen is a very different thing from a JPEG of a menu bar,
+        /// and the user is the one who has to judge whether that was worth the tokens.
+        bytes: u64,
+        label: String,
+    },
+
     /// A sub-agent run.
     /// `session_id` is what makes the child's transcript reachable — the UI opens it to show what
     /// the sub-agent actually did, rather than only its conclusion.
@@ -160,6 +187,7 @@ impl ToolDisplay {
             | ToolDisplay::File { object_id, .. }
             | ToolDisplay::Table { object_id, .. } => object_id.as_ref(),
             ToolDisplay::Output { object_id, .. } => Some(object_id),
+            ToolDisplay::Image { object_id, .. } => Some(object_id),
             ToolDisplay::Widget { object_id, .. } => Some(object_id),
             ToolDisplay::Text { .. } | ToolDisplay::Agent { .. } | ToolDisplay::Task { .. } => None,
         }

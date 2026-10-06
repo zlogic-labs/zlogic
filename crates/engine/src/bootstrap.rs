@@ -15,7 +15,7 @@ use zlogic_credential::{CredentialStore, SystemCredentialStore, credential_candi
 use zlogic_objects::{FileObjectStore, ObjectStore};
 use zlogic_store::Db;
 use zlogic_tools::{
-    MemoryUpdate, SearchKeySource, SearchProvider, Shell, ShellBudgets,
+    MemoryUpdate, SearchBudgets, SearchKeySource, SearchProvider, SearchTools, Shell, ShellBudgets,
     ShellPreference as ToolShellPreference, ToolRegistry, WebSearchSettings,
 };
 
@@ -69,6 +69,11 @@ pub struct ProHosts {
     /// Whether the host can render a tool's HTML widget output: the closed `widget` tool exists
     /// only where it can.
     pub html_widgets: bool,
+    /// The `tools.computer` block, for the closed `computer` tool. Narrow on purpose: the engine
+    /// has already loaded the whole config, and a seam that handed the closed half everything
+    /// would make "which parts of the config are public" a question nobody could answer from the
+    /// type. A closed tool that needs another settings block gets that block added here too.
+    pub computer: zlogic_config::ComputerConfig,
 }
 
 /// What a host returns from [`ProFactory`]: the tools it adds to the registry, and the services it
@@ -92,6 +97,14 @@ pub struct ProWiring {
     /// Per-turn environment lines the host adds to the system prompt — what this session is bound
     /// to, which the model cannot discover for itself. `None` for a host that has nothing to say.
     pub session_environment: Option<Arc<dyn crate::service::SessionEnvironmentService>>,
+    /// The closed `computer` tool's inspector, when the host registered one. The approval gate
+    /// needs it, and the gate runs before any tool does — which is exactly why this is a separate
+    /// field and not something the gate goes looking for in the registry: a tool the host did not
+    /// register cannot describe anything, and a gate that guessed would be inventing targets.
+    pub computer: Option<Arc<dyn zlogic_tools::ComputerInspector>>,
+    /// What the host wants the user to be told at startup, in the same channel the open tool set
+    /// uses. A host that registers nothing and says nothing gets a clean startup.
+    pub warnings: Vec<String>,
 }
 
 pub type ProFactory = Box<dyn FnOnce(ProHosts) -> ProWiring + Send>;
@@ -246,10 +259,11 @@ impl Engine {
             },
         )?);
         let tasks = Arc::new(
-            crate::TaskManager::new(
+            crate::TaskManager::with_host(
                 store.clone(),
                 objects.clone(),
                 dirs.data.join("task-output"),
+                opts.host,
             )
             .map_err(|e| BootstrapError::Open {
                 path: db_path.display().to_string(),
@@ -260,7 +274,7 @@ impl Engine {
             Ok(count) if count > 0 => tracing::info!(
                 target: "zlogic::task",
                 count,
-                "marked leftover Tasks from the previous run as interrupted"
+                "interrupted Tasks whose owning engine was no longer running"
             ),
             Ok(_) => {}
             Err(error) => warnings.push(format!(
@@ -324,6 +338,8 @@ impl Engine {
         let BuiltinTools {
             mut tools,
             shell,
+            search,
+            web_search,
             warnings: mut tool_warnings,
         } = tool_registry(
             &config,
@@ -352,13 +368,19 @@ impl Engine {
                 workspaces: workspaces.clone(),
                 auxiliary: auxiliary.clone(),
                 html_widgets: opts.html_widgets,
+                computer: config.tools.computer.clone(),
             })
         });
         if let Some(pro) = &pro {
             for tool in &pro.tools {
                 tools.add(tool.clone());
             }
+            warnings.append(&mut pro.warnings.clone());
         }
+        // The closed half's `computer` tool, for the approval gate. Absent unless a host
+        // registered one, and the gate treats absent as "cannot describe the target", which
+        // escalates to asking the user rather than waving the call through.
+        let computer = pro.as_ref().and_then(|pro| pro.computer.clone());
         let managed_resources: Arc<dyn crate::service::ManagedResourceService> = pro
             .as_ref()
             .and_then(|pro| pro.managed_resources.clone())
@@ -407,14 +429,31 @@ impl Engine {
         let bypass_cell = BypassFlag::new(approval_mode);
         let policy: Arc<dyn PolicyGate> = Arc::new(BypassGate::new(
             bypass_cell.clone(),
-            Arc::new(PolicyCoreGate::new(
-                shell_dialect,
-                dirs.clone(),
-                router.clone(),
-                store.clone(),
-                objects.clone(),
-                grants.clone(),
-            )),
+            Arc::new(
+                PolicyCoreGate::new(
+                    shell_dialect,
+                    dirs.clone(),
+                    router.clone(),
+                    store.clone(),
+                    objects.clone(),
+                    grants.clone(),
+                )
+                .with_computer(computer.clone()),
+            ),
+        ));
+
+        // One cell for the global layer, shared with the `Config` service built further down. The
+        // resolver and the settings page have to be looking at the same snapshot or a variable
+        // edited in the panel would not be the one the next command sees.
+        let env_global = Arc::new(crate::env::EnvGlobal::default());
+        let rc_path = Arc::new(crate::env::RcPath::default());
+        env_global.set(config.env.clone());
+        // One resolver, shared. It is asked twice per turn — once for the system prompt's `env:`
+        // line and once per shell call — and two instances would mean two PATH probes.
+        let env_resolver = Arc::new(crate::env::EnvResolver::new(
+            env_global.clone(),
+            store.clone(),
+            rc_path.clone(),
         ));
 
         let services = Arc::new(CoreServices {
@@ -426,6 +465,8 @@ impl Engine {
             interaction: Some(interactions.clone()),
             tasks: Some(tasks.clone()),
             runtime_paths: Some(Arc::new(HostRuntimePaths(opts.runtime_paths.clone()))),
+            env: Some(env_resolver.clone()),
+            computer: computer.clone(),
             model_resolver: Some(Arc::new(crate::dispatch::RouterModelResolver::new(
                 router.clone(),
             ))),
@@ -445,7 +486,11 @@ impl Engine {
         let prompts = Arc::new(
             crate::SystemPrompts::new(dirs.clone(), config.clone(), shell_dialect)
                 .with_math_rendering(opts.renders_math)
-                .with_session_environment(session_environment.clone()),
+                // The very resolver `CoreServices` hands the shell, so the `env:` line and the
+                // child process can never name different sets.
+                .with_env(Some(env_resolver.clone()))
+                .with_session_environment(session_environment.clone())
+                .with_checkpoints(Some(checkpoints.clone())),
         );
 
         let session_locks = Arc::new(SessionLocks::new(store.clone(), opts.host));
@@ -468,7 +513,8 @@ impl Engine {
         .with_skills(skills.clone())
         // `general` is always available; `agent:<name>` role entries add named profiles whose
         // model/thinking settings are resolved at the start of each turn.
-        .with_agents(agent_profile_names(&config));
+        .with_agents(agent_profile_names(&config))
+        .with_search_tools(search);
         if let Some(shell) = shell {
             dispatcher = dispatcher.with_shell(shell);
         }
@@ -520,7 +566,9 @@ impl Engine {
             )
             .with_router(router.clone())
             .with_grants(grants.clone())
-            .with_registry(dispatcher.registry().clone()),
+            .with_registry(dispatcher.registry().clone())
+            .with_roots(tasks.roots())
+            .with_hub(hub.clone()),
         );
 
         let config_service = Arc::new(
@@ -533,9 +581,17 @@ impl Engine {
             )
             .with_bypass_flag(bypass_cell)
             .with_router(router.clone())
+            .with_env_global(env_global.clone())
             .with_checkpoints(checkpoints.clone())
+            .with_web_search(web_search)
             .with_transport(transport.clone()),
         );
+        let env_service = Arc::new(crate::env::EnvLayers::new(
+            env_global,
+            store.clone(),
+            config_service.clone(),
+            rc_path,
+        ));
         let credential_service = Arc::new(Credentials::new(
             config_service.clone(),
             credential_store,
@@ -551,6 +607,7 @@ impl Engine {
                 checkpoints.clone(),
                 workspaces.clone(),
                 session_locks.clone(),
+                store.clone(),
             )))
             .with_auxiliary(auxiliary_service)
             .with_translations(translation_service)
@@ -560,6 +617,7 @@ impl Engine {
             .with_objects(objects_service)
             .with_turns(dispatcher)
             .with_config(config_service)
+            .with_env(env_service)
             .with_credentials(credential_service)
             .with_managed_resources(managed_resources)
             .with_extension_service(extension_service)
@@ -580,6 +638,13 @@ impl Engine {
                 dirs.clone(),
                 config.retention.clone(),
                 std::time::Duration::from_secs(45),
+            );
+            // Checkpoints are swept by the captures themselves, which leaves every repository the
+            // user has not opened in a while untouched. This pass is what makes the retention days
+            // in the settings apply to those too.
+            let _ = zlogic_checkpoints::maintenance::spawn(
+                checkpoints.clone(),
+                std::time::Duration::from_secs(60),
             );
         }
 
@@ -629,6 +694,13 @@ fn agent_profile_names(config: &AppConfig) -> Vec<String> {
 pub(crate) struct BuiltinTools {
     pub tools: ToolRegistry,
     pub shell: Option<Shell>,
+    /// The three walking tools, carried out of `tool_registry` so the Dispatcher can rebudget them
+    /// per workspace exactly as it does the shell. Built from the same registry value that was
+    /// registered, so what a turn runs is what a workspace override replaces.
+    pub search: SearchTools,
+    /// Handed to `Config` so a settings save reaches the registered instance — the registry itself
+    /// is built once and never rebuilt, which would leave a changed backend frozen until restart.
+    pub web_search: Arc<zlogic_tools::WebSearch>,
     pub warnings: Vec<String>,
 }
 
@@ -645,7 +717,10 @@ pub(crate) fn tool_registry(
     // config exactly once: definition text, policy dialect and process launch then all refer to the
     // same Shell value.
     registry.remove("shell");
-    match Shell::resolve(shell_preference(config.tools.default_shell)) {
+    match Shell::resolve(
+        shell_preference(config.tools.default_shell),
+        config.tools.shell.read_profile,
+    ) {
         Ok(resolved) => {
             tracing::info!(
                 target: "zlogic::engine",
@@ -700,10 +775,19 @@ pub(crate) fn tool_registry(
         settings.timeout = std::time::Duration::from_secs(cfg.timeout_secs);
     }
 
-    registry.add(Arc::new(zlogic_tools::WebSearch::new(settings)));
+    let web_search = Arc::new(zlogic_tools::WebSearch::new(settings));
+    registry.add(web_search.clone());
+
+    // The built-in source registered default-budget copies of the three walking tools; replace them
+    // with the configured ones so a single `tools.search_timeout_secs` governs all of them.
+    let search = SearchTools::with_budgets(SearchBudgets::from(&config.tools));
+    search.register(&mut registry);
+
     BuiltinTools {
         tools: registry,
         shell,
+        search,
+        web_search,
         warnings,
     }
 }

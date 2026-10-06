@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// The shell used by the built-in `shell` tool.
@@ -26,12 +28,154 @@ pub enum ApprovalMode {
     Bypass,
 }
 
+/// Which layer a variable is declared in. Precedence runs in this order: a name declared higher
+/// wins outright, and a higher layer that switches a name **off** masks the lower one rather than
+/// falling back to it — that is the only way to say "do not use the global one here".
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvScope {
+    Global,
+    Workspace,
+    Session,
+}
+
+/// Where a variable lives: one of the three layers, or zlogic itself.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvSource {
+    Builtin,
+    Global,
+    Workspace,
+    Session,
+}
+
+/// The `ZLOGIC_` prefix is zlogic's own. A user variable under it would be indistinguishable from
+/// a built-in in the shell, so it is refused rather than shadowed.
+pub const ENV_BUILTIN_PREFIX: &str = "ZLOGIC_";
+
+/// One variable as a configuration file spells it: `FOO: bar` for the common case,
+/// `FOO: { value: bar, enabled: false }` when it is switched off.
+///
+/// Untagged rather than a struct with optional fields because `enabled` has to be *absent* by
+/// default, and `Option<bool>` would make `enabled: null` mean "on" — a second spelling of the
+/// same thing, which is how a file ends up meaning two things at once.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EnvVar {
+    Value(String),
+    Detailed(EnvVarDetail),
+}
+
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnvVarDetail {
+    pub value: String,
+    pub enabled: bool,
+}
+
+impl Default for EnvVarDetail {
+    fn default() -> Self {
+        Self {
+            value: String::new(),
+            enabled: true,
+        }
+    }
+}
+
+impl EnvVar {
+    pub fn detail(&self) -> EnvVarDetail {
+        match self {
+            EnvVar::Value(value) => EnvVarDetail {
+                value: value.clone(),
+                enabled: true,
+            },
+            EnvVar::Detailed(detail) => detail.clone(),
+        }
+    }
+}
+
+impl From<EnvVarDetail> for EnvVar {
+    fn from(detail: EnvVarDetail) -> Self {
+        EnvVar::Detailed(detail)
+    }
+}
+
+/// The `env:` block. Present at all three layers with the same shape, so one loader reads any of
+/// them and the desktop's table is the same component wherever it is shown.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnvConfig {
+    /// The layer's own master switch. Off means this layer contributes nothing at all, whatever
+    /// its variables say — the difference between "I have no variables" and "I do not want any".
+    pub enabled: bool,
+    pub variables: BTreeMap<String, EnvVar>,
+}
+
+impl Default for EnvConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            variables: BTreeMap::new(),
+        }
+    }
+}
+
+/// The refusals that need no policy crate: shape and the reserved prefix.
+///
+/// The dangerous-name judgement lives in the engine, which is the one layer that can see both this
+/// and the command analyzer's list — `policy` deliberately depends on nothing but `zlogic-paths`,
+/// so the shared list cannot be imported from here without inverting the dependency.
+pub fn name_syntax_reason(name: &str) -> std::result::Result<(), String> {
+    if !is_env_name(name) {
+        return Err("not a valid environment variable name".into());
+    }
+    if name.starts_with(ENV_BUILTIN_PREFIX) {
+        return Err(format!(
+            "`{ENV_BUILTIN_PREFIX}` is reserved for zlogic's own variables"
+        ));
+    }
+    Ok(())
+}
+
+/// A name-shape denylist, matching the one the shell applies to the inherited environment. Values
+/// are never scanned: a value that looks random is very often a legitimate build hash, whereas
+/// `*_TOKEN` is unambiguous.
+pub fn looks_like_credential(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.ends_with("_API_KEY")
+        || upper.ends_with("_TOKEN")
+        || upper.ends_with("_SECRET")
+        || upper.ends_with("_PASSWORD")
+        || matches!(upper.as_str(), "API_KEY" | "TOKEN" | "SECRET" | "PASSWORD")
+}
+
+/// Shell env name syntax: ASCII alphanumerics and `_`, not starting with a digit.
+pub fn is_env_name(key: &str) -> bool {
+    !key.is_empty()
+        && !key.contains(['=', '\0'])
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && !key.as_bytes()[0].is_ascii_digit()
+}
+
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionConfig {
     pub auto_title: AutoTitle,
     pub approval_mode: ApprovalMode,
+    /// Plan mode: a turn is restricted to the tools that declare `ToolRisk::Read` and gets a
+    /// system-prompt section saying so. The restriction is applied at materialisation, so a
+    /// mutating tool is not offered to the model rather than refused once called. `false` is the
+    /// ordinary posture; the desktop's Plan switch writes it here, and the engine reads it when a
+    /// turn starts.
+    pub plan_mode: bool,
 }
 
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -99,8 +243,19 @@ pub struct ToolsConfig {
     /// Overrides `shell`'s per-class budgets when set, which is why it is an emergency stop
     /// rather than the normal way to bound a run.
     pub timeout_secs: u64,
+    /// Wall-clock ceiling on one `grep` / `glob` / `list_dir` call. 0 = off.
+    ///
+    /// Separate from [`Self::timeout_secs`] because a search is the one tool call that can run for
+    /// hours without producing anything to show for it: a pattern that matches nothing reads every
+    /// file in the tree, and `include_ignored` turns a Rust repository's `target/` from a skipped
+    /// directory into tens of thousands of files. This bound is checked *inside* the walk, so
+    /// expiry returns the hits already found plus a note that the tree was not fully read —
+    /// rather than an error, and rather than a search that keeps burning disk after the caller has
+    /// given up on it.
+    pub search_timeout_secs: u64,
     pub shell: ShellConfig,
     pub web_search: WebSearchConfig,
+    pub computer: ComputerConfig,
 }
 
 impl Default for ToolsConfig {
@@ -109,11 +264,18 @@ impl Default for ToolsConfig {
             default_shell: ShellPreference::Auto,
             max_result_chars: 30_000,
             timeout_secs: 0,
+            search_timeout_secs: DEFAULT_SEARCH_TIMEOUT_SECS,
             shell: ShellConfig::default(),
             web_search: WebSearchConfig::default(),
+            computer: ComputerConfig::default(),
         }
     }
 }
+
+/// Generous enough that no ordinary search notices it, low enough that a runaway one is minutes
+/// rather than hours. A search that legitimately needs longer wants a narrower `path` or
+/// `include`, which returns a better answer than the same search with more time.
+pub const DEFAULT_SEARCH_TIMEOUT_SECS: u64 = 60;
 
 /// How long the `shell` tool may run, per kind of command.
 ///
@@ -125,6 +287,19 @@ impl Default for ToolsConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ShellConfig {
+    /// Whether the shell reads its startup files before running a command.
+    ///
+    /// On: bash is launched as a login shell, so `/etc/profile` and `~/.bash_profile` (and
+    /// whatever that sources) run; PowerShell runs its `$PROFILE`; cmd runs its AutoRun commands.
+    /// Off: `--noprofile --norc`, `-NoProfile`, `/d`.
+    ///
+    /// On by default, because the alternative is a `PATH` nobody can extend — the user spends an
+    /// afternoon wiring a toolchain into `~/.bash_profile` and the agent cannot see it, so it has
+    /// to be declared as a variable instead. The cost is that a startup file can `set -e`, install
+    /// an `EXIT` trap or block on a `read`, and all of that then applies to a command the model
+    /// wrote. A profile that is safe interactively is not automatically safe non-interactively,
+    /// so `set -e`, prompts and readline tweaks belong behind an interactivity check.
+    pub read_profile: bool,
     /// A command whose answer is a fact about the repository: status, a diff, a listing.
     pub quick_secs: u64,
     /// A test run. Generous on purpose — a suite killed at the quick budget has told nobody
@@ -148,6 +323,7 @@ pub struct ShellConfig {
 impl Default for ShellConfig {
     fn default() -> Self {
         Self {
+            read_profile: true,
             quick_secs: 60,
             test_secs: 600,
             build_secs: 1_200,
@@ -225,6 +401,81 @@ impl WebSearchConfig {
                 "tools.web_search.provider must be exa or parallel, got {:?}",
                 self.provider.as_deref().unwrap_or_default()
             ));
+        }
+        Ok(())
+    }
+}
+
+/// The `computer` tool: letting the model look at and drive the desktop.
+///
+/// Off by default and not for the usual reason: every field here is a knob that hands an agent
+/// control of the machine, so the enabled flag is a decision the user has to make out loud rather
+/// than a default that happens to be conservative.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ComputerConfig {
+    pub enabled: bool,
+    /// Long edge of the copy handed to the model, in pixels. Bounds the image cost of a turn:
+    /// every action returns a fresh screenshot unless `observe` says otherwise.
+    pub max_edge: u32,
+    /// `png` keeps text sharp; `jpeg` is smaller and cheaper per image. PNG is the default because
+    /// a compressed screenshot of a dialog is a screenshot of mush.
+    pub format: String,
+    /// Default budget for a `wait` that does not name one.
+    pub wait_ms: u64,
+    /// Ceiling on screenshots in one turn, so a model that has lost the thread fails on a named
+    /// counter instead of on the context window.
+    pub max_screens_per_turn: u32,
+    /// Whether an action that moves something comes back with a screenshot. On by default
+    /// because a mis-click is only visible if the result shows the screen it caused.
+    pub observe_after_action: bool,
+}
+
+impl Default for ComputerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_edge: 1280,
+            format: "png".into(),
+            wait_ms: 2000,
+            max_screens_per_turn: 20,
+            observe_after_action: true,
+        }
+    }
+}
+
+impl ComputerConfig {
+    /// `png` or `jpeg`, normalized. The tools crate maps this onto an encoder; the protocol crate
+    /// deliberately does not depend on `image` for one enum.
+    pub fn image_format(&self) -> &'static str {
+        match self.format.trim().to_ascii_lowercase().as_str() {
+            "jpeg" | "jpg" => "jpeg",
+            _ => "png",
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !(320..=2000).contains(&self.max_edge) {
+            return Err(format!(
+                "tools.computer.max_edge must be between 320 and 2000, got {}",
+                self.max_edge
+            ));
+        }
+        if !matches!(
+            self.format.trim().to_ascii_lowercase().as_str(),
+            "png" | "jpeg" | "jpg"
+        ) {
+            return Err(format!(
+                "tools.computer.format must be png or jpeg, got {:?}",
+                self.format
+            ));
+        }
+        if self.wait_ms == 0 {
+            return Err("tools.computer.wait_ms must be at least 1ms".into());
+        }
+        if self.max_screens_per_turn == 0 {
+            return Err("tools.computer.max_screens_per_turn must be at least 1".into());
         }
         Ok(())
     }
@@ -328,7 +579,7 @@ impl Default for RetentionConfig {
     fn default() -> Self {
         Self {
             cache_days: 7,
-            logs_days: 30,
+            logs_days: 7,
             session_days: 7,
             enabled: true,
         }
@@ -498,7 +749,7 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             max_rounds: 150,
-            max_depth: 2,
+            max_depth: 1,
             max_parallel_tools: 16,
             task_wait_secs: 60,
         }

@@ -25,8 +25,6 @@ use std::time::Duration;
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
 use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
-#[cfg(windows)]
-use process_wrap::tokio::{CreationFlags, JobObject};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 #[cfg(windows)]
@@ -57,14 +55,21 @@ pub enum Console {
 ///
 /// Used directly where something else owns the child afterwards — the MCP transport, for
 /// instance — and by [`Tree::spawn`] everywhere else.
-pub fn wrap(command: Command, console: Console) -> CommandWrap {
+pub fn wrap(mut command: Command, console: Console) -> CommandWrap {
+    // TEMPORARY DIAGNOSTIC -- revert once the console flash is pinned down. Setting the flag on the
+    // command itself, with no process-wrap wrappers, is the shape `workspace-api`'s git helpers
+    // use, and those were confirmed not to flash a window. If this stops the flash, the cause is
+    // in process-wrap's CreationFlags/JobObject (JobObject adds CREATE_SUSPENDED, which the git
+    // path never uses) rather than in CREATE_NO_WINDOW itself. Killing the tree is degraded while
+    // this stands: only the direct child is stopped.
+    #[cfg(windows)]
+    if console == Console::Hidden {
+        command.creation_flags(CREATE_NO_WINDOW.0);
+    }
     let mut wrapped = CommandWrap::from(command);
     #[cfg(windows)]
     {
-        if console == Console::Hidden {
-            wrapped.wrap(CreationFlags(CREATE_NO_WINDOW));
-        }
-        wrapped.wrap(KillOnDrop).wrap(JobObject);
+        wrapped.wrap(KillOnDrop);
     }
     #[cfg(unix)]
     {

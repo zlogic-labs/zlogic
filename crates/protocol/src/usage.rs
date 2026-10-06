@@ -325,6 +325,9 @@ pub enum Purpose {
     Approval,
     ApprovalDeep,
     Utility,
+    /// A spoken reply during a live call. Short, latency-bound, and routed like the other
+    /// auxiliary roles rather than like the conversation it interrupts.
+    Voice,
     Agent(String),
 }
 
@@ -375,6 +378,7 @@ impl Purpose {
             Purpose::Approval => "approval".into(),
             Purpose::ApprovalDeep => "approval_deep".into(),
             Purpose::Utility => "utility".into(),
+            Purpose::Voice => "voice".into(),
             Purpose::Agent(name) => format!("agent:{name}"),
         }
     }
@@ -387,6 +391,7 @@ impl Purpose {
             "approval" => Purpose::Approval,
             "approval_deep" => Purpose::ApprovalDeep,
             "utility" => Purpose::Utility,
+            "voice" => Purpose::Voice,
             other => Purpose::Agent(other.strip_prefix("agent:")?.to_string()),
         })
     }
@@ -436,6 +441,7 @@ mod purpose_tests {
             Purpose::Approval,
             Purpose::ApprovalDeep,
             Purpose::Utility,
+            Purpose::Voice,
             Purpose::Agent("researcher".into()),
         ] {
             assert_eq!(Purpose::parse_wire(&p.as_wire()).unwrap(), p);

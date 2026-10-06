@@ -2,29 +2,60 @@
 //! ```
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use zlogic_checkpoints::{Checkpoints, REPO_DIR};
 use zlogic_config::{AppConfig, Dirs};
 use zlogic_objects::RepoFacts;
-use zlogic_protocol::{MemoryRecord, SessionId, WorkspaceId};
-use zlogic_tools::{ShellDialect, ToolPrompt};
+use zlogic_protocol::settings::EnvSource;
+use zlogic_protocol::{MemoryRecord, SessionId, TurnId, WorkspaceId};
+use zlogic_tools::{EnvFacts, EnvProvider, EnvVariable, ShellDialect, ToolPrompt};
 
 use crate::skills::{self, SkillDef};
 
 const MAX_NOTES_CHARS: usize = 32 * 1024;
 const MAX_MEMORY_CHARS: usize = 16 * 1024;
 
+/// How many variable names the `env:` line names before it counts the rest. A user with forty
+/// variables needs the list, not forty lines of prompt; one with four hundred does not, and the
+/// shell can still be asked.
+const MAX_ENV_NAMES: usize = 24;
+
 const NOTES_NAMES: &[&str] = &["AGENTS.md"];
+
+/// `NAME=value`, or just `NAME` when the name says the value is a secret. A truncated value keeps
+/// its shape (`sk-a…9f2c`) so the model can tell a truncated key from a short one, without the
+/// line carrying enough of it to be useful to anyone reading the transcript.
+fn describe_variable(var: &EnvVariable) -> String {
+    if zlogic_protocol::settings::looks_like_credential(&var.name) {
+        return var.name.clone();
+    }
+    if var.value.contains(['\n', '\r']) || var.value.len() > 60 {
+        return format!(
+            "{}={}…",
+            var.name,
+            var.value.chars().take(24).collect::<String>()
+        );
+    }
+    format!("{}={}", var.name, var.value)
+}
 
 pub struct SystemPrompts {
     dirs: Dirs,
     config: Arc<AppConfig>,
     shell: Option<ShellDialect>,
     renders_math: bool,
+    /// The same resolver the `shell` tool asks, so the line below and the child process can never
+    /// describe different sets. See [`crate::env`].
+    env: Option<Arc<dyn EnvProvider>>,
     /// What the host says about this session, asked afresh every turn. See
     /// [`SessionEnvironmentService`](crate::service::SessionEnvironmentService).
     session_environment: Option<Arc<dyn crate::service::SessionEnvironmentService>>,
+    /// The store behind [`Self::checkpoint_block`]. Asked afresh every turn rather than read at
+    /// construction, so turning checkpoints off takes effect on the next turn and not on the next
+    /// restart.
+    checkpoints: Option<Arc<Checkpoints>>,
 }
 
 pub struct PromptRequest<'a> {
@@ -33,6 +64,10 @@ pub struct PromptRequest<'a> {
     /// The turn's session, which decides where the model is told to put its temporary files.
     /// `None` only where there is no session yet — the system prompt itself, and the tests.
     pub session_id: Option<SessionId>,
+    /// The turn being assembled, which names the folder its output is collected from. `None` where
+    /// no turn is in flight, and where the environment block then leaves the folder unnamed rather
+    /// than pointing the model at one that will not be read.
+    pub turn_id: Option<TurnId>,
     pub root: &'a Path,
     pub exec_cwd: &'a Path,
     pub tools: &'a [String],
@@ -56,8 +91,20 @@ impl SystemPrompts {
             config,
             shell,
             renders_math: false,
+            env: None,
             session_environment: None,
+            checkpoints: None,
         }
+    }
+
+    pub fn with_checkpoints(mut self, checkpoints: Option<Arc<Checkpoints>>) -> Self {
+        self.checkpoints = checkpoints;
+        self
+    }
+
+    pub fn with_env(mut self, provider: Option<Arc<dyn EnvProvider>>) -> Self {
+        self.env = provider;
+        self
     }
 
     pub fn with_session_environment(
@@ -90,7 +137,19 @@ impl SystemPrompts {
                 stable.push(text);
             }
         }
-        stable.extend(self.notes_sections(req.root, tools.uses_workspace()));
+        stable.extend(self.notes_sections(
+            req.root,
+            req.exec_cwd,
+            tools.uses_workspace(),
+        ));
+        if tools.is_research() {
+            let deep_research = tools.has("skill")
+                && skills::discover(&self.dirs, req.root, Some(req.workspace_id))
+                    .found
+                    .iter()
+                    .any(|s| s.name == DEEP_RESEARCH_SKILL && s.enabled);
+            stable.push(research_guidance(deep_research));
+        }
 
         let mut parts = vec![stable.join("\n\n")];
         let can_update_memory = tools.has("memory_update");
@@ -102,20 +161,101 @@ impl SystemPrompts {
             ));
         }
         parts.push(self.environment(&req, &tools));
+        // Reading a store needs a shell, so a turn without one is not told where it is.
+        if tools.has("shell")
+            && let Some(text) = self.checkpoint_block(&req)
+        {
+            parts.push(text);
+        }
         parts
     }
 
-    fn notes_sections(&self, root: &Path, include_project: bool) -> Vec<String> {
+    /// The `env:` line: which variables a shell call will find, and where they came from.
+    ///
+    /// Names only for the built-ins, whose values are already stated as prose above (`workspace:`,
+    /// `cwd:`, `cache:`), and for anything whose *name* says it is a secret. A value in the system
+    /// prompt is a value in the transcript, in every log that records one, and in the provider's
+    /// own request body — the model can read a variable by running `echo`, and that costs nothing
+    /// that matters. The line is omitted entirely when the user has declared nothing.
+    fn env_line(&self, req: &PromptRequest<'_>) -> Option<String> {
+        let provider = self.env.as_ref()?;
+        let session_id = req.session_id?;
+        // No turn exists yet when a system prompt is assembled — both callers build it on the way
+        // to `Core::new`. The only value this placeholder reaches is `ZLOGIC_TURN_ID`, and the
+        // built-ins are filtered out of the line before it is rendered, so it never does.
+        let turn_id = TurnId::new();
+        let variables = provider.variables(&EnvFacts {
+            root: req.root,
+            exec_cwd: req.exec_cwd,
+            session_id,
+            turn_id,
+        });
+        let user: Vec<&EnvVariable> = variables
+            .iter()
+            .filter(|var| var.source != EnvSource::Builtin)
+            .collect();
+        if user.is_empty() {
+            return None;
+        }
+        let shown: Vec<String> = user
+            .iter()
+            .take(MAX_ENV_NAMES)
+            .map(|var| describe_variable(var))
+            .collect();
+        let hidden = user.len().saturating_sub(shown.len());
+        let mut text = format!("env: {}", shown.join(", "));
+        if hidden > 0 {
+            text.push_str(&format!(" ({hidden} more)"));
+        }
+        text.push_str(
+            " — set in zlogic's variables (global, then this project, then this session); \
+             the shell expands $NAME itself",
+        );
+        Some(text)
+    }
+
+    fn notes_sections(&self, root: &Path, exec_cwd: &Path, include_project: bool) -> Vec<String> {
         let mut out = Vec::new();
         if let Some((path, text)) = first_existing(&self.dirs.config, NOTES_NAMES) {
-            out.push(wrap_notes("user_instructions", &path, &text));
+            let (body, truncated) = slice_notes(&text, MAX_NOTES_CHARS);
+            out.push(wrap_notes("user_instructions", &path, &body, truncated));
         }
         if include_project {
-            if let Some((path, text)) = first_existing(root, NOTES_NAMES) {
-                out.push(wrap_notes("project_instructions", &path, &text));
-            }
+            out.extend(project_notes(root, exec_cwd));
         }
         out
+    }
+
+    /// zlogic's own snapshots of this working tree, named only where there are any and only where
+    /// a shell exists to read them with. The directory is computed rather than described, because a
+    /// store is named after a hash of the repository's own path and nothing the model could work
+    /// out, and because zlogic's data directory is not otherwise disclosed to the model; `exec_cwd`
+    /// rather than the root, so a session inside a worktree is pointed at the store that session's
+    /// captures actually went into.
+    fn checkpoint_block(&self, req: &PromptRequest<'_>) -> Option<String> {
+        let store = self.checkpoints.as_ref()?;
+        if !store.enabled() {
+            return None;
+        }
+        let dir = store
+            .repository_dir(req.exec_cwd)?
+            .join(REPO_DIR)
+            .display()
+            .to_string();
+        Some(format!(
+            "<checkpoints>\n\
+             checkpoints: {dir}\n\n\
+             If a file goes missing and git cannot restore it, check this repository for a zlogic \
+             checkpoint. zlogic creates checkpoints before tool calls that may modify files, so an \
+             otherwise unrecoverable file may still be available here.\n\n\
+             List checkpoints, newest first:\n\
+             git --git-dir=… log {head} --format=%H%n%ci%n%B\n\n\
+             Restore a file:\n\
+             git --git-dir=… show <commit>:<path> > <path>\n\n\
+             Git-ignored files are not captured.\n\
+             </checkpoints>",
+            head = zlogic_checkpoints::HEAD_REF,
+        ))
     }
 
     fn environment(&self, req: &PromptRequest<'_>, tools: &PromptTools<'_>) -> String {
@@ -141,6 +281,20 @@ impl SystemPrompts {
                  it does not exist",
                 crate::retention::session_cache_dir(req.root, req.session_id).display()
             ));
+
+            // Only with a turn in flight: the folder is per-turn, and a path to a folder nobody
+            // will read is worse than no line at all.
+            if let (Some(session_id), Some(turn_id)) = (req.session_id, req.turn_id) {
+                lines.push(format!(
+                    "deliverables: {} — inside this turn's cache folder. Put the files the user \
+                     is meant to receive here: images, documents, spreadsheets, charts, anything \
+                     you generated for them to open. Also exported as \
+                     {}DELIVERABLES_DIR, which is how a script reaches it without you having to \
+                     spell the path out. Create the directory if it does not exist.",
+                    zlogic_core::turndir::deliverables_dir(req.root, session_id, turn_id).display(),
+                    zlogic_protocol::settings::ENV_BUILTIN_PREFIX,
+                ));
+            }
 
             if req.exec_cwd != req.root {
                 lines.push(format!(
@@ -172,6 +326,14 @@ impl SystemPrompts {
                 "mcp: configured but not available this turn — {}",
                 req.unavailable_mcp.join("; ")
             ));
+        }
+
+        // Only where a shell exists to inherit them: a turn with no `shell` tool has no process
+        // environment, and naming variables it cannot use would be a fact about the wrong machine.
+        if tools.has("shell")
+            && let Some(text) = self.env_line(req)
+        {
+            lines.push(text);
         }
 
         // Asked last so a host's own line reads as the most specific fact on the block. A failure
@@ -297,6 +459,37 @@ summary.
 - When a request is ambiguous and the readings lead to materially different work, ask. Otherwise \
 pick the reasonable default and say which one you picked.";
 
+/// Shown only in a research workspace, where the folder holds findings rather than a codebase.
+///
+/// The rules are the ones that keep a long investigation honest: a claim without a source is a
+/// guess wearing a citation's clothes, and an agent that cannot express uncertainty will invent a
+/// value instead. Nothing here overrides the user's instructions — it is the floor.
+const RESEARCH_GUIDANCE: &str = "\
+Working in this research workspace:
+- You are investigating, not coding. The folder holds research output: an outline, a field \
+schema, one file of findings per subject, and a report.
+- Search before you answer, and cite every factual claim with the URL you found it at. A claim \
+you cannot source is a guess — mark it as one.
+- Give the date a source carries. Anything time-sensitive ('latest', 'current', 'as of') needs \
+its date stated, not assumed.
+- Report what you could not establish. An unresolved question is a result; a confident wrong \
+answer is not.
+- Split independent subjects across `create_agent` sub-agents running in parallel, and give each \
+one a self-contained brief: what to find, what fields to fill, where to write the result.";
+
+/// The built-in skill ships switched off, so this line is only true when it has been turned on.
+const DEEP_RESEARCH_SKILL: &str = "deep-research";
+
+fn research_guidance(deep_research: bool) -> String {
+    if !deep_research {
+        return RESEARCH_GUIDANCE.to_string();
+    }
+    format!(
+        "{RESEARCH_GUIDANCE}\n- Prefer the `{DEEP_RESEARCH_SKILL}` skill when the user asks for a \
+         structured investigation — it carries the outline-first workflow."
+    )
+}
+
 const FILE_TOOLS: &[&str] = &["read_file", "write_file", "edit"];
 const INSPECTION_TOOLS: &[&str] = &["read_file", "list_dir", "glob", "grep", "shell"];
 const WORKSPACE_TOOLS: &[&str] = &[
@@ -340,6 +533,14 @@ impl<'a> PromptTools<'a> {
 
     fn uses_workspace(&self) -> bool {
         self.any(WORKSPACE_TOOLS)
+    }
+
+    /// The research preset is the only allowlist carrying both the search pair and the file tools,
+    /// so membership identifies it without threading the workspace kind through every caller.
+    fn is_research(&self) -> bool {
+        zlogic_protocol::query::research_workspace_tools()
+            .iter()
+            .all(|name| self.names.contains(name.as_str()))
     }
 }
 
@@ -577,13 +778,14 @@ fn background_list(tools: &PromptTools<'_>) -> String {
 }
 
 fn skills_section(found: &[SkillDef]) -> Option<String> {
-    if found.is_empty() {
-        return None;
-    }
     let list: Vec<String> = found
         .iter()
+        .filter(|s| s.enabled)
         .map(|s| format!("- {} — {} ({})", s.name, s.description, s.path.display()))
         .collect();
+    if list.is_empty() {
+        return None;
+    }
     Some(format!(
         "Skills available here. A skill is a written procedure for one kind of task. When the task \
          at hand matches one, load it with the `skill` tool (by name, with arguments if it \
@@ -594,25 +796,78 @@ fn skills_section(found: &[SkillDef]) -> Option<String> {
     ))
 }
 
-fn wrap_notes(tag: &str, path: &Path, text: &str) -> String {
-    let (body, note) = match text.chars().count() > MAX_NOTES_CHARS {
-        false => (text.trim().to_string(), String::new()),
-        true => {
-            let head: String = text.chars().take(MAX_NOTES_CHARS).collect();
-            (
-                head,
-                format!(
-                    "\n… truncated at {MAX_NOTES_CHARS} characters. Read {} for the rest.",
-                    path.display()
-                ),
-            )
-        }
+fn wrap_notes(tag: &str, path: &Path, body: &str, truncated: bool) -> String {
+    let note = if truncated {
+        format!(
+            "\n… truncated at {MAX_NOTES_CHARS} characters. Read {} for the rest.",
+            path.display()
+        )
+    } else {
+        String::new()
     };
     format!(
         "<{tag} path=\"{}\">\nInstructions the user wrote for this work. They take precedence over \
          the general guidance above; follow them without being asked.\n\n{body}{note}\n</{tag}>",
         path.display()
     )
+}
+
+/// `AGENTS.md` from the workspace root down to the directory the turn runs in, one file per level.
+///
+/// The cascade is the convention (Codex, and the AAIF spec behind it): a repository states its
+/// rules once at the root, and a package states only what differs for it. Reading root-downward
+/// means the more specific file lands later in the prompt and can narrow what the general one
+/// said. A single file at the root cannot express "except in here" — which is the whole reason a
+/// monorepo has a `packages/*/AGENTS.md` at all.
+fn project_notes(root: &Path, exec_cwd: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut budget = MAX_NOTES_CHARS;
+    for dir in note_chain(root, exec_cwd) {
+        if budget == 0 {
+            break;
+        }
+        let Some((path, text)) = first_existing(&dir, NOTES_NAMES) else {
+            continue;
+        };
+        let (body, truncated) = slice_notes(&text, budget);
+        // Charge what was actually injected, not the whole file: a 10 KB file truncated to the
+        // last 2 KB of the budget must leave 2 KB for the next level, not zero.
+        budget = budget.saturating_sub(body.chars().count());
+        out.push(wrap_notes("project_instructions", &path, &body, truncated));
+    }
+    out
+}
+
+/// The directories from `root` down to `exec_cwd`, inclusive of both.
+///
+/// Returns just the root when the turn runs outside the workspace: `open_at` on a sibling
+/// directory registers a *new* workspace rather than borrowing this one's rules, and walking
+/// `..` out of the root would read files the workspace does not own.
+fn note_chain(root: &Path, exec_cwd: &Path) -> Vec<PathBuf> {
+    let Ok(relative) = exec_cwd.strip_prefix(root) else {
+        return vec![root.to_path_buf()];
+    };
+    let mut dirs = vec![root.to_path_buf()];
+    let mut dir = root.to_path_buf();
+    for component in relative.components() {
+        // `..` cannot survive `strip_prefix` on a normalised pair, but a lexical path that
+        // reached here unnormalised would otherwise walk out of the workspace.
+        if component == Component::ParentDir {
+            return vec![root.to_path_buf()];
+        }
+        dir.push(component);
+        dirs.push(dir.clone());
+    }
+    dirs
+}
+
+/// The leading `budget` characters of a notes file, and whether that cut it short.
+fn slice_notes(text: &str, budget: usize) -> (String, bool) {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= budget {
+        return (trimmed.to_string(), false);
+    }
+    (trimmed.chars().take(budget).collect(), true)
 }
 
 fn first_existing(dir: &Path, names: &[&str]) -> Option<(PathBuf, String)> {
@@ -663,6 +918,7 @@ mod tests {
         let tools: Vec<String> = tools.iter().map(|t| t.to_string()).collect();
         p.build(PromptRequest {
             workspace_id: WorkspaceId::new(),
+            turn_id: None,
             session_id: None,
             root,
             exec_cwd,
@@ -845,6 +1101,7 @@ mod tests {
         let tools = tool_names(&["memory_update"]);
         let parts = prompts(tmp.path()).build(PromptRequest {
             workspace_id: WorkspaceId::new(),
+            turn_id: None,
             session_id: None,
             root: tmp.path(),
             exec_cwd: tmp.path(),
@@ -884,6 +1141,7 @@ mod tests {
         };
         let parts = prompts(tmp.path()).build(PromptRequest {
             workspace_id: WorkspaceId::new(),
+            turn_id: None,
             session_id: None,
             root: tmp.path(),
             exec_cwd: tmp.path(),
@@ -937,6 +1195,7 @@ mod tests {
         };
         let parts = prompts(tmp.path()).build(PromptRequest {
             workspace_id: WorkspaceId::new(),
+            turn_id: None,
             session_id: None,
             root: tmp.path(),
             exec_cwd: tmp.path(),
@@ -1036,6 +1295,55 @@ mod tests {
         );
     }
 
+    /// The delivery folder is where the engine looks when the turn ends, so a prompt that does not
+    /// name it is a folder nobody reads. Named per turn, not per session: a session folder would
+    /// answer with every earlier turn's leftovers as well.
+    #[test]
+    fn the_turn_names_the_folder_its_output_is_collected_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let tools = vec!["read_file".to_string()];
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+
+        let env_of = |turn| {
+            prompts(tmp.path()).build(PromptRequest {
+                workspace_id: WorkspaceId::new(),
+                session_id: Some(session_id),
+                turn_id: Some(turn),
+                root: &root,
+                exec_cwd: &root,
+                tools: &tools,
+                tool_guidance: &[],
+                unavailable_mcp: &[],
+                allows_mcp: true,
+                effectful: false,
+                global_memory: &[],
+                workspace_memory: &[],
+            })[1]
+                .clone()
+        };
+
+        let env = env_of(turn_id);
+        let expected = zlogic_core::turndir::deliverables_dir(&root, session_id, turn_id);
+        assert!(env.contains(&expected.display().to_string()), "{env}");
+        assert!(
+            env.contains("DELIVERABLES_DIR"),
+            "a script needs the variable: {env}"
+        );
+
+        // A second turn of the same session gets a different folder, or the first one's leftovers
+        // are handed over again.
+        let next = env_of(TurnId::new());
+        assert_ne!(
+            zlogic_core::turndir::deliverables_dir(&root, session_id, turn_id),
+            zlogic_core::turndir::deliverables_dir(&root, session_id, TurnId::new()),
+            "the folder is per turn"
+        );
+        assert_ne!(env, next);
+    }
+
     #[test]
     fn each_session_is_announced_its_own_cache_folder() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1046,6 +1354,7 @@ mod tests {
         let env_of = |session_id| {
             prompts(tmp.path()).build(PromptRequest {
                 workspace_id: WorkspaceId::new(),
+                turn_id: None,
                 session_id: Some(session_id),
                 root: &root,
                 exec_cwd: &root,
@@ -1236,6 +1545,7 @@ mod tests {
         let env = prompts(tmp.path())
             .build(PromptRequest {
                 workspace_id: WorkspaceId::new(),
+                turn_id: None,
                 session_id: None,
                 root: tmp.path(),
                 exec_cwd: tmp.path(),
@@ -1262,6 +1572,7 @@ mod tests {
         let unavailable = vec!["github (still starting)".to_string()];
         let parts = prompts(tmp.path()).build(PromptRequest {
             workspace_id: WorkspaceId::new(),
+            turn_id: None,
             session_id: None,
             root: tmp.path(),
             exec_cwd: tmp.path(),
@@ -1302,6 +1613,90 @@ mod tests {
         assert!(
             stable.contains(&root.join("AGENTS.md").display().to_string()),
             "with a path"
+        );
+    }
+
+    #[test]
+    fn a_notes_file_below_the_root_narrows_it_for_that_directory_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let package = root.join("packages/api");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "root rule: run cargo fmt\n").unwrap();
+        std::fs::write(package.join("AGENTS.md"), "package rule: no fmt here\n").unwrap();
+
+        let prompts = prompts(tmp.path());
+        let tools = ["read_file"];
+
+        let inside = build(&prompts, &root, &package, &tools).remove(0);
+        let root_at = inside.find("root rule").expect("the root file still applies");
+        let package_at = inside.find("package rule").expect("the nested file applies too");
+        assert!(
+            root_at < package_at,
+            "the deeper file lands last, so it can narrow the root one"
+        );
+
+        let elsewhere = build(&prompts, &root, &root, &tools).remove(0);
+        assert!(
+            elsewhere.contains("root rule"),
+            "the root file alone is not enough to lose the workspace's rules"
+        );
+        assert!(
+            !elsewhere.contains("package rule"),
+            "a sibling package's file must not leak into a turn that is not under it"
+        );
+    }
+
+    #[test]
+    fn a_turn_outside_the_workspace_reads_the_root_and_nothing_above_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let outside = tmp.path().join("elsewhere/deep");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "root rule\n").unwrap();
+        std::fs::write(outside.join("AGENTS.md"), "stray rule\n").unwrap();
+
+        let stable = build(&prompts(tmp.path()), &root, &outside, &["read_file"]).remove(0);
+        assert!(stable.contains("root rule"));
+        assert!(
+            !stable.contains("stray rule"),
+            "a directory the workspace does not own has no say over this turn"
+        );
+    }
+
+    #[test]
+    fn the_notes_budget_is_shared_across_the_cascade() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let package = root.join("packages/api");
+        std::fs::create_dir_all(&package).unwrap();
+        // Two files that each fit the budget on their own: summed, they do not.
+        let half = "x".repeat(MAX_NOTES_CHARS - 16);
+        std::fs::write(root.join("AGENTS.md"), &half).unwrap();
+        std::fs::write(package.join("AGENTS.md"), &half).unwrap();
+
+        let stable = build(&prompts(tmp.path()), &root, &package, &["read_file"]).remove(0);
+        let injected = stable
+            .matches("<project_instructions")
+            .count();
+        assert!(
+            injected <= 2,
+            "one block per level at most, never an unbounded concatenation"
+        );
+        assert!(
+            stable.contains("truncated at") || injected == 1,
+            "the second file is cut to the remaining budget, and says so"
+        );
+        let notes_chars: usize = stable
+            .split("<project_instructions")
+            .skip(1)
+            .filter_map(|block| block.split_once('>'))
+            .map(|(_, rest)| rest.len())
+            .sum();
+        assert!(
+            notes_chars <= MAX_NOTES_CHARS * 2,
+            "the cascade must not grow the prompt past roughly one budget's worth of body"
         );
     }
 
@@ -1359,14 +1754,34 @@ mod tests {
         );
     }
 
+    /// A bundled skill ships switched off, so the index is empty until someone turns it on — and once
+    /// on, it carries the synthetic path, because a bundled skill still has no file to edit.
     #[test]
-    fn the_built_in_guide_is_listed_without_anything_installed() {
+    fn a_bundled_skill_enters_the_index_only_once_it_is_switched_on() {
         let tmp = tempfile::tempdir().unwrap();
-        let stable = build(&prompts(tmp.path()), tmp.path(), tmp.path(), &["skill"]).remove(0);
-        assert!(stable.contains("zlogic-guide"), "{stable}");
+        let off = build(&prompts(tmp.path()), tmp.path(), tmp.path(), &["skill"]).remove(0);
         assert!(
-            stable.contains("<builtin>/skills/zlogic-guide/SKILL.md"),
-            "the index says where it came from, and a built-in has no file to edit: {stable}"
+            !off.contains(crate::skills::TEST_BUILTIN),
+            "nothing installed and nothing switched on means no index: {off}"
+        );
+
+        // The switch is machine-wide, which is what Runtime → Skills writes: a bundled skill has
+        // no folder and belongs to no repository, so there is no per-workspace answer to give.
+        crate::extensions::state::set_global(
+            &Dirs::under(tmp.path()),
+            crate::extensions::Kind::Skill,
+            crate::skills::TEST_BUILTIN,
+            Some(true),
+        )
+        .unwrap();
+        let on = build(&prompts(tmp.path()), tmp.path(), tmp.path(), &["skill"]).remove(0);
+        assert!(on.contains(crate::skills::TEST_BUILTIN), "{on}");
+        assert!(
+            on.contains(&format!(
+                "<builtin>/skills/{}/SKILL.md",
+                crate::skills::TEST_BUILTIN
+            )),
+            "the index says where it came from, and a bundled skill has no file to edit: {on}"
         );
     }
 
@@ -1392,6 +1807,7 @@ mod tests {
             .collect::<Vec<_>>();
         let parts = prompts(tmp.path()).build(PromptRequest {
             workspace_id: WorkspaceId::new(),
+            turn_id: None,
             session_id: None,
             root: tmp.path(),
             exec_cwd: tmp.path(),

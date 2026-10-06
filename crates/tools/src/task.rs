@@ -65,11 +65,14 @@ pub trait TaskHost: Send + Sync {
     /// Starts a persisted background agent and returns after the runtime has been registered.
     /// The host combines `request.cancel` with the task's own token. Cancelling the launching
     /// conversation or calling `task_stop` therefore reaches the same agent run.
+    ///
+    /// Returns the sub-agent's session id alongside the task id: the host reserves the session
+    /// before returning, so the caller can label the sub-agent on its card straight away.
     async fn start_agent(
         &self,
         request: AgentRequest,
         spawner: Arc<dyn AgentSpawner>,
-    ) -> std::result::Result<TaskId, String>;
+    ) -> std::result::Result<(TaskId, SessionId), String>;
 
     async fn get(
         &self,

@@ -13,6 +13,8 @@ workspace = true
 zlogic-config = { path = "../config" }
 # Bucketing by day needs "today" — chrono is already available in the workspace, and a date format is not worth a new dependency.
 chrono.workspace = true
+# The privacy gate scrubs the home directory out of paths, which needs the home directory.
+dirs.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true

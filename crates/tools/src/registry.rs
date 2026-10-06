@@ -151,6 +151,23 @@ impl ToolRegistry {
         })
     }
 
+    /// The subset of [`Self::available_names`] that only reads.
+    ///
+    /// Plan mode's tool set. Keyed on the tools' own [`ToolRisk`] for the same reason
+    /// [`Self::any_effectful`] is: a hand-kept list falls behind every tool that is added, and
+    /// falling behind here means a mutating tool stays reachable in the one mode that promises it
+    /// is not. `mcp__` tools are excluded whatever they declare — the declaration comes from
+    /// someone else's process.
+    pub fn read_only_names(&self) -> Vec<String> {
+        self.tools
+            .iter()
+            .filter(|(name, _)| !name.starts_with("mcp__"))
+            .filter(|(_, tool)| tool.available())
+            .filter(|(_, tool)| tool.meta().risk == ToolRisk::Read)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.tools.len()
     }

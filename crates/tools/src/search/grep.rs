@@ -53,6 +53,7 @@ use zlogic_protocol::llm::ToolDefinition;
 
 use crate::search::CaseMode;
 use crate::search::ignores::Ignores;
+use crate::search::SearchBudgets;
 use crate::{Recovery, Result, Tool, ToolCtx, ToolExecResult, ToolMeta, ToolRisk, parse_args};
 
 const DEFAULT_MAX_MATCHES: usize = 100;
@@ -80,7 +81,22 @@ struct Args {
     max_matches: Option<usize>,
 }
 
-pub struct Grep;
+#[derive(Debug, Clone)]
+pub struct Grep {
+    budgets: SearchBudgets,
+}
+
+impl Default for Grep {
+    fn default() -> Self {
+        Self::with_budgets(SearchBudgets::default())
+    }
+}
+
+impl Grep {
+    pub fn with_budgets(budgets: SearchBudgets) -> Self {
+        Self { budgets }
+    }
+}
 
 #[async_trait]
 impl Tool for Grep {
@@ -176,10 +192,15 @@ impl Tool for Grep {
             context_lines,
             files_only: a.files_only,
             cancel: None,
+            deadline: self.budgets.deadline(),
         };
 
-        let (result, cancelled) = run_blocking(ctx, root.clone(), a.pattern.clone(), opts).await?;
-        if cancelled {
+        let (result, stopped) = run_blocking(ctx, root.clone(), a.pattern.clone(), opts).await?;
+        // A search cut short by the runtime's own ceiling is reported as a timeout, never as a user
+        // interrupt. The turn is still going and the model will act on this result, so "the user
+        // stopped you" would be a false fact it reasons from; and `ToolExecResult::timeout` is what
+        // the runtime reports for the same event, so this keeps the two accounts consistent.
+        if stopped == Some(Stopped::Cancelled) {
             return Ok(ToolExecResult::cancelled("search interrupted"));
         }
         let outcome = match result {
@@ -189,14 +210,43 @@ impl Tool for Grep {
                 return Ok(ToolExecResult::failed(format!("invalid regex: {m}")));
             }
             Err(code_sitter::SearchError::Cancelled) => {
-                return Ok(ToolExecResult::cancelled("search interrupted"));
+                return Ok(match stopped {
+                    Some(Stopped::Cancelled) => ToolExecResult::cancelled("search interrupted"),
+                    Some(Stopped::Budget) => ToolExecResult::timeout(format!(
+                        "search stopped at the {}s tool timeout",
+                        self.budgets.timeout.as_secs()
+                    )),
+                    // The flag was set but neither token reads as cancelled: the runtime's timeout
+                    // fired and the round already reported it. Do not contradict that with a
+                    // different status.
+                    None => ToolExecResult::cancelled("search interrupted"),
+                });
             }
             Err(e) => return Ok(ToolExecResult::failed(format!("search failed: {e}"))),
         };
 
         let hits = outcome.hits;
 
+        // A deadline that expires with nothing found is the dangerous case, not the empty one:
+        // "no matches" tells the model the answer does not exist, and here it only means the part of
+        // the tree that would have said so was never read. The wording avoids the phrase "no
+        // matches" entirely rather than qualifying it — a caller scanning a summary line reads the
+        // first clause, and the caveat would be the clause it skips.
         if hits.is_empty() {
+            if outcome.timed_out {
+                return Ok(ToolExecResult::success(format!(
+                    "searched part of {} for /{}/ and stopped at the {}s limit without finding a \
+                     match{}. The tree was not fully read, so this is not evidence that nothing \
+                     matches — narrow path or include and search again",
+                    root.display(),
+                    a.pattern,
+                    self.budgets.timeout.as_secs(),
+                    match &a.include {
+                        Some(g) => format!(" (include: {g})"),
+                        None => String::new(),
+                    },
+                )));
+            }
             return Ok(ToolExecResult::success(format!(
                 "no matches for /{}/ under {}{}",
                 a.pattern,
@@ -248,11 +298,26 @@ impl Tool for Grep {
                 " — capped at {max_matches}, narrow the search to see more"
             ));
         }
+        if outcome.timed_out {
+            body.push_str(&format!(
+                " — stopped at the {}s limit with the tree only partly read, so a match outside \
+                 what was searched would not appear here",
+                self.budgets.timeout.as_secs()
+            ));
+        }
         if outcome.skipped_files > 0 {
             // Honest bookkeeping: unreadable files mean the absence of a match proves nothing.
             body.push_str(&format!(
                 " — {} file(s) could not be read and were skipped",
                 outcome.skipped_files
+            ));
+        }
+        if outcome.oversized_files > 0 {
+            // Same false-negative problem as an unreadable file, different fix, so it says which:
+            // these were not skipped because they failed, they were too big to search.
+            body.push_str(&format!(
+                " — {} file(s) were too large to search and were skipped",
+                outcome.oversized_files
             ));
         }
         if !a.files_only && unannotated > 0 {
@@ -346,10 +411,24 @@ fn format_hit_body(hit: &code_sitter::Hit) -> String {
     line
 }
 
-/// Runs the search off the executor, with the conversation's cancellation bridged onto
-/// `code-sitter`'s flag.
-/// Returns `(result, cancelled_before_it_started)`. The second value exists because a token that
-/// was already cancelled must not start a search at all — there would be nobody left to read it.
+/// Which stop signal ended a search, if any.
+///
+/// `code-sitter` reports both as `SearchError::Cancelled`, so the flag alone cannot say why — and
+/// the caller needs to know: a user pressing Esc and the runtime's `tools.timeout_secs` expiring
+/// are different facts, and reporting one as the other tells the model something untrue about its
+/// own call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stopped {
+    /// The user stopped the conversation.
+    Cancelled,
+    /// `tools.timeout_secs` ran out. The call is abandoned but the turn continues.
+    Budget,
+}
+
+/// Runs the search off the executor, with both stop signals bridged onto `code-sitter`'s flag.
+///
+/// Returns `(result, stopped)`. `stopped` is `Some` when the search ended early, so the caller can
+/// report the right reason; a search that ran out of budget is not reported as cancelled.
 #[allow(clippy::type_complexity)]
 async fn run_blocking(
     ctx: &ToolCtx,
@@ -358,10 +437,13 @@ async fn run_blocking(
     mut opts: Options,
 ) -> Result<(
     std::result::Result<code_sitter::SearchResult, code_sitter::SearchError>,
-    bool,
+    Option<Stopped>,
 )> {
-    if ctx.is_cancelled() {
-        return Ok((Err(code_sitter::SearchError::Cancelled), true));
+    // Either signal already set means there is nobody left to read a result: the conversation is
+    // over, or the runtime has given up on this call. Starting the search anyway would burn a thread
+    // on an answer no one will use.
+    if let Some(stopped) = stopped_by(ctx) {
+        return Ok((Err(code_sitter::SearchError::Cancelled), Some(stopped)));
     }
     let flag = Arc::new(AtomicBool::new(false));
     opts.cancel = Some(flag.clone());
@@ -369,10 +451,17 @@ async fn run_blocking(
     // A watcher rather than `select!` on the blocking join: the point is to make the *search*
     // return, not to stop waiting for it. Aborted as soon as the search is done so the task does
     // not outlive the call.
+    //
+    // Both tokens feed one flag because the flag's only job is "stop soon"; which one fired is
+    // recovered afterwards, by asking the tokens again. They are never reset, so that read is
+    // reliable even if the search finished on its own a moment earlier.
     let watcher = {
-        let (flag, token) = (flag.clone(), ctx.cancel.clone());
+        let (flag, cancel, budget) = (flag.clone(), ctx.cancel.clone(), ctx.budget.clone());
         tokio::spawn(async move {
-            token.cancelled().await;
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = budget.cancelled() => {}
+            }
             flag.store(true, Ordering::Relaxed);
         })
     };
@@ -381,9 +470,21 @@ async fn run_blocking(
     watcher.abort();
 
     match joined {
-        Ok(r) => Ok((r, false)),
+        Ok(r) => Ok((r, stopped_by(ctx))),
         // The blocking pool panicked. That is not something the model can act on.
         Err(e) => Err(crate::ToolError::Failed(format!("search task failed: {e}"))),
+    }
+}
+
+/// Which stop signal is set, if any. Checked conversation-first: Esc cancels the budget token too,
+/// so the reverse order would report a user interrupt as a timeout.
+fn stopped_by(ctx: &ToolCtx) -> Option<Stopped> {
+    if ctx.cancel.is_cancelled() {
+        Some(Stopped::Cancelled)
+    } else if ctx.budget.is_cancelled() {
+        Some(Stopped::Budget)
+    } else {
+        None
     }
 }
 
@@ -426,7 +527,7 @@ mod tests {
     #[tokio::test]
     async fn finds_matches_and_reports_paths_relative_to_the_search_root() {
         let (_d, ctx) = project();
-        let out = Grep
+        let out = Grep::default()
             .execute(&ctx, r#"{"pattern":"applyCoupon"}"#)
             .await
             .unwrap();
@@ -446,7 +547,7 @@ mod tests {
     #[tokio::test]
     async fn each_file_is_named_once_and_its_hits_carry_only_line_numbers() {
         let (_d, ctx) = project();
-        let out = Grep
+        let out = Grep::default()
             .execute(&ctx, r#"{"pattern":"applyCoupon"}"#)
             .await
             .unwrap();
@@ -474,7 +575,7 @@ mod tests {
     #[tokio::test]
     async fn hits_carry_their_kind_and_enclosing_symbol() {
         let (_d, ctx) = project();
-        let out = Grep
+        let out = Grep::default()
             .execute(&ctx, r#"{"pattern":"applyCoupon"}"#)
             .await
             .unwrap();
@@ -494,7 +595,7 @@ mod tests {
     #[tokio::test]
     async fn the_summary_is_separated_from_the_hits() {
         let (_d, ctx) = project();
-        let out = Grep
+        let out = Grep::default()
             .execute(&ctx, r#"{"pattern":"applyCoupon"}"#)
             .await
             .unwrap();
@@ -526,7 +627,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = Grep
+        let out = Grep::default()
             .execute(&ctx, r#"{"pattern":"applyCoupon"}"#)
             .await
             .unwrap();
@@ -536,7 +637,7 @@ mod tests {
             out.model_text()
         );
 
-        let ts_only = Grep
+        let ts_only = Grep::default()
             .execute(&ctx, r#"{"pattern":"applyCoupon","include":"*.ts"}"#)
             .await
             .unwrap();
@@ -550,7 +651,7 @@ mod tests {
     #[tokio::test]
     async fn no_match_is_a_successful_empty_answer_not_a_failure() {
         let (_d, ctx) = project();
-        let out = Grep
+        let out = Grep::default()
             .execute(&ctx, r#"{"pattern":"nothingLikeThis"}"#)
             .await
             .unwrap();
@@ -565,7 +666,7 @@ mod tests {
     #[tokio::test]
     async fn files_only_reports_paths_without_line_text() {
         let (_d, ctx) = project();
-        let out = Grep
+        let out = Grep::default()
             .execute(&ctx, r#"{"pattern":"applyCoupon","files_only":true}"#)
             .await
             .unwrap();
@@ -586,7 +687,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = Grep
+        let out = Grep::default()
             .execute(&ctx, r#"{"pattern":"applyCoupon","include":"*.md"}"#)
             .await
             .unwrap();
@@ -598,7 +699,7 @@ mod tests {
     #[tokio::test]
     async fn smart_case_and_explicit_case_modes_are_honoured() {
         let (_d, ctx) = project();
-        let loose = Grep
+        let loose = Grep::default()
             .execute(
                 &ctx,
                 r#"{"pattern":"APPLYCOUPON","case_mode":"insensitive"}"#,
@@ -611,7 +712,7 @@ mod tests {
             loose.model_text()
         );
 
-        let strict = Grep
+        let strict = Grep::default()
             .execute(&ctx, r#"{"pattern":"APPLYCOUPON"}"#)
             .await
             .unwrap();
@@ -625,7 +726,7 @@ mod tests {
     #[tokio::test]
     async fn context_lines_surround_each_match() {
         let (_d, ctx) = project();
-        let out = Grep
+        let out = Grep::default()
             .execute(
                 &ctx,
                 r#"{"pattern":"return applyCoupon","context_lines":1}"#,
@@ -646,7 +747,7 @@ mod tests {
         ctx.max_result_chars = 300;
         std::fs::write(d.path().join("many.ts"), "applyCoupon\n".repeat(40)).unwrap();
 
-        let out = Grep
+        let out = Grep::default()
             .execute(&ctx, r#"{"pattern":"applyCoupon"}"#)
             .await
             .unwrap();
@@ -671,7 +772,7 @@ mod tests {
         std::fs::create_dir_all(d.path().join("node_modules/dep")).unwrap();
         std::fs::write(d.path().join("node_modules/dep/index.ts"), "applyCoupon\n").unwrap();
 
-        let out = Grep
+        let out = Grep::default()
             .execute(&ctx, r#"{"pattern":"applyCoupon"}"#)
             .await
             .unwrap();
@@ -695,7 +796,7 @@ mod tests {
         std::fs::write(d.path().join("src/z.ts"), "uniqueNeedle\n").unwrap();
         let ctx = test_ctx(d.path());
 
-        let out = Grep
+        let out = Grep::default()
             .execute(&ctx, r#"{"pattern":"uniqueNeedle","max_matches":1}"#)
             .await
             .unwrap();
@@ -716,7 +817,7 @@ mod tests {
         std::fs::create_dir_all(d.path().join("node_modules/dep")).unwrap();
         std::fs::write(d.path().join("node_modules/dep/index.ts"), "applyCoupon\n").unwrap();
 
-        let out = Grep
+        let out = Grep::default()
             .execute(&ctx, r#"{"pattern":"applyCoupon","include_ignored":true}"#)
             .await
             .unwrap();
@@ -732,7 +833,7 @@ mod tests {
         let (d, ctx) = project();
         std::fs::write(d.path().join("many.ts"), "applyCoupon\n".repeat(50)).unwrap();
 
-        let out = Grep
+        let out = Grep::default()
             .execute(&ctx, r#"{"pattern":"applyCoupon","max_matches":5}"#)
             .await
             .unwrap();
@@ -747,7 +848,7 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_regex_is_a_failed_result_not_an_err() {
         let (_d, ctx) = project();
-        let out = Grep.execute(&ctx, r#"{"pattern":"("}"#).await.unwrap();
+        let out = Grep::default().execute(&ctx, r#"{"pattern":"("}"#).await.unwrap();
         assert_eq!(out.status, ToolExecStatus::Failed);
         assert!(out.model_text().contains("invalid regex"));
     }
@@ -755,7 +856,7 @@ mod tests {
     #[tokio::test]
     async fn searching_one_file_is_supported() {
         let (_d, ctx) = project();
-        let out = Grep
+        let out = Grep::default()
             .execute(&ctx, r#"{"pattern":"applyCoupon","path":"src/total.ts"}"#)
             .await
             .unwrap();
@@ -772,7 +873,7 @@ mod tests {
     async fn a_cancelled_turn_does_not_start_the_search() {
         let (_d, ctx) = project();
         ctx.cancel.cancel();
-        let out = Grep
+        let out = Grep::default()
             .execute(&ctx, r#"{"pattern":"applyCoupon"}"#)
             .await
             .unwrap();
@@ -785,7 +886,7 @@ mod tests {
         ctx.max_result_chars = 200;
         std::fs::write(d.path().join("many.ts"), "applyCoupon\n".repeat(80)).unwrap();
 
-        let out = Grep
+        let out = Grep::default()
             .execute(&ctx, r#"{"pattern":"applyCoupon"}"#)
             .await
             .unwrap();
@@ -799,7 +900,105 @@ mod tests {
     #[tokio::test]
     async fn missing_required_args_are_rejected() {
         let (_d, ctx) = project();
-        assert!(Grep.execute(&ctx, "{}").await.is_err());
-        assert!(Grep.execute(&ctx, "not json").await.is_err());
+        assert!(Grep::default().execute(&ctx, "{}").await.is_err());
+        assert!(Grep::default().execute(&ctx, "not json").await.is_err());
+    }
+
+    /// A budget too small for even the first file. The deadline is read before the walk starts, so
+    /// this is deterministic — no sleeping, no racing the machine's speed.
+    fn expired() -> Grep {
+        Grep::with_budgets(SearchBudgets {
+            timeout: std::time::Duration::from_nanos(1),
+        })
+    }
+
+    /// The dangerous case: a search that ran out of budget having found nothing. Reporting that as
+    /// "no matches" tells the model the answer does not exist, when really a whole subtree was
+    /// never read.
+    #[tokio::test]
+    async fn a_search_that_ran_out_of_budget_without_a_hit_does_not_say_no_matches() {
+        let (_d, ctx) = project();
+        let out = expired()
+            .execute(&ctx, r#"{"pattern":"applyCoupon"}"#)
+            .await
+            .unwrap();
+        let text = out.model_text();
+        assert!(!text.contains("no matches for"), "{text}");
+        assert!(text.contains("not fully read"), "{text}");
+        assert!(text.contains("narrow"), "it must say what to do: {text}");
+    }
+
+    #[tokio::test]
+    async fn a_search_that_ran_out_of_budget_still_reports_what_it_found() {
+        let (_d, ctx) = project();
+        let out = expired()
+            .execute(&ctx, r#"{"pattern":"applyCoupon"}"#)
+            .await
+            .unwrap();
+        // Expiry is not a failure and not a silent truncation: the caller learns the tree was only
+        // partly read, which is what makes the result interpretable.
+        assert_eq!(out.status, ToolExecStatus::Success);
+    }
+
+    /// The default is a real ceiling, not decoration — this is the whole reason the field exists.
+    #[test]
+    fn the_default_budget_is_finite() {
+        assert!(
+            Grep::default().budgets.timeout > std::time::Duration::ZERO,
+            "a search with no ceiling is the failure this feature was added to stop"
+        );
+    }
+
+    /// 0 means off, matching every other timeout in the config — not "expired immediately".
+    #[tokio::test]
+    async fn a_zero_budget_is_off_rather_than_instantly_expired() {
+        let (_d, ctx) = project();
+        let unlimited = Grep::with_budgets(SearchBudgets {
+            timeout: std::time::Duration::ZERO,
+        });
+        let out = unlimited
+            .execute(&ctx, r#"{"pattern":"applyCoupon"}"#)
+            .await
+            .unwrap();
+        let text = out.model_text();
+        assert!(text.contains("applyCoupon"), "{text}");
+        assert!(!text.contains("limit"), "an off budget must not be reported: {text}");
+    }
+
+    /// The tool's own deadline (above) and the runtime's `tools.timeout_secs` are different events
+    /// with the same visible effect, and they must not collapse into one story. A user pressing Esc
+    /// and the runtime giving up are different facts about a call the model is about to reason from.
+    #[tokio::test]
+    async fn a_runtime_timeout_is_not_reported_as_a_user_interrupt() {
+        let (_d, mut ctx) = project();
+        // Only the budget token, which is what the runtime's timeout arm cancels.
+        ctx.budget.cancel();
+
+        let out = Grep::default()
+            .execute(&ctx, r#"{"pattern":"applyCoupon"}"#)
+            .await
+            .unwrap();
+
+        assert_ne!(
+            out.status,
+            ToolExecStatus::Cancelled,
+            "the user did not interrupt anything — reporting that is a lie the model acts on"
+        );
+    }
+
+    /// The converse: Esc must still read as an interrupt. The budget token is a child of the
+    /// conversation token, so it is cancelled here too — and this is why `stopped_by` checks the
+    /// conversation token first, since both now read as cancelled.
+    #[tokio::test]
+    async fn a_user_interrupt_still_reads_as_cancelled() {
+        let (_d, mut ctx) = project();
+        ctx.cancel.cancel();
+
+        let out = Grep::default()
+            .execute(&ctx, r#"{"pattern":"applyCoupon"}"#)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, ToolExecStatus::Cancelled);
     }
 }

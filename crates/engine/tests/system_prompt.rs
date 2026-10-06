@@ -160,6 +160,8 @@ impl Harness {
             interaction: Some(interactions.clone()),
             tasks: None,
             runtime_paths: None,
+            env: None,
+            computer: None,
             model_resolver: None,
             limits: Limits {
                 max_rounds: 2,

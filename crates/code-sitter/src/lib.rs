@@ -101,8 +101,14 @@ pub struct SearchResult {
     pub hits: Vec<Hit>,
     /// Files that errored mid-read and were skipped (potential false negatives).
     pub skipped_files: usize,
+    /// Files skipped for being too large to search (see `search::MAX_SEARCH_BYTES`).
+    pub oversized_files: usize,
     /// True when `max_total` cut results short — narrow the search to see more.
     pub truncated: bool,
+    /// True when the walk hit [`Options::deadline`] and returned what it had. Distinct from
+    /// `truncated`: a match cap means the pattern was everywhere, a deadline means part of the
+    /// tree was never read, so a caller must not report the absence of a match as meaningful.
+    pub timed_out: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +137,11 @@ pub struct Options {
     /// Cooperative cancellation: set the flag to true and the search returns
     /// `SearchError::Cancelled` at the next checkpoint.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Wall-clock ceiling for the walk. On expiry the search stops at its next checkpoint and
+    /// returns the hits it already has with `SearchResult::timed_out` set — it does **not** fail,
+    /// because a search that read 40 of the 200 directories that could contain the answer is
+    /// worth more to a caller than an error is. `None` = no ceiling.
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl Default for Options {
@@ -147,6 +158,7 @@ impl Default for Options {
             context_lines: 0,
             files_only: false,
             cancel: None,
+            deadline: None,
         }
     }
 }
@@ -167,7 +179,9 @@ pub fn search(
         return Ok(SearchResult {
             hits,
             skipped_files: run.skipped_files,
+            oversized_files: run.oversized_files,
             truncated: run.truncated,
+            timed_out: run.timed_out,
         });
     }
 
@@ -185,7 +199,17 @@ pub fn search(
         }
     }
 
+    // The annotation pass is bounded by the same deadline as the walk: tree-sitting a few hundred
+    // large hit files can outlast the walk that found them, and a caller that set a ceiling meant
+    // the whole call. Files past the deadline come back unannotated rather than being dropped —
+    // an unannotated hit is still a hit.
+    let mut annotation_cut = false;
     for (path, group) in groups {
+        if annotation_cut || opts.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            annotation_cut = true;
+            hits.extend(group.into_iter().map(|r| to_hit(r, None, None)));
+            continue;
+        }
         // Parse the file once (best-effort); None if language unknown / too
         // large / minified / parse fails.
         let file_syms = symbols::FileSymbols::parse(&path);
@@ -204,7 +228,9 @@ pub fn search(
     Ok(SearchResult {
         hits,
         skipped_files: run.skipped_files,
+        oversized_files: run.oversized_files,
         truncated: run.truncated,
+        timed_out: run.timed_out || annotation_cut,
     })
 }
 
@@ -605,6 +631,50 @@ mod tests {
         let res = search(&dir, "m", &opts).unwrap();
         assert_eq!(res.hits.len(), 2);
         assert!(res.truncated);
+    }
+
+    /// A file too large to search is skipped and *counted*, not silently dropped: its absence from
+    /// the results is a false negative, and the caller has to be able to see that.
+    ///
+    /// A sparse file, so the test costs no disk and no time — the size check is on `metadata().len()`
+    /// and never reads a byte.
+    #[test]
+    fn an_oversized_file_is_skipped_and_reported() {
+        let dir = scratch_dir();
+        let big = dir.join("big.bin");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(search::MAX_SEARCH_BYTES + 1).unwrap();
+        drop(f);
+        std::fs::write(dir.join("small.txt"), "needle\n").unwrap();
+
+        let res = search(&dir, "needle", &Options::default()).unwrap();
+
+        assert_eq!(res.oversized_files, 1, "{res:?}");
+        assert_eq!(
+            res.hits.len(),
+            1,
+            "the small file must still be searched: {:?}",
+            res.hits
+        );
+        assert!(
+            res.skipped_files == 0,
+            "too large is not a read error and must not be counted as one"
+        );
+    }
+
+    /// A file right at the cap is searched — the boundary is inclusive, or the cap silently
+    /// excludes the largest file anyone would legitimately want to grep.
+    #[test]
+    fn a_file_at_the_cap_is_still_searched() {
+        let dir = scratch_dir();
+        let edge = dir.join("edge.txt");
+        let f = std::fs::File::create(&edge).unwrap();
+        f.set_len(search::MAX_SEARCH_BYTES).unwrap();
+        drop(f);
+        // Sparse: the content is not there, so no hit is possible. What matters is that it was
+        // *not* skipped for size, which `oversized_files` reports.
+        let res = search(&dir, "needle", &Options::default()).unwrap();
+        assert_eq!(res.oversized_files, 0, "the cap must be inclusive: {res:?}");
     }
 
     /// Binary files (NUL byte) must not produce garbage hits.

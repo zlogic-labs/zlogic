@@ -62,7 +62,9 @@ pub fn tool_name(server_id: &str, tool: &str) -> String {
     )
 }
 
-fn sanitize_segment(value: &str) -> String {
+/// A single path- and keyring-safe segment. ASCII alphanumerics, `_` and `-` survive; everything
+/// else becomes `_`, so the result is safe as a directory name as well as a keyring entry.
+pub(crate) fn sanitize_segment(value: &str) -> String {
     let mapped: String = value
         .chars()
         .map(|c| {
@@ -141,21 +143,33 @@ impl Origin {
     }
 }
 
-/// How much a connection may be shared.
-/// **Not a scope declaration.** Whether two workspaces share a connection follows from the resolved
-/// launch parameters (see [`crate::resolve`]) — a server whose args mention the workspace root
-/// splits by itself, one whose parameters are identical everywhere is shared by itself. This field
-/// exists only for the case parameters cannot express: a server that keeps state *inside* the tools
-/// it offers, a browser being the standing example. MCP has no capability flag for that, so it is
-/// the one thing left to declare by hand.
+/// Which callers may share one connection.
+/// [`Binding::Params`] is the default and stays **derived, not declared**: whether two workspaces
+/// share a connection follows from the resolved launch parameters (see [`crate::resolve`]). The
+/// other three are the escape hatch for what parameters cannot express.
+/// # Why an override is needed at all
+/// Two things the parameters get wrong for a stateful server. A browser launched with the workspace
+/// as its directory is per-workspace by derivation, and every conversation then gets its own too —
+/// which is the opposite of what "one browser" means. And MCP has no capability flag for "I keep
+/// state inside my tools", so a server that must be shared across sessions has no way to say so.
+/// # What a wider scope costs
+/// A connection shared across sessions cannot answer an elicitation, because the reverse request
+/// carries no zlogic session and zlogic only knows who opened the connection
+/// ([`crate::conn`]). `Workspace` and `Global` therefore stop advertising the capability rather
+/// than route a stranger's prompt into somebody else's window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Binding {
     /// Shared by anyone whose resolved parameters hash the same.
     #[default]
     Params,
-    /// Additionally keyed by session, so two conversations never share tool-level state.
+    /// One connection per workspace, whatever the parameters say.
+    Workspace,
+    /// One connection per session, so two conversations never share tool-level state.
     Session,
+    /// One connection for the whole process, launched in a directory of ours rather than the
+    /// caller's workspace — see [`crate::resolve`].
+    Global,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,7 +274,9 @@ impl ServerDef {
     /// [`ServerDef::filter`] is out for the same reason, and it matters more: the filter says which
     /// of the server's tools *we* want, not what the server has. Including it would re-fetch the whole
     /// list every time somebody edited an allowlist — a connection paid for a decision that changes
-    /// nothing about the server.
+    /// nothing about the server. `binding` is out because it decides who *shares* a connection rather
+    /// than what the server is: widening it must not cost a confirmed trust prompt, and the tool list
+    /// is keyed by the resolved connection key as well, which does move when the scope does.
     pub fn fingerprint(&self) -> String {
         let mut w = Fields::new();
         w.field("id", &self.id);
@@ -308,14 +324,6 @@ impl ServerDef {
                 }
             }
         }
-        w.field(
-            "binding",
-            if self.binding == Binding::Session {
-                "session"
-            } else {
-                "params"
-            },
-        );
         w.finish()
     }
 
@@ -712,7 +720,9 @@ fn parse_server(
         enabled: obj.get("enabled").and_then(|v| v.as_bool()),
         transport,
         binding: match obj.get("binding").and_then(|v| v.as_str()) {
+            Some("workspace") => Binding::Workspace,
             Some("session") => Binding::Session,
+            Some("global") => Binding::Global,
             _ => Binding::Params,
         },
         filter,

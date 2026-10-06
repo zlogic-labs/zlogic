@@ -59,7 +59,9 @@ impl TitleSource {
         match self {
             TitleSource::Draft => true,
             TitleSource::Model => incoming == TitleSource::User,
-            TitleSource::User => false,
+            // Renaming twice must work: a user title outranks every automatic path, the user
+            // included.
+            TitleSource::User => incoming == TitleSource::User,
         }
     }
 }
@@ -208,6 +210,11 @@ pub struct SessionRecord {
     /// count), maintained by the entry and lock stores. `None` for a session that never finished
     /// a turn.
     pub last_message_at: Option<DateTime<Utc>>,
+    /// Whether the session's **last** turn ended unfinished — the user stopped it, it was cut off
+    /// mid-flight, or it errored out. Maintained by [`crate::entry::EntryStore`] when a `turn_end`
+    /// entry lands, so a session list reads it out of the row rather than aggregating the timeline.
+    /// The next turn to end normally clears it.
+    pub interrupted: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub archived_at: Option<DateTime<Utc>>,
@@ -512,6 +519,19 @@ impl<'a> SessionStore<'a> {
         Ok(())
     }
 
+    /// Marks the session as active **now**, for a session whose newest content did not just land.
+    /// The session list's ruler is `last_message_at`, not `updated_at`: a fork copies its entries
+    /// verbatim, so a fork of an older turn reads as older than the sessions around it and drops
+    /// off the end of the page the sidebar asks for.
+    pub fn touch_last_message_at(&self, session_id: SessionId) -> Result<()> {
+        self.conn.execute(
+            "UPDATE session SET last_message_at = :ts, updated_at = :ts
+             WHERE session_id = :session_id",
+            named_params! { ":ts": now(), ":session_id": session_id },
+        )?;
+        Ok(())
+    }
+
     /// Deletes the session plus its entries, mailbox rows and lock (foreign key cascade).
     /// **Usage rows are kept on purpose** — they have no foreign key, because deleting a
     /// session must not make historical spend reporting shrink.
@@ -537,7 +557,7 @@ impl<'a> SessionStore<'a> {
 
 const COLS: &str = "session_id, workspace_id, kind, exec_cwd, agent, agent_paths,
      parent_session_id, root_session_id, title, title_source, model_ref, effort,
-     turn_count, last_message_at, created_at, updated_at, archived_at";
+     turn_count, last_message_at, interrupted, created_at, updated_at, archived_at";
 
 fn map_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
@@ -555,6 +575,7 @@ fn map_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         effort: r.get("effort")?,
         turn_count: r.get::<_, i64>("turn_count")? as u32,
         last_message_at: r.get("last_message_at")?,
+        interrupted: r.get::<_, i64>("interrupted")? != 0,
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
         archived_at: r.get("archived_at")?,
@@ -746,6 +767,15 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(st.get(s.session_id).unwrap().title.as_deref(), Some("mine"));
+
+        assert!(
+            st.set_title(s.session_id, "renamed again", TitleSource::User)
+                .unwrap()
+        );
+        assert_eq!(
+            st.get(s.session_id).unwrap().title.as_deref(),
+            Some("renamed again")
+        );
     }
 
     #[test]

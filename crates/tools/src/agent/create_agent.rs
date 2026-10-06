@@ -10,6 +10,7 @@ use crate::{
     Recovery, Result, Tool, ToolCtx, ToolDisplay, ToolError, ToolExecResult, ToolMeta, ToolRisk,
     parse_args,
 };
+use zlogic_protocol::SessionId;
 
 #[derive(Debug, Deserialize)]
 struct Args {
@@ -104,6 +105,20 @@ impl Tool for CreateAgent {
             ));
         };
 
+        // The parent's card learns the sub-agent's session id here, while it is still running: the
+        // session exists before the sub-agent does anything, and a card that cannot name what it
+        // is waiting on is indistinguishable from a hang. The same id comes back on the result,
+        // where a client that only ever sees the finished turn still finds it.
+        let announce = |session_id: SessionId| {
+            if let Some(display) = &ctx.display {
+                display.attach(ToolDisplay::Agent {
+                    agent: a.agent.clone(),
+                    session_id: session_id.to_string(),
+                });
+            }
+        };
+        let announce = &announce;
+
         // A name outside the profile list is fine when the caller customises the agent (system /
         // tools / model) — core falls back to the parent's base then. Only a bare unknown name is
         // an error, answered with the real list so the model can fix it without ending the turn.
@@ -129,6 +144,7 @@ impl Tool for CreateAgent {
             exec_cwd: None,
             mailbox: None,
             anchor_call_id: ctx.call_id.clone(),
+            session_id: None,
             unattended: a.background,
             cancel: ctx.cancel.clone(),
             system: a.system,
@@ -142,18 +158,25 @@ impl Tool for CreateAgent {
                     "background agents require a task runtime",
                 ));
             };
-            let task_id = tasks
+            // The task reserves the sub-agent's session before it returns, so the card can name it
+            // straight away rather than staying nameless until the run produces something.
+            let (task_id, session_id) = tasks
                 .start_agent(req, spawner.clone())
                 .await
                 .map_err(ToolError::Failed)?;
+            announce(session_id);
             return Ok(ToolExecResult::success(format!(
                 "Sub-agent {:?} started in background as task {task_id}. You will be notified \
                  when it finishes — its conclusion arrives with the notification; do not poll.",
                 a.agent
-            )));
+            ))
+            .with_display(ToolDisplay::Agent {
+                agent: a.agent.clone(),
+                session_id: session_id.to_string(),
+            }));
         }
 
-        match spawner.spawn(req).await {
+        match spawner.spawn(req, announce).await {
             Ok(outcome) => {
                 // Carry the child session id so the UI can open the sub-agent's own transcript.
                 // Added alongside any offload card rather than replacing it: both are useful, and
@@ -196,7 +219,9 @@ mod tests {
         async fn spawn(
             &self,
             req: AgentRequest,
+            on_spawned: &(dyn Fn(zlogic_protocol::SessionId) + Send + Sync),
         ) -> std::result::Result<crate::AgentOutcome, String> {
+            on_spawned(zlogic_protocol::SessionId::new());
             self.calls.fetch_add(1, Ordering::Relaxed);
             if self.fail {
                 return Err("upstream blew up".into());
@@ -250,10 +275,10 @@ mod tests {
             &self,
             request: AgentRequest,
             _spawner: Arc<dyn AgentSpawner>,
-        ) -> std::result::Result<TaskId, String> {
+        ) -> std::result::Result<(TaskId, zlogic_protocol::SessionId), String> {
             assert!(request.unattended);
             self.starts.fetch_add(1, Ordering::Relaxed);
-            Ok(self.id)
+            Ok((self.id, zlogic_protocol::SessionId::new()))
         }
 
         async fn get(
@@ -358,7 +383,9 @@ mod tests {
             async fn spawn(
                 &self,
                 req: AgentRequest,
+                on_spawned: &(dyn Fn(zlogic_protocol::SessionId) + Send + Sync),
             ) -> std::result::Result<crate::AgentOutcome, String> {
+                on_spawned(zlogic_protocol::SessionId::new());
                 *self.0.lock().unwrap() = Some(req);
                 Ok(crate::AgentOutcome {
                     session_id: zlogic_protocol::SessionId::new(),
@@ -415,7 +442,9 @@ mod tests {
             async fn spawn(
                 &self,
                 req: AgentRequest,
+                on_spawned: &(dyn Fn(zlogic_protocol::SessionId) + Send + Sync),
             ) -> std::result::Result<crate::AgentOutcome, String> {
+                on_spawned(zlogic_protocol::SessionId::new());
                 *self.0.lock().unwrap() = Some(req);
                 Ok(crate::AgentOutcome {
                     session_id: zlogic_protocol::SessionId::new(),

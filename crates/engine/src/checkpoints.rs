@@ -6,20 +6,23 @@
 //! the request: the client sends the plan it drew its confirmation from, and the server recomputes
 //! it, because a plan is a description of the past and `HEAD` is a fact about the present.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use zlogic_core::SharedStore;
 use zlogic_checkpoints::{
     Capture, CheckpointError, Checkpoints, RestoreOptions, Snapshot, Trigger,
 };
 use zlogic_protocol::query::{
     ApiError, ApiResult, CheckpointCompare, CheckpointFileChange, CheckpointLineStats,
     CheckpointRestoreFailure, CheckpointTriggerKind, WorkspaceCheckpoint,
-    WorkspaceCheckpointCaptureReq, WorkspaceCheckpointFile, WorkspaceCheckpointFileDiff,
-    WorkspaceCheckpointFileDiffReq, WorkspaceCheckpointList, WorkspaceCheckpointListReq,
-    WorkspaceCheckpointPlan, WorkspaceCheckpointPlanReq, WorkspaceCheckpointRestore,
-    WorkspaceCheckpointRestoreReq, WorkspaceCheckpointStep, WorkspaceCheckpointStepReq,
-    WorkspaceSelector,
+    WorkspaceCheckpointCaptureReq, WorkspaceCheckpointClearReq, WorkspaceCheckpointCleared,
+    WorkspaceCheckpointFile, WorkspaceCheckpointFileDiff, WorkspaceCheckpointFileDiffReq,
+    WorkspaceCheckpointList, WorkspaceCheckpointListReq, WorkspaceCheckpointPlan,
+    WorkspaceCheckpointPlanReq, WorkspaceCheckpointRestore, WorkspaceCheckpointRestoreReq,
+    WorkspaceCheckpointStep, WorkspaceCheckpointStepReq, WorkspaceCheckpointStepSummary,
+    WorkspaceCheckpointSteps, WorkspaceCheckpointStepsReq, WorkspaceSelector,
 };
 
 use crate::lock::SessionLocks;
@@ -35,10 +38,18 @@ const MAX_PAGE: u32 = 500;
 /// The totals beside the rows are what the confirmation and the header count.
 const ROW_LIMIT: usize = 200;
 
+/// How many step summaries one call may ask for. The card asks for three; the ceiling is here so
+/// "give me the numbers for the whole chain" is not a single request that diffs hundreds of pairs.
+const MAX_SUMMARY_STEPS: usize = 50;
+
 pub struct CheckpointTimeline {
     store: Arc<Checkpoints>,
     workspaces: Arc<Workspaces>,
     locks: Arc<SessionLocks>,
+    /// The session store, for the one thing a snapshot cannot answer about itself: which
+    /// conversation it belongs to. A record carries the session id and nothing else, so the
+    /// timeline's title column is joined in on read.
+    sessions: SharedStore,
 }
 
 impl CheckpointTimeline {
@@ -46,16 +57,55 @@ impl CheckpointTimeline {
         store: Arc<Checkpoints>,
         workspaces: Arc<Workspaces>,
         locks: Arc<SessionLocks>,
+        sessions: SharedStore,
     ) -> Self {
         Self {
             store,
             workspaces,
             locks,
+            sessions,
         }
     }
 
     fn root(&self, selector: &WorkspaceSelector) -> ApiResult<std::path::PathBuf> {
         self.workspaces.file_root(selector)
+    }
+
+    /// Titles for a page of snapshots, one query per distinct session rather than per row: a page
+    /// is a few hundred snapshots of what is usually one or two conversations, and the session
+    /// table is read on every timeline page otherwise. A session that no longer parses or no
+    /// longer exists contributes no title, which is what a row with no conversation to name
+    /// should say.
+    fn session_titles<'a>(&self, items: &'a [Snapshot]) -> HashMap<&'a str, Option<String>> {
+        let ids: HashSet<&str> = items
+            .iter()
+            .map(|snapshot| snapshot.session.as_str())
+            .filter(|session| !session.is_empty())
+            .collect();
+        ids.into_iter().map(|id| (id, self.title_of(id))).collect()
+    }
+
+    fn export_page(&self, items: &[Snapshot]) -> Vec<WorkspaceCheckpoint> {
+        let titles = self.session_titles(items);
+        items
+            .iter()
+            .map(|snapshot| {
+                let title = titles.get(snapshot.session.as_str()).cloned().flatten();
+                export_snapshot(snapshot, title)
+            })
+            .collect()
+    }
+
+    fn export_one(&self, snapshot: &Snapshot) -> WorkspaceCheckpoint {
+        export_snapshot(snapshot, self.title_of(&snapshot.session))
+    }
+
+    fn title_of(&self, session: &str) -> Option<String> {
+        session
+            .parse::<zlogic_protocol::SessionId>()
+            .ok()
+            .and_then(|id| self.sessions.with(|db| db.sessions().find(id)).ok().flatten())
+            .and_then(|session| session.title)
     }
 
     /// Whether the session the client named is mid-turn, which is the one thing that makes a
@@ -133,7 +183,7 @@ impl WorkspaceCheckpointsService for CheckpointTimeline {
                 list.has_more = page.has_more;
                 list.total = page.total;
                 list.other_branches = page.other_branches;
-                list.checkpoints = page.items.iter().map(export_snapshot).collect();
+                list.checkpoints = self.export_page(&page.items);
                 Ok(list)
             }
             // A workspace that never was a repository is not a failure; the list is empty and the
@@ -141,6 +191,16 @@ impl WorkspaceCheckpointsService for CheckpointTimeline {
             Err(CheckpointError::NotARepository(path)) => {
                 list.available = false;
                 list.reason = Some(format!("{path} is not a git repository"));
+                Ok(list)
+            }
+            // Same shape, different words: this one has a repository, and the remedy is not
+            // `git init`, so the section must not read as though there were nothing to open.
+            Err(CheckpointError::NotOwned(path)) => {
+                list.available = false;
+                list.reason = Some(format!(
+                    "{path} is a git repository zlogic is not allowed to open: its .git is not \
+                     owned by the user zlogic runs as"
+                ));
                 Ok(list)
             }
             Err(error) => Err(translate(error)),
@@ -157,7 +217,8 @@ impl WorkspaceCheckpointsService for CheckpointTimeline {
             .plan_restore(root, req.id.clone(), req.session)
             .await
             .map_err(translate)?;
-        Ok(export_plan(plan))
+        let title = self.title_of(&plan.snapshot.session);
+        Ok(export_plan(plan, title))
     }
 
     async fn checkpoint_step(
@@ -171,6 +232,37 @@ impl WorkspaceCheckpointsService for CheckpointTimeline {
             .await
             .map_err(translate)?;
         Ok(export_step(step))
+    }
+
+    async fn checkpoint_steps(
+        &self,
+        req: WorkspaceCheckpointStepsReq,
+    ) -> ApiResult<WorkspaceCheckpointSteps> {
+        let root = self.root(&req.workspace)?;
+        let mut steps = Vec::new();
+        for id in req.checkpoints.iter().take(MAX_SUMMARY_STEPS) {
+            let step = self.store.step(root.clone(), id.clone()).await;
+            // A row whose summary cannot be read is a row that shows no number, not a request that
+            // failed: the other two rows on the card are still worth rendering, and a retention
+            // sweep that dropped this snapshot between the list and this call is not an error the
+            // user can act on.
+            match step {
+                Ok(step) => steps.push(WorkspaceCheckpointStepSummary {
+                    checkpoint: id.clone(),
+                    previous: step.previous,
+                    files: step.files_total,
+                    deletions: step.deletions_total,
+                    lines: export_stats(step.drift),
+                }),
+                Err(error) => tracing::debug!(
+                    target: "zlogic::checkpoints",
+                    checkpoint = %id,
+                    %error,
+                    "no step summary for this row"
+                ),
+            }
+        }
+        Ok(WorkspaceCheckpointSteps { steps })
     }
 
     async fn checkpoint_diff(
@@ -221,7 +313,7 @@ impl WorkspaceCheckpointsService for CheckpointTimeline {
             )
             .await
             .map_err(translate)?;
-        Ok(export_snapshot(&snapshot))
+        Ok(self.export_one(&snapshot))
     }
 
     async fn checkpoint_restore(
@@ -267,7 +359,26 @@ impl WorkspaceCheckpointsService for CheckpointTimeline {
                     error: failure.error,
                 })
                 .collect(),
-            guard: outcome.guard.as_ref().map(export_snapshot),
+            guard: outcome
+                .guard
+                .as_ref()
+                .map(|snapshot| self.export_one(snapshot)),
+        })
+    }
+
+    async fn checkpoint_clear(
+        &self,
+        req: WorkspaceCheckpointClearReq,
+    ) -> ApiResult<WorkspaceCheckpointCleared> {
+        // No session to be busy in: this writes nothing into the checkout, and the store takes the
+        // same per-repository lock a capture does, so a turn mid-snapshot cannot be pulled out
+        // from under itself. A snapshot taken after this is a new one, which is what the user
+        // turned checkpoints on for.
+        let root = self.root(&req.workspace)?;
+        let report = self.store.clear(root).await.map_err(translate)?;
+        Ok(WorkspaceCheckpointCleared {
+            dropped: report.dropped,
+            bytes: report.bytes,
         })
     }
 }
@@ -279,13 +390,14 @@ fn page_limit(limit: Option<u32>) -> usize {
     limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE) as usize
 }
 
-fn export_snapshot(snapshot: &Snapshot) -> WorkspaceCheckpoint {
+fn export_snapshot(snapshot: &Snapshot, session_title: Option<String>) -> WorkspaceCheckpoint {
     WorkspaceCheckpoint {
         id: snapshot.id.clone(),
         at: snapshot.at,
         head: snapshot.head.clone(),
         branch: snapshot.branch.clone(),
         session: snapshot.session.clone(),
+        session_title,
         turn: snapshot.turn.clone(),
         trigger: match snapshot.trigger {
             Trigger::TurnStart => CheckpointTriggerKind::TurnStart,
@@ -301,12 +413,15 @@ fn export_snapshot(snapshot: &Snapshot) -> WorkspaceCheckpoint {
     }
 }
 
-fn export_plan(plan: zlogic_checkpoints::RestorePlan) -> WorkspaceCheckpointPlan {
+fn export_plan(
+    plan: zlogic_checkpoints::RestorePlan,
+    session_title: Option<String>,
+) -> WorkspaceCheckpointPlan {
     let restorable = !plan.snapshot.partial;
     let writes_total = plan.writes_total;
     let deletes_total = plan.deletes_total;
     WorkspaceCheckpointPlan {
-        checkpoint: export_snapshot(&plan.snapshot),
+        checkpoint: export_snapshot(&plan.snapshot, session_title),
         head_matches: plan.head_matches,
         current_head: plan.current_head,
         writes: plan
@@ -385,6 +500,13 @@ fn translate(error: CheckpointError) -> ApiError {
             "not_a_repository",
             format!("{path} is not a git repository, so it has no checkpoints."),
         ),
+        CheckpointError::NotOwned(path) => ApiError::denied(
+            "git_owner_mismatch",
+            format!(
+                "{path} is a git repository zlogic is not allowed to open: its .git is not owned \
+                 by the user zlogic runs as."
+            ),
+        ),
         other => ApiError::internal(other.to_string()),
     }
 }
@@ -427,6 +549,7 @@ mod tests {
             checkpoints,
             Arc::new(crate::Workspaces::new(store.clone())),
             Arc::new(SessionLocks::new(store.clone(), "test")),
+            store.clone(),
         );
         (timeline, store)
     }
@@ -442,6 +565,33 @@ mod tests {
             cross_head: false,
             only: None,
         }
+    }
+
+    /// The title column is a join, not a copy: the snapshot records the session id and nothing
+    /// else, so this is the one thing the store cannot answer by itself.
+    #[test]
+    fn a_point_is_named_after_the_session_that_took_it() {
+        use zlogic_store::TitleSource;
+
+        let (timeline, store) = timeline();
+        let session = store
+            .with(|db| db.sessions().create(NewSession::root(WorkspaceId::new())))
+            .unwrap()
+            .session_id;
+        store
+            .with(|db| db.sessions().set_title(session, "修复登录 bug", TitleSource::User))
+            .unwrap();
+
+        assert_eq!(
+            timeline.title_of(&session.to_string()).as_deref(),
+            Some("修复登录 bug"),
+            "a titled session has to reach the row"
+        );
+        assert_eq!(
+            timeline.title_of("").as_deref(),
+            None,
+            "a point with no session names no conversation"
+        );
     }
 
     /// A whole-tree restore while the agent is running would write under it: the agent is holding

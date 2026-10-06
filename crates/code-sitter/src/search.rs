@@ -55,9 +55,31 @@ pub struct RunOutput {
     pub hits: Vec<RawHit>,
     /// Files that errored mid-read and were skipped (potential false negatives).
     pub skipped_files: usize,
+    /// Files skipped for exceeding [`MAX_SEARCH_BYTES`] — a *different* reason from a read error,
+    /// so it is counted apart: the caller can tell "I could not read this" from "I declined to
+    /// read this", and only the second is something a narrower `path` or a raised cap fixes.
+    pub oversized_files: usize,
     /// True when `max_total` cut the results short.
     pub truncated: bool,
+    /// True when the walk stopped at `Options::deadline` with part of the tree unread.
+    pub timed_out: bool,
 }
+
+/// Files above this are not searched at all.
+///
+/// **This is the only interrupt available inside a file.** `Sink` has no per-buffer callback —
+/// `matched` fires on matching lines and `context` only around them — so a file whose content never
+/// matches gives the deadline nothing to check between, and one enormous non-matching file would be
+/// read to the end regardless of the budget. Capping size is the only way to bound that case at
+/// all, and it costs nothing on real source: 256 MB is a generated bundle nobody greps, and even a
+/// pathological regex would spend seconds rather than the whole budget on it.
+///
+/// Deliberately far above `MAX_PARSE_BYTES` (1 MB, the *annotation* cap). There, a big file merely
+/// loses a `[def]` label; here it loses its matches entirely, so the bar has to be much higher.
+///
+/// `pub` so a test can size a file to it without hardcoding the number a second time — a boundary
+/// test that hardcodes its own constant tests nothing when the constant moves.
+pub const MAX_SEARCH_BYTES: u64 = 256_000_000;
 
 fn line_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
@@ -77,6 +99,9 @@ struct HitSink<'a> {
     /// NEXT match in this file.
     pending_before: Vec<(u64, String)>,
     cancel: Option<&'a AtomicBool>,
+    /// Checked per match so one enormous file cannot hold the walk past its budget. See the note
+    /// in [`run`] about what this can and cannot interrupt.
+    deadline: Option<std::time::Instant>,
 }
 
 impl Sink for HitSink<'_> {
@@ -87,6 +112,9 @@ impl Sink for HitSink<'_> {
             .cancel
             .map(|c| c.load(Ordering::Relaxed))
             .unwrap_or(false)
+            || self
+                .deadline
+                .is_some_and(|d| std::time::Instant::now() >= d)
         {
             return Ok(false);
         }
@@ -181,13 +209,23 @@ pub fn run(root: &Path, pattern: &str, opts: &Options) -> Result<RunOutput, Sear
         .build();
 
     let cancel = opts.cancel.as_deref();
+    let deadline = opts.deadline;
     let mut out: Vec<RawHit> = Vec::new();
     let mut skipped = 0usize;
+    let mut oversized = 0usize;
     let mut truncated = false;
+    let mut timed_out = false;
 
     for dent in walk.build() {
         if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
             return Err(SearchError::Cancelled);
+        }
+        // Checked once per directory entry rather than once per file: the walker yields entries,
+        // not files, so this is the only place the walk itself can be stopped — and the walker is
+        // what runs away, since a pattern that matches nothing reads every file in the tree.
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            timed_out = true;
+            break;
         }
         let dent = match dent {
             Ok(d) => d,
@@ -197,6 +235,17 @@ pub fn run(root: &Path, pattern: &str, opts: &Options) -> Result<RunOutput, Sear
             continue;
         }
         let path = dent.path();
+
+        // Before the search, because nothing inside it can stop it — see `MAX_SEARCH_BYTES`.
+        // `len()` from the walker's own entry: a second `metadata()` would be another syscall on
+        // the hot path, and this is the same stat the walker already did.
+        match dent.metadata() {
+            Ok(meta) if meta.len() > MAX_SEARCH_BYTES => {
+                oversized += 1;
+                continue;
+            }
+            _ => {}
+        }
 
         // files_only: one hit per file is enough (its first match).
         let budget = if opts.files_only {
@@ -211,6 +260,7 @@ pub fn run(root: &Path, pattern: &str, opts: &Options) -> Result<RunOutput, Sear
             hits: Vec::new(),
             pending_before: Vec::new(),
             cancel,
+            deadline,
         };
         // A per-file failure (IO, mid-read) is non-fatal — like ripgrep, skip
         // the file and keep going — but COUNT it so it isn't a silent false
@@ -231,6 +281,8 @@ pub fn run(root: &Path, pattern: &str, opts: &Options) -> Result<RunOutput, Sear
     Ok(RunOutput {
         hits: out,
         skipped_files: skipped,
+        oversized_files: oversized,
         truncated,
+        timed_out,
     })
 }

@@ -36,6 +36,7 @@ use zlogic_tools::{
     TaskReport,
 };
 
+use crate::ports::ProcessRoots;
 use crate::service::TaskService;
 
 #[derive(Clone)]
@@ -47,6 +48,13 @@ struct Inner {
     store: SharedStore,
     objects: Arc<dyn ObjectStore>,
     spool_dir: PathBuf,
+    /// This process's identity among the engines sharing the database. Every run this process
+    /// claims is stamped with it, which is what lets another engine tell its work apart from a
+    /// dead process's leftovers.
+    instance_id: String,
+    /// The pid every running process task was spawned with. Process-local on purpose: see
+    /// [`crate::ports`].
+    roots: Arc<ProcessRoots>,
     runtimes: Mutex<HashMap<TaskId, RuntimeHandle>>,
     agent_mailboxes: Mutex<HashMap<TaskId, Arc<AgentMailboxGate>>>,
     waker: Mutex<Option<Weak<dyn TaskWake>>>,
@@ -104,6 +112,23 @@ impl Stop {
     }
 }
 
+/// The reason recorded on a run whose owning engine process is gone.
+const ORPHANED_REASON: &str = "runtime restarted before the task completed";
+
+/// How a terminal state is written.
+///
+/// The two differ in what they trust. [`FinishWrite::State`] is this process reporting on its own
+/// run, so the state it observed is all there is to check. [`FinishWrite::Orphan`] is startup
+/// housekeeping acting on a row it did not create, in a database other engines are also using —
+/// there, the state alone cannot distinguish a dead process's leftover from a live engine's work,
+/// so the write is conditional on the owner still being gone. It reports "not written" instead of
+/// failing when that guard turns it away.
+#[derive(Clone, Copy)]
+enum FinishWrite {
+    State,
+    Orphan { live_cutoff: chrono::DateTime<Utc> },
+}
+
 #[async_trait]
 pub(crate) trait ScheduledAgentFactory: Send + Sync {
     async fn spawner_for(
@@ -122,6 +147,17 @@ impl TaskManager {
         objects: Arc<dyn ObjectStore>,
         spool_dir: impl Into<PathBuf>,
     ) -> Result<Self, String> {
+        Self::with_host(store, objects, spool_dir, "engine")
+    }
+
+    /// `host_kind` is the label recorded next to this process's heartbeat, so an operator reading
+    /// the `engine_instance` table can tell which host a leftover run belonged to.
+    pub fn with_host(
+        store: SharedStore,
+        objects: Arc<dyn ObjectStore>,
+        spool_dir: impl Into<PathBuf>,
+        host_kind: &str,
+    ) -> Result<Self, String> {
         store
             .with(|db| zlogic_task::install_schema(db.conn()))
             .map_err(|error| error.to_string())?;
@@ -132,11 +168,26 @@ impl TaskManager {
                 spool_dir.display()
             )
         })?;
+        let instance_id = zlogic_task::new_instance_id();
+        // Registered before anything is claimed: a run this process starts one line later already
+        // needs a heartbeat to point at, and a failure here would mean the table is unusable, in
+        // which case recording ownership would silently fail too.
+        store
+            .with(|db| {
+                zlogic_task::EngineInstance::new(db.conn()).register(
+                    &instance_id,
+                    host_kind,
+                    std::process::id(),
+                )
+            })
+            .map_err(|error| format!("task runtime: cannot register this engine: {error}"))?;
         Ok(Self {
             inner: Arc::new(Inner {
                 store,
                 objects,
                 spool_dir,
+                instance_id,
+                roots: Arc::new(ProcessRoots::new()),
                 runtimes: Mutex::new(HashMap::new()),
                 agent_mailboxes: Mutex::new(HashMap::new()),
                 waker: Mutex::new(None),
@@ -175,25 +226,37 @@ impl TaskManager {
         &self.inner.store
     }
 
-    /// Close executions whose futures belonged to the previous process.
+    /// The pids of this process's running background work, for whoever has to report what they
+    /// are listening on. The session layer answers "what is this conversation running" and needs
+    /// this engine's memory to do it; handing over the registry rather than the whole manager keeps
+    /// that edge one method wide.
+    pub fn roots(&self) -> Arc<ProcessRoots> {
+        self.inner.roots.clone()
+    }
+
+    /// Close executions whose owning engine process is gone.
     /// This runs before the scheduler. Using the normal finish path makes the state change and its
     /// Task Session mailbox notification one durable transaction.
+    ///
+    /// Decided per row by its owner, not per process: the desktop app and a local daemon share one
+    /// database, and each starting up must leave the other's live runs alone. A run counts as
+    /// orphaned only when its recorded owner stopped heartbeating.
     pub fn reconcile_interrupted(&self) -> Result<usize, String> {
+        // One reading for both the scan and every guarded write below. A row whose owner
+        // heartbeats after this point is live as far as this pass is concerned — the next
+        // process to start decides about it, with fresher information.
+        let cutoff = zlogic_task::live_cutoff();
         let running = self
             .inner
             .store
-            .with(|db| TaskStore::new(db.conn()).list_recoverable())
+            .with(|db| TaskStore::new(db.conn()).list_recoverable(cutoff))
             .map_err(|error| error.to_string())?;
         let mut reconciled = 0;
         for task in running {
-            if self.inner.finish_checked(
-                task.task_id,
-                task.state,
-                TaskState::Interrupted,
-                task.result,
-                Some("runtime restarted before the task completed"),
-                true,
-            ) {
+            if self
+                .inner
+                .interrupt_orphan(task.task_id, task.state, cutoff)
+            {
                 reconciled += 1;
             }
         }
@@ -208,6 +271,12 @@ impl TaskManager {
     ) -> TaskId {
         let task_id = task.task_id;
         let inner = self.inner.clone();
+        // The pid is the only handle on what this run goes on to open: the socket a dev server
+        // binds is generations below the process the shell spawned, so this is what makes the port
+        // findable at all. Read before `process` moves into the future.
+        if let Some(pid) = process.child.id() {
+            self.inner.roots.record(task_id, pid);
+        }
         let (registered_tx, registered_rx) = oneshot::channel();
         let handle = RuntimeHandle::spawn(task_id, move |cancel| async move {
             let _ = registered_rx.await;
@@ -225,15 +294,13 @@ impl TaskManager {
             if let Some(stop) = stopped_before_start {
                 process.child.terminate().await;
                 inner.finish_stopped(task_id, TaskState::Queued, stop, None);
-                inner.runtimes().remove(&task_id);
+                inner.release(task_id);
                 return;
             }
-            if let Err(error) =
-                inner.transition(task_id, TaskState::Queued, TaskState::Running, None, None)
-            {
+            if let Err(error) = inner.claim(task_id) {
                 process.child.terminate().await;
                 tracing::error!(target: "zlogic::task", %task_id, "could not claim task: {error}");
-                inner.runtimes().remove(&task_id);
+                inner.release(task_id);
                 return;
             }
 
@@ -255,7 +322,7 @@ impl TaskManager {
                         None,
                         Some(&format!("cannot persist process output: {error}")),
                     );
-                    inner.runtimes().remove(&task_id);
+                    inner.release(task_id);
                     return;
                 }
             };
@@ -399,7 +466,7 @@ impl TaskManager {
                     ),
                 }
             }
-            inner.runtimes().remove(&task_id);
+            inner.release(task_id);
         });
 
         self.inner.runtimes().insert(task_id, handle);
@@ -439,7 +506,7 @@ impl TaskManager {
             };
             if let Some(stop) = stopped_before_start {
                 inner.finish_stopped(task_id, TaskState::Queued, stop, None);
-                inner.runtimes().remove(&task_id);
+                inner.release(task_id);
                 inner
                     .agent_mailboxes
                     .lock()
@@ -448,11 +515,9 @@ impl TaskManager {
                 runtime_mailbox.close().await;
                 return;
             }
-            if let Err(error) =
-                inner.transition(task_id, TaskState::Queued, TaskState::Running, None, None)
-            {
+            if let Err(error) = inner.claim(task_id) {
                 tracing::error!(target: "zlogic::task", %task_id, "could not claim task: {error}");
-                inner.runtimes().remove(&task_id);
+                inner.release(task_id);
                 inner
                     .agent_mailboxes
                     .lock()
@@ -483,7 +548,11 @@ impl TaskManager {
             });
             request.cancel = run_cancel.clone();
             request.unattended = true;
-            let outcome = spawner.spawn(request).await;
+            // The caller already has the child session id — `start_agent` reserved it — so
+            // there is nothing left to announce here.
+            let outcome = spawner
+                .spawn(request, &|_session_id| {})
+                .await;
             // CoreSpawner closes the gate on both success and failure; this close only marks gates
             // that never activated (failures before a child session was created). After close the
             // gate keeps the session id, so the failure branches below can still link the run to
@@ -537,7 +606,7 @@ impl TaskManager {
                     ),
                 }
             }
-            inner.runtimes().remove(&task_id);
+            inner.release(task_id);
             inner
                 .agent_mailboxes
                 .lock()
@@ -573,6 +642,13 @@ impl TaskManager {
     }
 
     async fn scheduler_tick(&self) -> Result<(), String> {
+        // Refreshing liveness here rather than on a timer of its own: this loop already runs every
+        // 15s in every engine, and a heartbeat that shares a loop with the work cannot be starved
+        // by the work. A run this process owns is only ever taken away by another engine that read
+        // this row as stale.
+        if let Err(error) = self.inner.heartbeat() {
+            tracing::warn!(target: "zlogic::task", "cannot refresh this engine's liveness: {error}");
+        }
         let jobs = self
             .inner
             .store
@@ -729,6 +805,7 @@ impl TaskManager {
                         exec_cwd: spec.cwd.clone(),
                         mailbox: None,
                         anchor_call_id: zlogic_protocol::CallId::new(format!("job:{}", job.job_id)),
+                        session_id: None,
                         unattended: true,
                         cancel: zlogic_tools::CancellationToken::new(),
                         system: None,
@@ -1377,16 +1454,22 @@ const fn concurrency_to_api(value: ConcurrencyPolicy) -> TaskJobConcurrencyPolic
     }
 }
 
+/// A process run as one line, for every surface that names one.
+///
+/// Shared so the task list and the session's service list cannot drift into showing the same run
+/// under two names.
+pub fn process_title(spec: &zlogic_task::ProcessSpec) -> String {
+    let mut title = spec.program.clone();
+    if !spec.args.is_empty() {
+        title.push(' ');
+        title.push_str(&spec.args.join(" "));
+    }
+    title
+}
+
 fn runtime_task(task: TaskRun, running_agent_session: Option<&str>) -> RuntimeTask {
     let (kind, title) = match &task.executor {
-        ExecutorSpec::Process(spec) => {
-            let mut title = spec.program.clone();
-            if !spec.args.is_empty() {
-                title.push(' ');
-                title.push_str(&spec.args.join(" "));
-            }
-            (RuntimeTaskKind::Process, title)
-        }
+        ExecutorSpec::Process(spec) => (RuntimeTaskKind::Process, process_title(spec)),
         ExecutorSpec::Agent(spec) => (
             RuntimeTaskKind::Agent,
             spec.prompt
@@ -1437,6 +1520,16 @@ fn runtime_task(task: TaskRun, running_agent_session: Option<&str>) -> RuntimeTa
 }
 
 impl Inner {
+    /// A run is over: drop the runtime handle and everything that hangs off it together.
+    ///
+    /// The pid is as process-local as the future that owns the child, so leaving it behind would
+    /// let a recycled pid keep answering for a run that has finished. One call rather than two so a
+    /// new exit path cannot forget half of it.
+    fn release(&self, task_id: TaskId) {
+        self.runtimes().remove(&task_id);
+        self.roots.forget(&task_id);
+    }
+
     fn runtimes(&self) -> std::sync::MutexGuard<'_, HashMap<TaskId, RuntimeHandle>> {
         self.runtimes.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -1467,16 +1560,14 @@ impl Inner {
         self.spool_dir.join(format!("{task_id}.log"))
     }
 
-    fn transition(
-        &self,
-        task_id: TaskId,
-        from: TaskState,
-        to: TaskState,
-        result: Option<TaskResult>,
-        error: Option<&str>,
-    ) -> Result<TaskRun, String> {
+    /// Tells the other engines sharing this database that this process is still here.
+    fn heartbeat(&self) -> Result<(), String> {
         self.store
-            .with(|db| TaskStore::new(db.conn()).transition(task_id, from, to, result, error))
+            .with(|db| {
+                zlogic_task::EngineInstance::new(db.conn())
+                    .heartbeat(&self.instance_id)
+                    .map(|_| ())
+            })
             .map_err(|error| error.to_string())
     }
 
@@ -1488,7 +1579,39 @@ impl Inner {
         result: Option<TaskResult>,
         error: Option<&str>,
     ) {
-        self.finish_checked(task_id, from, to, result, error, true);
+        self.finish_checked(task_id, from, to, result, error, true, FinishWrite::State);
+    }
+
+    /// Claims a queued run for this process and records the ownership that makes the run
+    /// distinguishable from another engine's work.
+    fn claim(&self, task_id: TaskId) -> Result<(), String> {
+        self.store
+            .with(|db| {
+                TaskStore::new(db.conn())
+                    .claim(task_id, &self.instance_id)
+                    .map(|_| ())
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    /// Startup housekeeping: interrupt a run whose owning engine is gone — unless it was claimed
+    /// again in the meantime. Whether the conversation is told follows the usual rule: this is
+    /// news about a run, not a stop the conversation caused.
+    fn interrupt_orphan(
+        &self,
+        task_id: TaskId,
+        from: TaskState,
+        live_cutoff: chrono::DateTime<Utc>,
+    ) -> bool {
+        self.finish_checked(
+            task_id,
+            from,
+            TaskState::Interrupted,
+            None,
+            Some(ORPHANED_REASON),
+            true,
+            FinishWrite::Orphan { live_cutoff },
+        )
     }
 
     /// A run that something stopped, in the one place that decides whether the conversation is
@@ -1511,6 +1634,7 @@ impl Inner {
             result,
             Some(error),
             stop.notifies(),
+            FinishWrite::State,
         );
     }
 
@@ -1524,6 +1648,7 @@ impl Inner {
         result: Option<TaskResult>,
         error: Option<&str>,
         notify: bool,
+        write: FinishWrite,
     ) -> bool {
         let preview = match &result {
             Some(TaskResult::Process(_)) if notify => {
@@ -1549,9 +1674,30 @@ impl Inner {
                 .conn()
                 .unchecked_transaction()
                 .map_err(|error| error.to_string())?;
-            let task = TaskStore::new(&tx)
-                .transition(task_id, from, to, result, error)
-                .map_err(|error| error.to_string())?;
+            let task = match write {
+                FinishWrite::State => Some(
+                    TaskStore::new(&tx)
+                        .transition(task_id, from, to, result, error)
+                        .map_err(|error| error.to_string())?,
+                ),
+                FinishWrite::Orphan { live_cutoff } => {
+                    let reason = error.ok_or_else(|| {
+                        "an orphaned run has to say why it was interrupted".to_string()
+                    })?;
+                    let store = TaskStore::new(&tx);
+                    let written = store
+                        .interrupt_orphan(task_id, from, reason, live_cutoff)
+                        .map_err(|error| error.to_string())?;
+                    // The guard turned this one away: another engine owns the run now, so there is
+                    // nothing to announce and nothing to commit.
+                    written
+                        .then(|| store.get(task_id).map_err(|error| error.to_string()))
+                        .transpose()?
+                }
+            };
+            let Some(task) = task else {
+                return Ok(None);
+            };
             let mut notification_written = false;
             if notify
                 && let Some(session_id) = task.notification_session_id
@@ -1616,11 +1762,11 @@ impl Inner {
                 notification_written = true;
             }
             tx.commit().map_err(|error| error.to_string())?;
-            Ok::<_, String>((task, notification_written))
+            Ok::<_, String>(Some((task, notification_written)))
         });
 
         let finished_ok = match finished {
-            Ok((task, notification_written)) => {
+            Ok(Some((task, notification_written))) => {
                 let waker = self
                     .waker
                     .lock()
@@ -1639,8 +1785,24 @@ impl Inner {
                 }
                 true
             }
+            // The run was written to a terminal state by somebody else — another engine
+            // reconciled it, or the stop arrived twice. The row is already reported and terminal,
+            // so this process has nothing left to say and nothing to overwrite; that is a race
+            // resolved, not a corrupt row.
+            Ok(None) => false,
             Err(error) => {
-                tracing::error!(target: "zlogic::task", %task_id, "could not finish task: {error}");
+                match self.task(task_id) {
+                    Ok(Some(task)) if task.state.is_terminal() => tracing::warn!(
+                        target: "zlogic::task",
+                        %task_id,
+                        actual_state = task.state.as_str(),
+                        intended_state = to.as_str(),
+                        "this run was already finished elsewhere; its result was not written: {error}"
+                    ),
+                    _ => {
+                        tracing::error!(target: "zlogic::task", %task_id, "could not finish task: {error}")
+                    }
+                }
                 false
             }
         };
@@ -1705,14 +1867,19 @@ impl TaskHost for TaskManager {
 
     async fn start_agent(
         &self,
-        request: AgentRequest,
+        mut request: AgentRequest,
         spawner: Arc<dyn AgentSpawner>,
-    ) -> Result<TaskId, String> {
+    ) -> Result<(TaskId, zlogic_protocol::SessionId), String> {
         let parent = self
             .inner
             .store
             .with(|db| db.sessions().get(request.parent_session_id))
             .map_err(|error| error.to_string())?;
+
+        // Reserved before the task exists, so the caller's card can name the sub-agent as soon as
+        // this returns rather than when the run eventually gets a runner and creates one.
+        let session_id = zlogic_core::spawn::ensure_child_session(&self.inner.store, &request)?;
+        request.session_id = Some(session_id);
 
         let task = self
             .inner
@@ -1741,7 +1908,7 @@ impl TaskHost for TaskManager {
             })
             .map_err(|error| error.to_string())?;
 
-        Ok(self.register_agent(task, request, spawner))
+        Ok((self.register_agent(task, request, spawner), session_id))
     }
 
     async fn get(
@@ -2187,13 +2354,73 @@ mod tests {
         ));
     }
 
+    /// Two engines over one database is the arrangement that caused this in the field: a daemon
+    /// starting up must not take the desktop's work away, and the run the desktop owns has to come
+    /// out the other side still `running` and unmentioned.
+    #[test]
+    fn reconciling_one_engine_leaves_another_engines_live_runs_alone() {
+        let store = SharedStore::new(Db::open_in_memory().unwrap());
+        let session = store
+            .with(|db| db.sessions().create(NewSession::task(WorkspaceId::new())))
+            .unwrap();
+        let (_spool, objects, desktop) = manager(store.clone());
+        // The daemon is a second manager over the same store, exactly as `zlogic daemon` is a
+        // second `Engine::bootstrap` over the same `state.db`.
+        let (_daemon_spool, _daemon_objects, daemon) = manager(store.clone());
+
+        let task = store
+            .with(|db| {
+                TaskStore::new(db.conn()).create(NewTask {
+                    job_id: None,
+                    workspace_id: session.workspace_id,
+                    executor: ExecutorSpec::Agent(AgentSpec {
+                        prompt: "keep running".into(),
+                        agent: "reviewer".into(),
+                        model_ref: None,
+                        cwd: None,
+                    }),
+                    permission_policy: PermissionPolicy::DenyRequests,
+                    notification_session_id: Some(session.session_id),
+                    trigger: TaskTrigger::Manual,
+                    turn_scoped: false,
+                    attempt: 1,
+                    scheduled_for: None,
+                })
+            })
+            .unwrap();
+        desktop.inner.claim(task.task_id).unwrap();
+
+        assert_eq!(daemon.reconcile_interrupted().unwrap(), 0);
+        assert_eq!(
+            store
+                .with(|db| TaskStore::new(db.conn()).get(task.task_id))
+                .unwrap()
+                .state,
+            TaskState::Running
+        );
+        assert!(
+            store
+                .with(|db| db.mailbox().pending(session.session_id))
+                .unwrap()
+                .is_empty(),
+            "a run that is still running is not news for the conversation"
+        );
+        drop(objects);
+    }
+
     #[async_trait]
     impl AgentSpawner for FixedSpawner {
-        async fn spawn(&self, req: AgentRequest) -> Result<AgentOutcome, String> {
+        async fn spawn(
+            &self,
+            req: AgentRequest,
+            on_spawned: &(dyn Fn(zlogic_protocol::SessionId) + Send + Sync),
+        ) -> Result<AgentOutcome, String> {
             self.called.store(true, Ordering::SeqCst);
             assert!(req.unattended);
+            let session_id = zlogic_protocol::SessionId::new();
+            on_spawned(session_id);
             Ok(AgentOutcome {
-                session_id: zlogic_protocol::SessionId::new(),
+                session_id,
                 answer: "background conclusion".into(),
             })
         }
@@ -2205,7 +2432,11 @@ mod tests {
 
     #[async_trait]
     impl AgentSpawner for MailboxSpawner {
-        async fn spawn(&self, req: AgentRequest) -> Result<AgentOutcome, String> {
+        async fn spawn(
+            &self,
+            req: AgentRequest,
+            _on_spawned: &(dyn Fn(zlogic_protocol::SessionId) + Send + Sync),
+        ) -> Result<AgentOutcome, String> {
             let child = self
                 .store
                 .with(|db| {
@@ -2282,7 +2513,7 @@ mod tests {
             called: AtomicBool::new(false),
         });
 
-        let task_id = manager
+        let (task_id, _child_session) = manager
             .start_agent(
                 AgentRequest {
                     agent: "reviewer".into(),
@@ -2292,6 +2523,7 @@ mod tests {
                     exec_cwd: None,
                     mailbox: None,
                     anchor_call_id: CallId::new("call_bg"),
+                    session_id: None,
                     unattended: true,
                     cancel: CancellationToken::new(),
                     system: None,
@@ -2359,7 +2591,7 @@ mod tests {
             received: Mutex::new(Some(received_tx)),
         });
 
-        let task_id = manager
+        let (task_id, _child_session) = manager
             .start_agent(
                 AgentRequest {
                     agent: "reviewer".into(),
@@ -2369,6 +2601,7 @@ mod tests {
                     exec_cwd: None,
                     mailbox: None,
                     anchor_call_id: CallId::new("call_message"),
+                    session_id: None,
                     unattended: true,
                     cancel: CancellationToken::new(),
                     system: None,
@@ -2491,7 +2724,11 @@ mod tests {
 
     #[async_trait]
     impl AgentSpawner for WaitingSpawner {
-        async fn spawn(&self, req: AgentRequest) -> Result<AgentOutcome, String> {
+        async fn spawn(
+            &self,
+            req: AgentRequest,
+            _on_spawned: &(dyn Fn(zlogic_protocol::SessionId) + Send + Sync),
+        ) -> Result<AgentOutcome, String> {
             req.cancel.cancelled().await;
             Err("cancelled".into())
         }
@@ -2508,7 +2745,7 @@ mod tests {
             .with(|db| db.sessions().create(NewSession::root(WorkspaceId::new())))
             .unwrap();
         let (_spool, _objects, manager) = manager(store.clone());
-        let task_id = manager
+        let (task_id, _child_session) = manager
             .start_agent(
                 AgentRequest {
                     agent: "reviewer".into(),
@@ -2518,6 +2755,7 @@ mod tests {
                     exec_cwd: None,
                     mailbox: None,
                     anchor_call_id: CallId::new("call_stop"),
+                    session_id: None,
                     unattended: true,
                     cancel: CancellationToken::new(),
                     system: None,
@@ -2569,7 +2807,7 @@ mod tests {
         manager.bind_waker(Arc::downgrade(&wake_trait));
 
         let turn = CancellationToken::new();
-        let task_id = manager
+        let (task_id, _child_session) = manager
             .start_agent(
                 AgentRequest {
                     agent: "reviewer".into(),
@@ -2579,6 +2817,7 @@ mod tests {
                     exec_cwd: None,
                     mailbox: None,
                     anchor_call_id: CallId::new("call_turn_stop"),
+                    session_id: None,
                     unattended: true,
                     cancel: turn.clone(),
                     system: None,
@@ -2632,7 +2871,11 @@ mod tests {
 
     #[async_trait]
     impl AgentSpawner for FailingSpawner {
-        async fn spawn(&self, req: AgentRequest) -> Result<AgentOutcome, String> {
+        async fn spawn(
+            &self,
+            req: AgentRequest,
+            _on_spawned: &(dyn Fn(zlogic_protocol::SessionId) + Send + Sync),
+        ) -> Result<AgentOutcome, String> {
             req.mailbox
                 .as_ref()
                 .expect("background agent has a mailbox gate")
@@ -2659,7 +2902,7 @@ mod tests {
                     .create(NewSession::child(session.session_id, "reviewer"))
             })
             .unwrap();
-        let task_id = manager
+        let (task_id, _child_session) = manager
             .start_agent(
                 AgentRequest {
                     agent: "reviewer".into(),
@@ -2669,6 +2912,7 @@ mod tests {
                     exec_cwd: None,
                     mailbox: None,
                     anchor_call_id: CallId::new("call_fail"),
+                    session_id: None,
                     unattended: true,
                     cancel: CancellationToken::new(),
                     system: None,

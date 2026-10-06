@@ -829,6 +829,9 @@ fn translate(event: &StreamEvent, pump: &PumpState) -> Vec<CoreEvent> {
         StreamPayload::ToolDetected { .. } => {}
         StreamPayload::ToolExecStart { .. } => {}
         StreamPayload::ToolOutputDelta { .. } => {}
+        // The card it attaches to prints itself when the call ends; a terminal has nothing to
+        // redraw mid-call.
+        StreamPayload::ToolDisplayAttached { .. } => {}
         StreamPayload::ToolExecEnd {
             call_id,
             status,
@@ -2366,6 +2369,8 @@ mod tests {
                 status: TurnStatus::Completed,
                 reason: None,
                 stats: TurnStats::default(),
+                deliverables: Vec::new(),
+                gone: Vec::new(),
             },
         ];
         for payload in payloads {
@@ -2453,6 +2458,7 @@ mod tests {
             workspace_id: zlogic_protocol::WorkspaceId::new(),
             agent_paths: vec!["main".into()],
             root_session_id: zlogic_protocol::SessionId::new(),
+            parent_session_id: None,
             title: None,
             title_source: None,
             model_ref: None,
@@ -2463,6 +2469,7 @@ mod tests {
             turn_count: 2,
             live_turn_id: None,
             awaiting_input: false,
+            interrupted: false,
             archived_at: None,
         };
         let out = protocol_session_to_summary(base.clone());

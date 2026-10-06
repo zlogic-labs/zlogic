@@ -52,6 +52,8 @@ use crate::{
     ToolMeta, ToolRisk, parse_args,
 };
 
+use super::decode::StreamDecoder;
+
 /// How long a command of each class may run before it is killed and reported.
 /// The point of a per-class budget is that the common case needs no decision from the caller: a
 /// test run gets ten minutes whether or not anyone thought to ask for ten minutes, so the failure
@@ -202,27 +204,65 @@ impl From<&zlogic_protocol::settings::ShellConfig> for ShellBudgets {
 
 impl Default for Shell {
     fn default() -> Self {
-        Self::resolve(ShellPreference::Auto)
+        // Profile off, unlike `ShellConfig::default()`. This value is the unconfigured test
+        // fixture, and a suite that inherits the developer's `~/.bash_profile` is a suite that
+        // fails on someone else's machine. Bootstrap is the only production path and it passes
+        // the configured flag.
+        Self::resolve(ShellPreference::Auto, false)
             // The unconfigured registry is mainly used by tests. Production bootstrap resolves
             // the configured backend and replaces this instance; retaining a platform-shaped
             // definition here is better than making every generic registry constructor fallible.
-            .unwrap_or_else(|_| Self::unchecked_platform_default())
+            .unwrap_or_else(|_| Self::unchecked_platform_default(false))
+    }
+}
+
+/// The arguments a POSIX shell is launched with.
+///
+/// `-l` rather than simply dropping both switches: a login shell is what reads `/etc/profile` and
+/// `~/.bash_profile`, and on Git Bash `/etc/profile` is also where the Windows-side `PATH` gets
+/// translated — `--noprofile --norc` leaves it in the form the parent process handed over.
+fn posix_args(read_profile: bool) -> &'static [&'static str] {
+    if read_profile {
+        &["-l", "-c"]
+    } else {
+        &["--noprofile", "--norc", "-c"]
+    }
+}
+
+fn powershell_args(read_profile: bool) -> &'static [&'static str] {
+    if read_profile {
+        &["-NoLogo", "-NonInteractive", "-Command"]
+    } else {
+        &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
+    }
+}
+
+/// `/d` is what suppresses cmd's AutoRun commands, which come from the registry and from
+/// `HKCU\...\Command Processor\AutoRun` — a hook that outlives the profile file it was set next to.
+fn cmd_args(read_profile: bool) -> &'static [&'static str] {
+    if read_profile {
+        &["/s", "/c"]
+    } else {
+        &["/d", "/s", "/c"]
     }
 }
 
 impl Shell {
     /// Resolves a preference once at startup. Explicit preferences never fall back to another
     /// shell: doing that would make the prompt, policy dialect and actual process disagree.
-    pub fn resolve(preference: ShellPreference) -> std::result::Result<Self, String> {
+    pub fn resolve(
+        preference: ShellPreference,
+        read_profile: bool,
+    ) -> std::result::Result<Self, String> {
         let backend = match preference {
-            ShellPreference::Auto => detect_default_backend()?,
-            ShellPreference::GitBash => git_bash_backend().ok_or_else(|| {
+            ShellPreference::Auto => detect_default_backend(read_profile)?,
+            ShellPreference::GitBash => git_bash_backend(read_profile).ok_or_else(|| {
                 "git_bash is configured, but Git for Windows' bash.exe was not found".to_string()
             })?,
             ShellPreference::Ps7 => named_backend(
                 "ps7",
                 &["pwsh.exe", "pwsh"],
-                &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"],
+                powershell_args(read_profile),
                 "PowerShell 7",
                 "PowerShell",
                 ShellDialect::PowerShell,
@@ -230,7 +270,7 @@ impl Shell {
             ShellPreference::Powershell => named_backend(
                 "powershell",
                 &["powershell.exe", "powershell"],
-                &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"],
+                powershell_args(read_profile),
                 "Windows PowerShell",
                 "PowerShell",
                 ShellDialect::PowerShell,
@@ -238,7 +278,7 @@ impl Shell {
             ShellPreference::Cmd => named_backend(
                 "cmd",
                 &["cmd.exe", "cmd"],
-                &["/d", "/s", "/c"],
+                cmd_args(read_profile),
                 "Command Prompt",
                 "cmd.exe",
                 ShellDialect::Cmd,
@@ -246,7 +286,7 @@ impl Shell {
             ShellPreference::Bash => named_backend(
                 "bash",
                 &["bash.exe", "bash"],
-                &["--noprofile", "--norc", "-c"],
+                posix_args(read_profile),
                 "Bash",
                 "POSIX shell",
                 ShellDialect::Posix,
@@ -266,11 +306,11 @@ impl Shell {
         self.backend.label
     }
 
-    fn unchecked_platform_default() -> Self {
+    fn unchecked_platform_default(read_profile: bool) -> Self {
         #[cfg(windows)]
         let backend = ShellBackend {
             program: PathBuf::from("cmd.exe"),
-            launch_args: &["/d", "/s", "/c"],
+            launch_args: cmd_args(read_profile),
             label: "Command Prompt",
             syntax: "cmd.exe",
             dialect: ShellDialect::Cmd,
@@ -278,7 +318,7 @@ impl Shell {
         #[cfg(not(windows))]
         let backend = ShellBackend {
             program: PathBuf::from("bash"),
-            launch_args: &["--noprofile", "--norc", "-c"],
+            launch_args: posix_args(read_profile),
             label: "Bash",
             syntax: "POSIX shell",
             dialect: ShellDialect::Posix,
@@ -306,16 +346,16 @@ impl Shell {
     }
 }
 
-fn detect_default_backend() -> std::result::Result<ShellBackend, String> {
+fn detect_default_backend(read_profile: bool) -> std::result::Result<ShellBackend, String> {
     #[cfg(windows)]
     {
-        if let Some(backend) = git_bash_backend() {
+        if let Some(backend) = git_bash_backend(read_profile) {
             return Ok(backend);
         }
         if let Ok(backend) = named_backend(
             "ps7",
             &["pwsh.exe", "pwsh"],
-            &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"],
+            powershell_args(read_profile),
             "PowerShell 7",
             "PowerShell",
             ShellDialect::PowerShell,
@@ -325,7 +365,7 @@ fn detect_default_backend() -> std::result::Result<ShellBackend, String> {
         if let Ok(backend) = named_backend(
             "powershell",
             &["powershell.exe", "powershell"],
-            &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"],
+            powershell_args(read_profile),
             "Windows PowerShell",
             "PowerShell",
             ShellDialect::PowerShell,
@@ -335,7 +375,7 @@ fn detect_default_backend() -> std::result::Result<ShellBackend, String> {
         return named_backend(
             "cmd",
             &["cmd.exe", "cmd"],
-            &["/d", "/s", "/c"],
+            cmd_args(read_profile),
             "Command Prompt",
             "cmd.exe",
             ShellDialect::Cmd,
@@ -346,7 +386,7 @@ fn detect_default_backend() -> std::result::Result<ShellBackend, String> {
         named_backend(
             "bash",
             &["bash"],
-            &["--noprofile", "--norc", "-c"],
+            posix_args(read_profile),
             "Bash",
             "POSIX shell",
             ShellDialect::Posix,
@@ -379,36 +419,48 @@ fn named_backend(
 }
 
 #[cfg(windows)]
-fn git_bash_backend() -> Option<ShellBackend> {
-    let mut candidates = Vec::new();
-    for key in ["ProgramFiles", "ProgramFiles(x86)", "LocalAppData"] {
-        if let Some(base) = std::env::var_os(key) {
-            let base = PathBuf::from(base);
-            candidates.push(base.join("Git").join("bin").join("bash.exe"));
-            candidates.push(
-                base.join("Programs")
-                    .join("Git")
-                    .join("bin")
-                    .join("bash.exe"),
-            );
-        }
-    }
-    if let Some(git) = find_on_path("git.exe").or_else(|| find_on_path("git")) {
-        if let Some(parent) = git.parent() {
-            candidates.push(parent.join("bash.exe"));
-            if let Some(root) = parent.parent() {
-                candidates.push(root.join("bin").join("bash.exe"));
-            }
-        }
-    }
-    let program = candidates.into_iter().find(|path| path.is_file())?;
+fn git_bash_backend(read_profile: bool) -> Option<ShellBackend> {
     Some(ShellBackend {
-        program,
-        launch_args: &["--noprofile", "--norc", "-c"],
+        program: git_bash_program()?,
+        launch_args: posix_args(read_profile),
         label: "Git Bash",
         syntax: "POSIX shell",
         dialect: ShellDialect::Posix,
     })
+}
+
+/// Git for Windows ships two `bash.exe`. `usr\bin\bash.exe` is the 2.4 MB shell; `bin\bash.exe`
+/// is a 47 KB launcher whose only job is to re-execute the first one. That re-execution is not
+/// free: it drops the console the parent was handed and asks for a new one, so a spawn that
+/// correctly asked for no window still puts a terminal window on screen — once per `shell` call,
+/// on any machine whose default console host is Windows Terminal. The shell itself is the target,
+/// and the launcher stays only as a fallback for a layout with no `usr\bin`.
+#[cfg(windows)]
+pub fn git_bash_program() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for key in ["ProgramFiles", "ProgramFiles(x86)", "LocalAppData"] {
+        if let Some(base) = std::env::var_os(key) {
+            let base = PathBuf::from(base);
+            push_git_bash_candidates(&mut candidates, &base.join("Git"));
+            push_git_bash_candidates(&mut candidates, &base.join("Programs").join("Git"));
+        }
+    }
+    if let Some(git) = find_on_path("git.exe").or_else(|| find_on_path("git"))
+        && let Some(parent) = git.parent()
+    {
+        // `git.exe` sits in `<root>\cmd` or `<root>\bin`, so its grandparent is the root either way.
+        if let Some(root) = parent.parent() {
+            push_git_bash_candidates(&mut candidates, root);
+        }
+        candidates.push(parent.join("bash.exe"));
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+#[cfg(windows)]
+fn push_git_bash_candidates(candidates: &mut Vec<PathBuf>, root: &Path) {
+    candidates.push(root.join("usr").join("bin").join("bash.exe"));
+    candidates.push(root.join("bin").join("bash.exe"));
 }
 
 #[cfg(windows)]
@@ -497,8 +549,10 @@ impl Tool for Shell {
                  background task comes from a command that terminates (compile, test), the turn \
                  waits up to the configured budget for it before ending, so the result can land \
                  in the same reply; servers and watchers are never waited on. Filter large output \
-                 at the source. Prefer the file tools for filesystem changes because they report \
-                 the changed paths.",
+                 at the source with grep or head; `tail` is not one of them, because it prints \
+                 nothing until its input ends and so silences the live log for the whole run. \
+                 Prefer the file tools for filesystem changes because they report the changed \
+                 paths.",
                 quick = elapsed(budgets.quick),
                 test = elapsed(budgets.test),
                 build = elapsed(budgets.build),
@@ -611,7 +665,7 @@ impl Tool for Shell {
             // Cleared and rebuilt, not amended: `env_remove` per name would need the names in
             // advance, and the point is to filter by *shape*.
             .env_clear()
-            .envs(child_env(&ctx.runtime_paths))
+            .envs(child_env(&ctx.runtime_paths, &ctx.env_pairs()))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -649,6 +703,10 @@ impl Tool for Shell {
         let mut err_buf = [0u8; 8192];
         let mut out_open = true;
         let mut err_open = true;
+        // What decides the encoding is a window, not the first byte that fails — see `decode`.
+        // Each stream gets its own, because one pipe saying GBK says nothing about the other.
+        let mut out_dec = StreamDecoder::new();
+        let mut err_dec = StreamDecoder::new();
         // Deliberately *not* the instant `deadline` was derived from: the budget covers the spawn
         // (a spawn that never returns must still end the call), but the stall clock and the
         // reported runtime start here, because before this point the command had no chance to say
@@ -671,26 +729,37 @@ impl Tool for Shell {
         // Read both pipes as output arrives, so a long command shows progress instead of a blank
         // screen, and so neither pipe can fill and deadlock the child.
         while out_open || err_open {
+            // An undecided stream is holding bytes it needs either more of or a quiet moment to
+            // judge. Three lines of error text never fill a window, so the idle timer is what
+            // lets them through; without it a command that printed its banner and is now waiting
+            // would show nothing until it exited.
+            let probe_at = [out_dec.probe_deadline(), err_dec.probe_deadline()]
+                .into_iter()
+                .flatten()
+                .min();
             tokio::select! {
                 n = stdout.read(&mut out_buf), if out_open => match n {
                     Ok(0) | Err(_) => out_open = false,
                     Ok(n) => {
-                        let chunk = String::from_utf8_lossy(&out_buf[..n]);
-                        ctx.emit(OutputStream::Stdout, &chunk);
-                        transcript.push_str(&chunk);
-                        out.push(&chunk);
+                        let chunk = out_dec.push(&out_buf[..n], tokio::time::Instant::now());
+                        publish(&chunk, OutputStream::Stdout, ctx, &mut transcript, &mut out);
                         last_output = tokio::time::Instant::now();
                     }
                 },
                 n = stderr.read(&mut err_buf), if err_open => match n {
                     Ok(0) | Err(_) => err_open = false,
                     Ok(n) => {
-                        let chunk = String::from_utf8_lossy(&err_buf[..n]);
-                        ctx.emit(OutputStream::Stderr, &chunk);
-                        transcript.push_str(&chunk);
-                        err.push(&chunk);
+                        let chunk = err_dec.push(&err_buf[..n], tokio::time::Instant::now());
+                        publish(&chunk, OutputStream::Stderr, ctx, &mut transcript, &mut err);
                         last_output = tokio::time::Instant::now();
                     }
+                },
+                _ = tokio::time::sleep_until(probe_at.unwrap_or(started)), if probe_at.is_some() => {
+                    let now = tokio::time::Instant::now();
+                    let a = out_dec.flush_if_idle(now);
+                    let b = err_dec.flush_if_idle(now);
+                    publish(&a, OutputStream::Stdout, ctx, &mut transcript, &mut out);
+                    publish(&b, OutputStream::Stderr, ctx, &mut transcript, &mut err);
                 },
                 // Terminate, then kill. A process that ignores the signal must not be left
                 // running: by the time this returns it is dead, and the model's recourse is
@@ -742,6 +811,26 @@ impl Tool for Shell {
                 }
             }
         }
+
+        // The loop can end with a decoder still holding bytes — a window that never filled, or
+        // the tail of a character split across two reads — and what it holds is the last thing
+        // the command said.
+        let out_tail = out_dec.flush();
+        publish(
+            &out_tail,
+            OutputStream::Stdout,
+            ctx,
+            &mut transcript,
+            &mut out,
+        );
+        let err_tail = err_dec.flush();
+        publish(
+            &err_tail,
+            OutputStream::Stderr,
+            ctx,
+            &mut transcript,
+            &mut err,
+        );
 
         let status = child.wait().await;
         let ran_for = tokio::time::Instant::now().duration_since(started);
@@ -935,6 +1024,25 @@ fn summarize_command(command: &str) -> String {
     summary
 }
 
+/// Hands a piece of output to everywhere it has to reach: the live console, the interleaved
+/// transcript, and the bounded head/tail the model reads. One function for all three because a
+/// piece that reached two of them is worse than one that reached none — the console and the
+/// result would disagree about what the command printed.
+fn publish(
+    text: &str,
+    stream: OutputStream,
+    ctx: &ToolCtx,
+    transcript: &mut String,
+    sink: &mut HeadTail,
+) {
+    if text.is_empty() {
+        return;
+    }
+    ctx.emit(stream, text);
+    transcript.push_str(text);
+    sink.push(text);
+}
+
 /// Bounded accumulator that keeps the head and a larger tail while counting everything.
 struct HeadTail {
     head: String,
@@ -1030,7 +1138,7 @@ impl HeadTail {
         format!(
             "{head}\n… {omitted} characters omitted of {} total; whole lines from the start and \
              the end are shown. To see the middle, re-run with the filtering at the source — pipe \
-             through grep, head or tail …\n{tail}",
+             through grep or head, not tail …\n{tail}",
             self.total
         )
     }
@@ -1390,25 +1498,45 @@ pub(crate) fn scrubbed_env() -> Vec<(String, String)> {
     scrub(std::env::vars())
 }
 
-fn child_env(runtime_paths: &[PathBuf]) -> Vec<(String, String)> {
+fn child_env(runtime_paths: &[PathBuf], vars: &[(String, String)]) -> Vec<(String, String)> {
     let mut env = scrubbed_env();
-    if runtime_paths.is_empty() {
-        return env;
-    }
-    let mut entries = std::env::var_os("PATH")
-        .as_ref()
-        .map(|path| std::env::split_paths(path).collect::<Vec<_>>())
-        .unwrap_or_default();
-    for dir in runtime_paths {
-        if !entries.contains(dir) {
-            entries.insert(0, dir.clone());
+    if !runtime_paths.is_empty() {
+        let mut entries = std::env::var_os("PATH")
+            .as_ref()
+            .map(|path| std::env::split_paths(path).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for dir in runtime_paths {
+            if !entries.contains(dir) {
+                entries.insert(0, dir.clone());
+            }
+        }
+        if let Ok(path) = std::env::join_paths(entries) {
+            env.retain(|(name, _)| name != "PATH");
+            env.push(("PATH".into(), path.to_string_lossy().into_owned()));
         }
     }
-    if let Ok(path) = std::env::join_paths(entries) {
-        env.retain(|(name, _)| name != "PATH");
-        env.push(("PATH".into(), path.to_string_lossy().into_owned()));
+    // Configured last, so a name the user declared wins over the inherited one. They are *not*
+    // passed through `scrub`: that filter exists to stop the parent process's credentials leaking
+    // into a child that never asked for them, and a variable the user wrote down on purpose is
+    // the opposite case. The credential-shaped names are refused at the layer that can see where
+    // they came from instead, which is the only place that can tell a workspace's `settings.yaml`
+    // from a hand-edited global one.
+    for (name, value) in vars {
+        env.retain(|(existing, _)| !same_env_name(existing, name));
+        env.push((name.clone(), value.clone()));
     }
     env
+}
+
+/// Windows environment names are case-insensitive, so an override has to evict the inherited
+/// spelling as well or the child sees whichever the loader happened to read first. On Unix `FOO`
+/// and `foo` are two different variables and both have to survive.
+fn same_env_name(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
 }
 
 /// Whether a variable name looks like a credential.
@@ -1416,12 +1544,7 @@ fn child_env(runtime_paths: &[PathBuf]) -> Vec<(String, String)> {
 /// a legitimate build hash or revision, whereas `*_API_KEY` is unambiguous. Nothing here is
 /// configurable — a setting that could re-admit these would defeat the point of removing them.
 fn is_credential_name(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    upper.ends_with("_API_KEY")
-        || upper.ends_with("_TOKEN")
-        || upper.ends_with("_SECRET")
-        || upper.ends_with("_PASSWORD")
-        || matches!(upper.as_str(), "API_KEY" | "TOKEN" | "SECRET" | "PASSWORD")
+    zlogic_protocol::settings::looks_like_credential(name)
 }
 
 /// Split out from [`scrubbed_env`] so the rule can be tested against a constructed environment.
@@ -1550,6 +1673,20 @@ mod tests {
     }
 
     #[test]
+    fn read_profile_turns_the_startup_file_switches_back_on_and_off() {
+        assert_eq!(posix_args(true), &["-l", "-c"]);
+        assert_eq!(posix_args(false), &["--noprofile", "--norc", "-c"]);
+        assert!(!powershell_args(true).contains(&"-NoProfile"));
+        assert!(powershell_args(false).contains(&"-NoProfile"));
+        assert!(!cmd_args(true).contains(&"/d"));
+        assert!(cmd_args(false).contains(&"/d"));
+        assert!(
+            Shell::default().backend.launch_args.contains(&"--noprofile"),
+            "the unconfigured fixture stays hermetic; only bootstrap reads the flag"
+        );
+    }
+
+    #[test]
     fn definition_names_the_resolved_backend_and_its_syntax() {
         let shell = Shell::default();
         let definition = shell.definition();
@@ -1661,6 +1798,24 @@ mod tests {
         let text = out.model_text();
         assert!(text.contains("hello"), "{text}");
         assert!(text.contains("exit 0"), "{text}");
+    }
+
+    /// Output that is not UTF-8 has to arrive as text. A Windows console program writes its
+    /// messages in the console code page, so this is the everyday case there and a synthetic one
+    /// here — the same bytes reach the pipe either way.
+    #[tokio::test]
+    async fn a_gbk_stream_arrives_as_text_rather_than_mojibake() {
+        let (_d, ctx) = setup();
+        // GBK for 「中文」. Read as UTF-8 these are not "damaged" but *reinterpreted*: a lead byte
+        // in C2..DF starts a valid two-byte sequence, so the failure is a plausible wrong answer
+        // rather than an obvious one.
+        let out = Shell::default()
+            .execute(&ctx, &args(r"printf '\xD6\xD0\xCE\xC4'"))
+            .await
+            .unwrap();
+        let text = out.model_text();
+        assert!(text.contains("中文"), "{text}");
+        assert!(!text.contains('\u{fffd}'), "{text}");
     }
 
     /// A non-zero exit is an error result, so the model does not build on a failed step.

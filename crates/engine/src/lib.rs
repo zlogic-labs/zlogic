@@ -39,6 +39,7 @@ pub mod checkpoints;
 pub mod config;
 pub mod credentials;
 pub mod dispatch;
+pub mod env;
 pub mod extensions;
 pub mod gc;
 pub mod grants;
@@ -49,6 +50,7 @@ pub mod lock;
 pub mod memory;
 pub mod not_wired;
 pub mod policy;
+pub mod ports;
 pub mod prompt;
 pub mod provider_auth;
 pub mod retention;
@@ -81,9 +83,9 @@ use zlogic_protocol::{Command, SessionId, Submission, SubmitAck, WorkspaceId};
 
 use crate::hub::EventHub;
 use crate::service::{
-    AgentProfileService, AuxiliaryService, ConfigService, CredentialService, ExtensionService,
-    ManagedResourceService, MemoryService, ObjectService, SessionService, TaskService,
-    ToolCatalogService, TranslationService, TurnService, WorkspaceCheckpointsService,
+    AgentProfileService, AuxiliaryService, ConfigService, CredentialService, EnvService,
+    ExtensionService, ManagedResourceService, MemoryService, ObjectService, SessionService,
+    TaskService, ToolCatalogService, TranslationService, TurnService, WorkspaceCheckpointsService,
     WorkspaceFilesService, WorkspaceGitService, WorkspaceService,
 };
 
@@ -92,8 +94,12 @@ pub use auxiliary::Auxiliary;
 pub use config::Config;
 pub use credentials::Credentials;
 pub use dispatch::{Dispatcher, HubSink, TurnRegistry, WorkspaceRoots};
+pub use env::{EnvGlobal, EnvLayers, EnvResolver, RcPath};
 pub use extensions::{Assembled, Extensions};
-pub use grants::{GrantEntry, Grants, derive_rule, derive_rule_shape, grant_preview};
+pub use grants::{
+    COMPUTER_TOOL, GrantEntry, GrantRule, Grants, derive_computer_rule, derive_computer_rule_shape,
+    derive_rule, derive_rule_shape, grant_preview, grantable_computer_action,
+};
 pub use interaction::{EngineInteractions, InteractionRouter};
 pub use lifecycle::{Lifecycle, Reconciled};
 pub use lock::{LockGuard, SessionLocks};
@@ -278,6 +284,7 @@ pub struct Engine {
     pub turns: Arc<dyn TurnService>,
     pub objects: Arc<dyn ObjectService>,
     pub config: Arc<dyn ConfigService>,
+    pub env: Arc<dyn EnvService>,
     pub credentials: Arc<dyn CredentialService>,
     pub managed_resources: Arc<dyn ManagedResourceService>,
     pub extension_service: Arc<dyn ExtensionService>,
@@ -301,6 +308,7 @@ impl Engine {
             turns: Arc::new(not_wired::NotWired),
             objects: Arc::new(not_wired::NotWired),
             config: Arc::new(not_wired::NotWired),
+            env: Arc::new(not_wired::NotWired),
             credentials: Arc::new(not_wired::NotWired),
             managed_resources: Arc::new(not_wired::NotWired),
             extension_service: Arc::new(not_wired::NotWired),
@@ -367,6 +375,11 @@ impl Engine {
 
     pub fn with_config(mut self, config: Arc<dyn ConfigService>) -> Self {
         self.config = config;
+        self
+    }
+
+    pub fn with_env(mut self, env: Arc<dyn EnvService>) -> Self {
+        self.env = env;
         self
     }
 

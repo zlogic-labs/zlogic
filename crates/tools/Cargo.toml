@@ -21,7 +21,7 @@ thiserror.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
 tokio-util.workspace = true
-tokio = { workspace = true, features = ["process", "io-util", "rt", "net"] }
+tokio = { workspace = true, features = ["process", "io-util", "rt", "net", "sync", "time"] }
 zlogic-code-sitter = { path = "../code-sitter" }
 ignore = "0.4"
 globset = "0.4"
@@ -37,6 +37,8 @@ encoding_rs = "0.8"
 quick-xml = "0.42"
 zip.workspace = true
 tempfile.workspace = true
+# Header reads only, in `capture_picture` — a screenshot's dimensions come from its bytes.
+image.workspace = true
 url = "2.5"
 tar.workspace = true
 flate2.workspace = true
